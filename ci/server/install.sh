@@ -2,8 +2,7 @@
 set -eu
 [ "$(id -u)" -eq 0 ] || { echo "Run as root." >&2; exit 1; }
 cd "$(dirname "$0")"
-command -v python3 >/dev/null
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else "Python 3.12 or newer is required.")'
+/usr/bin/python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else "Python 3.12 or newer is required.")'
 command -v git >/dev/null
 command -v curl >/dev/null
 if ! id cola-ci >/dev/null 2>&1; then

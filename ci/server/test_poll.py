@@ -117,6 +117,10 @@ class PollTest(unittest.TestCase):
         orphan = self.data / "workspaces" / "orphan"
         orphan.mkdir()
         (orphan / "partial-archive").write_bytes(b"incomplete")
+        readonly = orphan / "readonly"
+        readonly.mkdir()
+        (readonly / "artifact").write_bytes(b"interrupted")
+        readonly.chmod(0o555)
         self.assertEqual(self.poll().returncode, 0)
         self.assertFalse(orphan.exists())
         self.assertEqual(state_file.read_bytes(), initial)

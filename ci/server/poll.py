@@ -104,13 +104,13 @@ def check_branch(branch, repo, data, state, env, force, api_base, archive_base):
                     status = "success" if exit_code == 0 else "failure"
                 else:
                     log.write("unsupported: ci/check.sh is absent\n")
-                record = dict(sha=sha, status=status, exit_code=exit_code,
-                              started_at=started_at, finished_at=timestamp())
-                write_json(directory / f"{run}.json", record)
-                state[branch] = record
-                write_json(data / "state.json", state)
-                print(f"{branch}: {status} {sha}", flush=True)
-                return status != "failure"
+            record = dict(sha=sha, status=status, exit_code=exit_code,
+                          started_at=started_at, finished_at=timestamp())
+            write_json(directory / f"{run}.json", record)
+            state[branch] = record
+            write_json(data / "state.json", state)
+            print(f"{branch}: {status} {sha}", flush=True)
+            return status != "failure"
     except (subprocess.SubprocessError, OSError, ValueError, tarfile.TarError,
             EOFError, HTTPException) as error:
         with log_path.open("a") as log:
@@ -132,6 +132,7 @@ def main():
     workspaces.mkdir(parents=True, exist_ok=True)
     for workspace in workspaces.iterdir():
         if workspace.is_dir() and not workspace.is_symlink():
+            subprocess.run(["chmod", "-R", "u+rwX", str(workspace)], check=True)
             shutil.rmtree(workspace)
         else:
             workspace.unlink()

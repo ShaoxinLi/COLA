@@ -58,7 +58,8 @@ failure. The failure stays in `state.json`. Any nonzero check exit is a complete
 failure, even when an infrastructure error caused it. Use `--force` to retry that
 SHA after fixing the infrastructure. Ref and archive errors, absent branches, and
 timeouts fail the service and leave the last completed result unchanged.
-The journal and attempt log identify the error. The next invocation retries unfinished work. At startup, the controller
+The journal and attempt log identify the error. The next invocation retries
+unfinished work. At startup, the controller
 removes orphaned files under `/var/lib/cola-ci/workspaces` from interrupted runs.
 Use the service to serialize invocations against that directory.
 

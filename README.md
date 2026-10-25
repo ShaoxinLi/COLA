@@ -14,8 +14,8 @@ adapters are not implemented.
 
 ## Build and test
 
-The repository pins Rust 1.98.1. Run the same checks as GitHub Actions from
-the repository root.
+The repository pins Rust 1.98.1. The checks also require Python 3.12 or newer
+and Git. Run the same checks as GitHub Actions from the repository root.
 
 ```sh
 ./ci/check.sh
