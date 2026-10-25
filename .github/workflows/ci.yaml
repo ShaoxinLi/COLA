@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   check:
+    name: Rust checks
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
