@@ -11,7 +11,7 @@ Environment=HOME=/home/cola-ci
 Environment=PATH=/home/cola-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/etc/cola-ci.conf
 ExecStart=/usr/bin/python3 /usr/local/lib/cola-ci/poll.py $COLA_CI_ARGS
-TimeoutStartSec=55min
+TimeoutStartSec=65min
 MemoryMax=3G
 CPUQuota=200%
 ProtectSystem=strict

@@ -1,9 +1,9 @@
 [Unit]
-Description=Poll trusted COLA branches every two minutes
+Description=Poll trusted COLA branches every five minutes
 
 [Timer]
 OnBootSec=1min
-OnUnitInactiveSec=2min
+OnUnitInactiveSec=5min
 Unit=cola-ci.service
 
 [Install]
