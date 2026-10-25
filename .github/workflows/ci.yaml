@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Reject pull requests from forks
+        if: github.event_name == 'pull_request'
+        env:
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [[ "$HEAD_REPOSITORY" != 'ShaoxinLi/COLA' ]]; then
+            echo '::error::CI requires a branch in ShaoxinLi/COLA. Fork pull requests cannot access the private checker.'
+            exit 1
+          fi
+      - name: Run private checks
+        env:
+          COLA_CI_HOST: ${{ secrets.COLA_CI_HOST }}
+          COLA_CI_SSH_KEY: ${{ secrets.COLA_CI_SSH_KEY }}
+          COLA_CI_KNOWN_HOSTS: ${{ secrets.COLA_CI_KNOWN_HOSTS }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          case "$EVENT" in
+            pull_request)
+              [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+              request="pr $PR_NUMBER $SHA"
+              ;;
+            push) request="push main $SHA" ;;
+            *) exit 1 ;;
+          esac
+          : "${COLA_CI_HOST:?Missing COLA_CI_HOST}"
+          : "${COLA_CI_SSH_KEY:?Missing COLA_CI_SSH_KEY}"
+          : "${COLA_CI_KNOWN_HOSTS:?Missing COLA_CI_KNOWN_HOSTS}"
+          umask 077
+          ssh_dir=$(mktemp -d "$RUNNER_TEMP/cola-ci.XXXXXX")
+          trap 'rm -rf "$ssh_dir"' EXIT
+          printf '%s\n' "$COLA_CI_SSH_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$COLA_CI_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          ssh -T -i "$ssh_dir/key" \
+            -o UserKnownHostsFile="$ssh_dir/known_hosts" \
+            -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
+            -o BatchMode=yes -o ConnectTimeout=15 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "cola-ci@$COLA_CI_HOST" "$request"
