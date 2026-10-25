@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll trusted COLA branches every two minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=2min
+Unit=cola-ci.service
+
+[Install]
+WantedBy=timers.target

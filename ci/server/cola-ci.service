@@ -1,0 +1,24 @@
+[Unit]
+Description=Check trusted COLA origin branches
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=cola-ci
+Group=cola-ci
+Environment=HOME=/home/cola-ci
+Environment=PATH=/home/cola-ci/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/cola-ci.conf
+ExecStart=/usr/bin/python3 /usr/local/lib/cola-ci/poll.py $COLA_CI_ARGS
+TimeoutStartSec=55min
+MemoryMax=3G
+CPUQuota=200%
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/cola-ci /var/lib/cola-ci
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

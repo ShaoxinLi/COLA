@@ -14,12 +14,11 @@ adapters are not implemented.
 
 ## Build and test
 
-Use a Rust toolchain that supports the Rust 2024 edition. Run these commands
-from the repository root.
+The repository pins Rust 1.98.1. Run the same checks as GitHub Actions from
+the repository root.
 
 ```sh
-cargo build
-cargo test --all-targets
+./ci/check.sh
 ```
 
 Run the domain example with manually supplied model and tool output.
@@ -32,6 +31,8 @@ The example records an in-memory exchange and performs no file operation.
 
 ## Documentation
 
+- [Server checks](ci/server/README.md) describes the credential-free branch
+  poller, installation, results, and retries.
 - [Domain contracts](docs/domain.md) describes the domain types, transitions,
   context rules, and snapshot recovery.
 - [Domain example](examples/read_file.rs) shows a complete conversation with a
