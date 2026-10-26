@@ -1,8 +1,9 @@
 # Domain contracts
 
-This document describes the implemented `cola::domain` library. It records
+This document describes the implemented `cola::domain` module. It records
 conversation facts and validates their order. Model clients, tool executors,
-persistence adapters, and the application loop are outside this library.
+persistence adapters, and the application loop are outside the domain module.
+The persistence port and filesystem adapter live elsewhere in the same crate.
 
 The [domain example](../examples/read_file.rs) supplies model and tool output
 manually. It performs no file operation.
@@ -160,3 +161,12 @@ source or verify whether its recorded tool outcomes actually occurred.
 Restore always closes formerly active work as `Interrupted(ProcessLost)`. It
 preserves partial facts and never resumes or re-executes a call. A closed snapshot
 roundtrip preserves all facts, including reconciliation evidence.
+
+## Persistence adapter
+
+The application port `cola::app::SessionStore` stores complete sessions.
+[`JsonlSessionStore`](session-store.md) owns private versioned serialization and
+atomic filesystem replacement. It uses `Session::snapshot` and `Session::restore`
+without adding storage dependencies to the domain. Loading active work closes it
+as `ProcessLost` and preserves dispatch intent. Save successfully after
+`start_tool` and before external tool I/O.

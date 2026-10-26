@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
-//! COLA's synchronous, in-memory conversation domain.
+//! COLA's synchronous conversation domain and session persistence.
 //!
 //! The library records facts and validates transitions. Callers supply model
-//! messages and tool results. See `examples/read_file.rs` for a full exchange.
+//! messages and tool results. See `examples/read_file.rs` for a full exchange
+//! and `examples/session_store.rs` for saving and recovering sessions.
 pub mod domain;
+
+pub mod adapters;
+pub mod app;

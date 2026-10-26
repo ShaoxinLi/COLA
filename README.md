@@ -11,8 +11,9 @@ the synchronous `Tool`, `Assistant`, and `ToolCallReviewer` contracts, typed
 context values, review decisions, snapshot export, and validated snapshot
 restoration.
 
-The agent execution loop, model integration, tool executors, and persistence
-adapters are not implemented.
+The application port `cola::app::SessionStore` and filesystem adapter
+`cola::adapters::stores::JsonlSessionStore` persist complete session facts.
+The agent execution loop, model integration, and tool executors are not implemented.
 
 External implementations of `Tool` validate their argument fields and return
 `ToolOutcome`. Execution can block the caller. The caller selects the tool,
@@ -37,7 +38,16 @@ cargo run --example read_file
 
 The example records an in-memory exchange and performs no file operation.
 
+Run the persistence example to save and reload a session on a local filesystem.
+
+```sh
+cargo run --example session_store -- /path/to/sessions
+```
+
 ## Documentation
+
+- [Session persistence](docs/session-store.md) describes atomic JSONL snapshots
+  and recovery on a local filesystem.
 
 - [Domain contracts](docs/domain.md) describes the domain types, transitions,
   context rules, and snapshot recovery.
