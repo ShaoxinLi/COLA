@@ -1,54 +1,38 @@
 # COLA
 
-COLA (Coffee-Overclocked Little Agent) is an agent project built from scratch
-with Rust.
+COLA (Coffee-Overclocked Little Agent) is an AI agent project built from scratch
+with Rust. It currently defines checked conversation state, application ports,
+and concrete adapters. The agent execution loop is not implemented.
 
-## Current status
+## Project structure
 
-COLA is in early development. The domain layer is implemented as the
-`cola::domain` library, with conversation state, messages, tool definitions,
-the synchronous `Tool`, `Assistant`, and `ToolCallReviewer` contracts, typed
-context values, review decisions, snapshot export, and validated snapshot
-restoration.
+The library has three layers.
 
-The application port `cola::app::SessionStore` and filesystem adapter
-`cola::adapters::stores::JsonlSessionStore` persist complete session facts.
-The adapters `cola::adapters::tools::{BashTool, ReadFileTool, WriteFileTool}`
-execute Bash commands and file operations on the host. The agent execution
-loop is not implemented. The application port `cola::app::ModelClient<O>` and
-`cola::adapters::models::{OpenAIClient, AnthropicClient}` provide blocking model
-generation with checked outputs and caller-owned native continuation tokens.
+| Layer | Responsibility | Reference |
+| --- | --- | --- |
+| `src/domain` | Values, messages, conversation transitions, tools, context assembly, and snapshot recovery. | [Domain contracts](docs/domain.md) |
+| `src/app` | Typed model generation and complete-session persistence contracts. | [Model clients](docs/model-clients.md#application-contracts), [session persistence](docs/session-store.md#application-contract) |
+| `src/adapters` | OpenAI and Anthropic clients, JSONL storage, Bash, and file tools. | [Model clients](docs/model-clients.md#adapter-implementations), [session persistence](docs/session-store.md#jsonl-adapter), [tool adapters](docs/tools.md) |
 
-Implementations of `Tool` validate their argument fields and return
-`ToolOutcome`. Execution can block the caller. The caller selects the tool,
-associates its outcome with the original call ID, and records the result in
-`Session`.
+The domain has no application or adapter dependency. Application contracts use
+domain values. Adapters implement the contracts. Callers own model invocation,
+tool selection, execution, continuation acceptance, and persistence ordering.
 
-## Build and test
+Integration tests have separate entry points in `tests/domain.rs`, `tests/app.rs`,
+and `tests/adapters.rs`. Test files follow production ownership. Shared fixtures
+live beside the tests that use them.
 
-Use a Rust toolchain that supports the Rust 2024 edition. Run these commands
-from the repository root.
+## Build and verify
+
+Use a Rust toolchain that supports the Rust 2024 edition. Run these commands from
+the repository root.
 
 ```sh
 cargo build
 cargo test --all-targets
+cargo test --doc
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 ```
 
-## Documentation
-
-- [Model clients](docs/model-clients.md) describes explicit configuration,
-  effort mapping, checked outputs, native replay, and recovery limits.
-
-- [Basic tool adapters](docs/tools.md) describes arguments, host behavior,
-  output limits, and blocking execution.
-- [Session persistence](docs/session-store.md) describes atomic JSONL snapshots
-  and recovery on a local filesystem.
-
-- [Domain contracts](docs/domain.md) describes the domain types, transitions,
-  context rules, and snapshot recovery.
-
-Generate local API documentation with:
-
-```sh
-cargo doc --no-deps
-```
+Generate local API documentation with `cargo doc --no-deps`.
