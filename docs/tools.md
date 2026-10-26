@@ -16,6 +16,26 @@ describe the same shape with required fields, `minLength: 1`, and
 `additionalProperties: false`. `InputSchema` is a descriptor, not a validator.
 Ordinary validation and I/O errors return a nonblank `ToolOutcome::Failure`.
 
+## Design decisions
+
+Each concrete adapter owns its argument shape, definition, and execution.
+Independent types let callers construct only the capabilities they need and
+combine them with other `Tool` implementations. A shared enum would centralize
+future additions. A registry would duplicate the caller's selection responsibility.
+Implementation modules stay private; only the three tool types are exported.
+
+The instance directory is resolved at construction so later calls do not depend
+on changes to the process cwd. Bash output decodes lossily because commands can
+emit arbitrary bytes. File reads require valid UTF-8 so a read-and-write cycle
+does not silently replace bytes.
+
+Output capture limits retained memory while readers continue draining the pipes.
+A prototype confirmed that Bash can exit while a descendant still holds an
+output pipe. A timeout on Bash alone would therefore not bound the complete
+call. Process-tree cancellation remains deferred until it can cover pipe readers
+as well. File writes use ordinary create-and-truncate behavior to preserve host
+symlink and permission semantics rather than introduce atomic replacement.
+
 ## BashTool
 
 The `bash` definition accepts `{"command": "..."}`. Execution starts a fresh
