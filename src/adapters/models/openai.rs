@@ -96,19 +96,23 @@ pub(super) fn decode(value: Value) -> Result<Decoded, ModelError> {
     let mut calls = Vec::new();
     let mut item_ids = std::collections::BTreeSet::new();
     for item in &raw {
-        if let Some(id) = item.get("id") {
+        let kind = string(item, "type")?;
+        if let Some(id) = item
+            .get("id")
+            .filter(|id| !id.is_null() || kind != "function_call")
+        {
             let id = id.as_str().ok_or_else(malformed)?;
             if id.trim().is_empty() || !item_ids.insert(id) {
                 return Err(malformed());
             }
         }
-        if item
-            .get("status")
-            .is_some_and(|v| v.as_str() != Some("completed"))
-        {
+        if item.get("status").is_some_and(|v| {
+            v.as_str() != Some("completed")
+                && !(v.is_null() && matches!(kind, "reasoning" | "function_call"))
+        }) {
             return Ok(Decoded::Incomplete(IncompleteReason::Other));
         }
-        match string(item, "type")? {
+        match kind {
             "reasoning" => {
                 for part in array(item, "summary")? {
                     if string(part, "type")? != "summary_text" {

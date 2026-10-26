@@ -102,7 +102,9 @@ pub(super) fn decode(value: Value) -> Result<Decoded, ModelError> {
         "max_tokens" => return Ok(Decoded::Incomplete(IncompleteReason::OutputLimit)),
         "refusal" => return Ok(Decoded::Refused),
         "end_turn" | "tool_use" => {}
-        "pause_turn" | "stop_sequence" => return Ok(Decoded::Incomplete(IncompleteReason::Other)),
+        "pause_turn" | "stop_sequence" | "model_context_window_exceeded" => {
+            return Ok(Decoded::Incomplete(IncompleteReason::Other));
+        }
         _ => return Err(unsupported()),
     }
     if string(&value, "type")? != "message" || string(&value, "role")? != "assistant" {

@@ -119,6 +119,10 @@ without a domain output. Unsupported or malformed native data returns a safe
 error. Blank answers, unoffered tools, invalid call names, non-object arguments,
 duplicate native IDs, and invalid decisions never become executable output.
 Domain call IDs are fresh UUID-based values independent of native IDs.
+Anthropic's `model_context_window_exceeded` produces `Incomplete(Other)`.
+OpenAI reasoning and function-call items accept omitted or null optional status
+fields. A function-call item ID may also be omitted or null. Explicit pending or
+incomplete item status still prevents a complete domain output.
 
 The decision object requires exactly `should_allow: boolean` and
 `reason: string | null`. A non-null reason must be nonblank. Review history and the
@@ -212,13 +216,21 @@ explicitly deferred native reconstruction and retained `MissingContinuation` for
 that history. The implementation follows the selected contract and documents the
 limit rather than silently falling back.
 
+The final independent review identified the context-window stop and a risk around
+nullable native metadata. The parent checked official Anthropic documentation and
+OpenAI's generated schema types, reproduced both failures through the public
+clients, and corrected those mappings. The nullable fields remain unchanged in
+native replay. No public type or ownership contract changed.
+
 ## Limits and verification
 
 Tokens have no serialization, raw wire accessor, hidden cache, session registry,
-or previous-response storage. JSONL recovery cannot restore them. Tool history
-without a token, including closed batches, fails with `MissingContinuation`.
-Notices alone can form a factual baseline. A deliberately new baseline can include
-plain historical answers, without a claim to restored native reasoning.
+or previous-response storage. JSONL recovery cannot restore them. A retained
+assistant tool-request message without a token, including a complete closed batch,
+fails with `MissingContinuation`. A closed partial batch may instead be projected
+entirely into notices. Those notices alone can form a factual baseline without a
+token. A deliberately new baseline can include plain historical answers, without
+a claim to restored native reasoning.
 
 Assistant generation requires an active last exchange. Partial interrupted native
 batches fail with `ContinuationMismatch` even when the domain can describe their
@@ -253,3 +265,8 @@ The protocol fields follow the official documentation read on 2026-10-26.
   describes the decision schema field.
 - [Anthropic versions](https://platform.claude.com/docs/en/api/versioning) describes
   the selected version header.
+- [Anthropic context windows](https://platform.claude.com/docs/en/build-with-claude/context-windows)
+  describes the context-window stop reason.
+- OpenAI's generated [reasoning item](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_reasoning_item.py)
+  and [function-call item](https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_function_tool_call.py)
+  types define the nullable native fields.
