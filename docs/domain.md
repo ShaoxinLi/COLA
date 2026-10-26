@@ -81,8 +81,9 @@ omits incomplete tool-message sequences and preserves their facts as notices.
 
 ## Model input contracts
 
-`Context` contains caller-supplied nonblank instructions, checked `ContextExchange`
-values, factual `ExecutionNotice` values, and a caller-supplied tool catalog. Catalog
+`Context<O>` associates model input with its expected output type `O`. It contains
+caller-supplied nonblank instructions, checked `ContextExchange` values, factual
+`ExecutionNotice` values, and a caller-supplied tool catalog. Catalog
 names and call IDs must be unique. Exchanges have strictly increasing turn IDs.
 Only the last exchange can be active, and it must await the model.
 An empty history or a history containing only closed exchanges is also valid.
@@ -103,13 +104,33 @@ failure reasons. These notices are domain-derived status and are not tool
 messages. The original assistant message and partial results remain available
 through the Session history getters.
 
-An active unresolved batch cannot become Context. The caller must finish or
-close it first. Context performs no history selection, token measurement, prompt
-rendering, or fitting. `Context::messages` exposes only the flat message
-projection. Read `execution_notices` or each exchange's `notices` as well to retain
-closure reasons, unknown effects, and reconciliations.
+`Session::context_exchanges` rejects an active unresolved batch. The caller must
+finish or close it first. `Session::closed_context_exchanges` includes the same
+closed history and recovery notices while excluding all active-turn messages.
+It works while an active batch is pending. Context performs no history selection,
+token measurement, prompt rendering, or fitting. `Context::messages` exposes only
+the flat message projection. Read `execution_notices` or each exchange's `notices`
+as well to retain closure reasons, unknown effects, and reconciliations.
 Neither Session nor Context checks whether requested tool names appear in the
 catalog. Tool definitions do not bind or resolve executable implementations.
+
+## Assistant and review contracts
+
+External implementations of `Assistant` synchronously assemble
+`Context<AssistantMessage>` from an immutable session. `ToolCallReviewer` assembles
+`Context<Decision>` from an immutable session and an explicit `ToolCall`.
+Both methods return `Result` with `ContextError`. Model invocation, output
+decoding, and tool execution belong to the caller.
+
+A reviewer can use `closed_context_exchanges` for checked history and render the
+target call's name, arguments, and selected active-turn facts in its instructions.
+History selection and active-turn rendering are implementation policy. There is
+no built-in lossless projection of an active review. Pending calls do not become
+fabricated tool results or unchecked exchanges.
+
+`Decision::new` records `should_allow` and an optional `NonEmptyText` reason.
+A decision is data. It does not authorize execution, prove freshness, or check
+that the supplied call belongs to the session.
 
 ## Value and recovery contracts
 

@@ -2,6 +2,7 @@
 mod context;
 mod conversation;
 mod message;
+mod roles;
 mod tool;
 mod value;
 
@@ -13,6 +14,7 @@ pub use conversation::{
     TurnFailure, TurnOutcome, TurnSnapshot,
 };
 pub use message::{AssistantMessage, Message, UserMessage};
+pub use roles::{Assistant, Decision, ToolCallReviewer};
 pub use tool::{
     InputSchema, Tool, ToolCall, ToolCalls, ToolDefinition, ToolError, ToolOutcome, ToolResult,
 };
