@@ -1,4 +1,10 @@
-use super::{Context, ContextError, NonEmptyText, Session, ToolCall};
+use super::{AssistantMessage, Context, ContextError, NonEmptyText, Session, ToolCall};
+
+/// Synchronous context assembly implemented outside the domain library.
+/// Model invocation and output decoding belong to the caller.
+pub trait Assistant {
+    fn context(&self, session: &Session) -> Result<Context<AssistantMessage>, ContextError>;
+}
 
 /// Review output data. It does not authorize execution or prove call freshness.
 #[derive(Clone, Debug, PartialEq, Eq)]

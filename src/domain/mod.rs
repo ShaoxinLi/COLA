@@ -1,13 +1,11 @@
 //! Validated messages, conversation state, recovery, and model input values.
-mod assistant;
 mod context;
 mod conversation;
 mod message;
-mod review;
+mod roles;
 mod tool;
 mod value;
 
-pub use assistant::Assistant;
 pub use context::{Context, ContextError, ContextExchange, ExecutionNotice};
 pub use conversation::{
     ActiveTurn, AssistantSnapshot, EffectDisposition, EffectResolution, ExecutionSnapshot,
@@ -16,7 +14,7 @@ pub use conversation::{
     TurnFailure, TurnOutcome, TurnSnapshot,
 };
 pub use message::{AssistantMessage, Message, UserMessage};
-pub use review::{Decision, ToolCallReviewer};
+pub use roles::{Assistant, Decision, ToolCallReviewer};
 pub use tool::{
     InputSchema, Tool, ToolCall, ToolCalls, ToolDefinition, ToolError, ToolOutcome, ToolResult,
 };

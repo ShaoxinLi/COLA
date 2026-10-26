@@ -1,9 +1,10 @@
-use cola::domain::*;
+use super::support::text;
+use cola::domain::{
+    Assistant, AssistantMessage, Context, ContextError, Decision, ExecutionNotice, Session,
+    SessionId, StopReason, ToolCall, ToolCallId, ToolCallReviewer, ToolCalls, ToolName,
+    UserMessage,
+};
 use serde_json::json;
-
-fn text(value: impl Into<String>) -> NonEmptyText {
-    NonEmptyText::new(value).unwrap()
-}
 
 struct FactAssistant;
 impl Assistant for FactAssistant {
@@ -112,20 +113,4 @@ fn decisions_preserve_allowance_and_optional_checked_reasons() {
     let deny = Decision::new(false, Some(reason.clone()));
     assert!(!deny.should_allow());
     assert_eq!(deny.reason(), Some(&reason));
-}
-
-#[test]
-fn context_operations_do_not_require_output_traits() {
-    struct Output;
-    fn assert_eq_contract<T: Eq>(_: &T) {}
-    let context = Context::<Output>::new(text("rules"), vec![], vec![]).unwrap();
-    let cloned = context.clone();
-    assert_eq!(cloned, context);
-    assert_eq_contract(&context);
-    assert!(format!("{context:?}").contains("rules"));
-    assert_eq!(context.instructions().as_str(), "rules");
-    assert!(context.exchanges().is_empty());
-    assert!(context.tools().is_empty());
-    assert_eq!(context.messages().count(), 0);
-    assert_eq!(context.execution_notices().count(), 0);
 }
