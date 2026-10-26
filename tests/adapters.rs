@@ -1,4 +1,15 @@
-#[path = "adapters/jsonl_session_store.rs"]
-mod jsonl_session_store;
-#[path = "adapters/tools.rs"]
-mod tools;
+#[path = "adapters/stores/jsonl.rs"]
+mod jsonl;
+#[path = "adapters/models"]
+mod models {
+    mod anthropic;
+    mod client;
+    mod openai;
+    mod support;
+}
+#[path = "adapters/tools"]
+mod tools {
+    mod bash;
+    mod contracts;
+    mod files;
+}

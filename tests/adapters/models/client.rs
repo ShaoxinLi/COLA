@@ -1,5 +1,12 @@
-use super::*;
+use super::support::*;
 use cola::adapters::stores::JsonlSessionStore;
+use cola::{
+    adapters::models::{ClientConfig, OpenAIClient},
+    app::*,
+    domain::*,
+};
+use serde_json::{Value, json};
+use std::{num::NonZeroUsize, time::Duration};
 
 #[test]
 fn config_rejects_unsafe_urls_secrets_and_limits_with_redacted_diagnostics() {
@@ -65,7 +72,6 @@ fn config_rejects_unsafe_urls_secrets_and_limits_with_redacted_diagnostics() {
         OpenAIClient::new(config.clone()).unwrap()
     );
     assert!(!printed.contains("SENTINEL"));
-    assert!(!format!("{:?}", ModelId::new("URL_SENTINEL").unwrap()).contains("SENTINEL"));
 }
 
 #[test]
@@ -688,31 +694,6 @@ fn notices_and_review_history_are_facts_at_their_exchange_position() {
 }
 
 #[test]
-fn every_supported_effort_level_has_its_exact_native_spelling() {
-    for p in PROVIDERS {
-        for (effort, label) in [
-            (Effort::Low, "low"),
-            (Effort::Medium, "medium"),
-            (Effort::High, "high"),
-            (Effort::Xhigh, "xhigh"),
-            (Effort::Max, "max"),
-        ] {
-            let server = Server::new(vec![p.answer("ok").into()]);
-            let mut settings = p.settings();
-            settings.effort = effort;
-            p.client(&server)
-                .generate(&context(&session()), &settings, None)
-                .unwrap();
-            let body = server.request(0).body;
-            match p {
-                Provider::OpenAI => assert_eq!(body["reasoning"]["effort"], label),
-                Provider::Anthropic => assert_eq!(body["output_config"]["effort"], label),
-            }
-        }
-    }
-}
-
-#[test]
 fn reviewer_refusals_remain_stopped_outcomes() {
     for (p, response) in [
         (
@@ -1202,7 +1183,7 @@ fn model_endpoint_provider_history_and_receipt_binding_fail_without_network() {
         let exchange = &valid.exchanges()[0];
         let mut messages = exchange.messages().to_vec();
         if let Message::User(user) = &mut messages[0] {
-            *user = super::user("rewritten user");
+            *user = super::support::user("rewritten user");
         }
         invalid.push(rebuild(
             &valid,

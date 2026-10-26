@@ -250,19 +250,16 @@ fn validate_messages(
     if !matches!(messages.first(), Some(Message::User(_))) {
         return Err(ContextError::MissingUser);
     }
-    let mut pending = Vec::new();
-    let mut next_result = 0;
+    let mut remaining: &[ToolCall] = &[];
     let mut answered = false;
     let mut ids = BTreeSet::new();
     for message in &messages[1..] {
         if answered {
             return Err(ContextError::InvalidMessageOrder);
         }
-        if next_result < pending.len() {
+        if let [next, rest @ ..] = remaining {
             match message {
-                Message::Tool(result) if result.call_id() == pending[next_result] => {
-                    next_result += 1
-                }
+                Message::Tool(result) if result.call_id() == next.id() => remaining = rest,
                 Message::Tool(_) => return Err(ContextError::MismatchedToolResult),
                 _ => return Err(ContextError::InvalidMessageOrder),
             }
@@ -270,11 +267,10 @@ fn validate_messages(
             match message {
                 Message::Assistant(AssistantMessage::Answer(_)) => answered = true,
                 Message::Assistant(AssistantMessage::ToolRequests { calls, .. }) => {
-                    pending = calls.as_slice().iter().map(ToolCall::id).collect();
-                    next_result = 0;
-                    for id in &pending {
-                        if !ids.insert(*id) {
-                            return Err(ContextError::DuplicateCallId((*id).clone()));
+                    remaining = calls.as_slice();
+                    for call in remaining {
+                        if !ids.insert(call.id()) {
+                            return Err(ContextError::DuplicateCallId(call.id().clone()));
                         }
                     }
                 }
@@ -282,7 +278,7 @@ fn validate_messages(
             }
         }
     }
-    if next_result < pending.len() {
+    if !remaining.is_empty() {
         return Err(ContextError::UnresolvedToolBatch);
     }
     if answered != matches!(outcome, Some(TurnOutcome::Completed)) {

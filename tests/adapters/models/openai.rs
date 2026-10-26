@@ -1,4 +1,9 @@
-use super::*;
+use super::support::*;
+use cola::{
+    app::{Generation, IncompleteReason, ModelErrorKind},
+    domain::AssistantMessage,
+};
+use serde_json::json;
 
 #[test]
 fn openai_failed_response_is_a_safe_provider_failure() {

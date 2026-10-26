@@ -1,4 +1,6 @@
-use super::*;
+use super::support::*;
+use cola::app::{Generation, IncompleteReason};
+use serde_json::json;
 
 #[test]
 fn anthropic_context_window_stop_never_returns_partial_output() {
