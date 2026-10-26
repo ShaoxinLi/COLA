@@ -1,8 +1,11 @@
-use super::{
-    Decoded, Event, ModelError, ModelSettings, OutputKind, Record, Snapshot, WireCall, array,
-    context, events, malformed, string, unsupported,
+use super::client::{
+    self, Decoded, Event, OutputKind, Record, Snapshot, WireCall, array, events, malformed, string,
+    unsupported,
 };
-use crate::{app::IncompleteReason, domain::ToolOutcome};
+use crate::{
+    app::{IncompleteReason, ModelError, ModelSettings},
+    domain::ToolOutcome,
+};
 use serde_json::{Value, json};
 fn push(messages: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
     if let Some(last) = messages.last_mut().filter(|last| last["role"] == role) {
@@ -24,7 +27,7 @@ pub(super) fn request(
     let decision = kind == OutputKind::Decision;
     let mut messages = Vec::new();
     if decision {
-        for text in context::review_history(snapshot) {
+        for text in client::review_history(snapshot) {
             push(
                 &mut messages,
                 "user",
@@ -66,7 +69,7 @@ pub(super) fn request(
     }
     let mut body = json!({
         "model": settings.model_id.as_str(),
-        "system": context::instructions(snapshot, decision),
+        "system": client::instructions(snapshot, decision),
         "messages": messages,
         "max_tokens": settings.max_output_tokens.get(),
     });
@@ -80,7 +83,7 @@ pub(super) fn request(
             body["output_config"] = json!({});
         }
         body["output_config"]["format"] =
-            json!({"type":"json_schema","schema":context::decision_schema()});
+            json!({"type":"json_schema","schema":client::decision_schema()});
     } else if !snapshot.tools.is_empty() {
         body["tools"] = json!(
             snapshot
@@ -142,7 +145,7 @@ pub struct AnthropicClient(super::client::Engine);
 impl AnthropicClient {
     pub fn new(config: super::ClientConfig) -> Result<Self, ModelError> {
         Ok(Self(super::client::Engine::new(
-            super::Provider::Anthropic,
+            super::client::Provider::Anthropic,
             config,
         )?))
     }
@@ -152,7 +155,7 @@ impl std::fmt::Debug for AnthropicClient {
         f.write_str("AnthropicClient([redacted])")
     }
 }
-impl<O: super::output::Output> crate::app::ModelClient<O> for AnthropicClient {
+impl<O: super::client::Output> crate::app::ModelClient<O> for AnthropicClient {
     fn generate(
         &self,
         context: &crate::domain::Context<O>,

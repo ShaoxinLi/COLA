@@ -1,8 +1,8 @@
-use super::{
-    Decoded, Event, ModelError, ModelSettings, OutputKind, Record, Snapshot, WireCall, array,
-    context, events, malformed, string, unsupported,
+use super::client::{
+    self, Decoded, Event, OutputKind, Record, Snapshot, WireCall, array, events, malformed, string,
+    unsupported,
 };
-use crate::app::{IncompleteReason, ModelErrorKind};
+use crate::app::{IncompleteReason, ModelError, ModelErrorKind, ModelSettings};
 use serde_json::{Value, json};
 
 pub(super) fn request(
@@ -15,7 +15,7 @@ pub(super) fn request(
     let decision = kind == OutputKind::Decision;
     let mut input = Vec::new();
     if decision {
-        for text in context::review_history(snapshot) {
+        for text in client::review_history(snapshot) {
             input.push(json!({"role":"user","content":text}));
         }
     } else {
@@ -31,14 +31,14 @@ pub(super) fn request(
                 Event::Result(call, result) => input.push(json!({
                     "type": "function_call_output",
                     "call_id": &call.id,
-                    "output": context::outcome(result.outcome()).to_string(),
+                    "output": client::outcome(result.outcome()).to_string(),
                 })),
             }
         }
     }
     let mut body = json!({
         "model": settings.model_id.as_str(),
-        "instructions": context::instructions(snapshot, decision),
+        "instructions": client::instructions(snapshot, decision),
         "input": input,
         "max_output_tokens": settings.max_output_tokens.get(),
         "store": false,
@@ -50,7 +50,7 @@ pub(super) fn request(
     if decision {
         body["text"] = json!({"format": {
             "type": "json_schema", "name": "decision", "strict": true,
-            "schema": context::decision_schema(),
+            "schema": client::decision_schema(),
         }});
     } else if !snapshot.tools.is_empty() {
         body["tools"] = json!(
@@ -156,7 +156,7 @@ pub struct OpenAIClient(super::client::Engine);
 impl OpenAIClient {
     pub fn new(config: super::ClientConfig) -> Result<Self, ModelError> {
         Ok(Self(super::client::Engine::new(
-            super::Provider::OpenAI,
+            super::client::Provider::OpenAI,
             config,
         )?))
     }
@@ -166,7 +166,7 @@ impl std::fmt::Debug for OpenAIClient {
         f.write_str("OpenAIClient([redacted])")
     }
 }
-impl<O: super::output::Output> crate::app::ModelClient<O> for OpenAIClient {
+impl<O: super::client::Output> crate::app::ModelClient<O> for OpenAIClient {
     fn generate(
         &self,
         context: &crate::domain::Context<O>,

@@ -104,12 +104,19 @@ The modules own the following knowledge.
 | `src/app/model_client.rs` | Port, settings, outcomes, typed opaque token, and safe errors. |
 | `src/adapters/models/openai.rs` | `OpenAIClient`, Responses requests, and native decoding. |
 | `src/adapters/models/anthropic.rs` | `AnthropicClient`, Messages requests, and native decoding. |
-| `src/adapters/models/client.rs` | Shared invocation, offered-tool checks, and fresh domain call IDs. |
-| `src/adapters/models/replay.rs` | Exact history binding and cumulative native records. |
-| `src/adapters/models/context.rs` | Factual history, notices, and the decision schema. |
-| `src/adapters/models/output.rs` | Private checked conversion to the two supported domain outputs. |
-| `src/adapters/models/transport.rs` | Explicit configuration, native headers, deadlines, and byte caps. |
-| `src/adapters/models/mod.rs` | Re-exports, shared decoded items, and ordered replay events. |
+| `src/adapters/models/client.rs` | Shared invocation, offered-tool checks, fresh domain call IDs, exact replay, checked output conversion, factual history, decoded items, ordered events, and bounded HTTP with explicit configuration. |
+| `src/adapters/models/mod.rs` | Private module declarations and the three public re-exports. |
+
+`client.rs` keeps `Engine`, `Transport`, `Snapshot`, `Replay`, `Record`, and `Output`
+as distinct private responsibilities. It also owns `ClientConfig`, context and
+notice rendering, and the shared decoded and event types. Co-location reduces
+navigation between shared request, validation, and replay rules without adding
+indirection. Provider files retain their native request and response logic.
+
+The integration tests use the same four filenames in `tests/adapters/models`.
+`mod.rs` owns shared fixtures, `openai.rs` and `anthropic.rs` hold provider-only
+cases, and `client.rs` holds common error, protocol, and replay cases.
+`tests/model_clients.rs` loads that test tree.
 
 ## Outcome and protocol contracts
 
@@ -194,9 +201,11 @@ this production implementation.
 
 The implementation keeps the selected public API and places both concrete client
 structs in their provider files. A private generic output implementation avoids a
-public codec and the old boilerplate macro. The shared invocation module owns real
-cross-provider validation and token publication rules. Native call IDs and the
-assistant receipt are required private values after decision handling, so the
+public codec and the old boilerplate macro. `client.rs` co-locates shared invocation,
+bounded transport, exact replay, checked output conversion, and factual rendering.
+These private responsibilities retain their types and validation rules.
+Native call IDs and the assistant receipt are required private values after
+decision handling, so the
 implementation has no third-provider optional-ID states.
 
 The owner accepted rejection of native call ID reuse within a supplied

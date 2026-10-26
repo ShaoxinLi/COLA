@@ -1,3 +1,7 @@
+mod anthropic;
+mod client;
+mod openai;
+
 use cola::{
     adapters::models::{AnthropicClient, ClientConfig, OpenAIClient},
     app::*,
@@ -6,6 +10,7 @@ use cola::{
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
+    error::Error,
     io::{Read, Write},
     net::TcpListener,
     num::{NonZeroU32, NonZeroUsize},
@@ -17,42 +22,42 @@ use std::{
     time::{Duration, Instant},
 };
 #[derive(Clone, Copy, Debug)]
-pub enum Provider {
+enum Provider {
     OpenAI,
     Anthropic,
 }
-pub const PROVIDERS: [Provider; 2] = [Provider::OpenAI, Provider::Anthropic];
+const PROVIDERS: [Provider; 2] = [Provider::OpenAI, Provider::Anthropic];
 impl Provider {
-    pub fn model(self) -> &'static str {
+    fn model(self) -> &'static str {
         match self {
             Self::OpenAI => "gpt-6.1-sol",
             Self::Anthropic => "claude-opus-5-5",
         }
     }
-    pub fn settings(self) -> ModelSettings {
+    fn settings(self) -> ModelSettings {
         ModelSettings {
             model_id: ModelId::new(self.model()).unwrap(),
             effort: Effort::High,
             max_output_tokens: NonZeroU32::new(1024).unwrap(),
         }
     }
-    pub fn client(self, server: &Server) -> Box<dyn ModelClient<AssistantMessage>> {
+    fn client(self, server: &Server) -> Box<dyn ModelClient<AssistantMessage>> {
         self.configured(server.config())
     }
-    pub fn configured(self, config: ClientConfig) -> Box<dyn ModelClient<AssistantMessage>> {
+    fn configured(self, config: ClientConfig) -> Box<dyn ModelClient<AssistantMessage>> {
         match self {
             Self::OpenAI => Box::new(OpenAIClient::new(config).unwrap()),
             Self::Anthropic => Box::new(AnthropicClient::new(config).unwrap()),
         }
     }
-    pub fn reviewer(self, server: &Server) -> Box<dyn ModelClient<Decision>> {
+    fn reviewer(self, server: &Server) -> Box<dyn ModelClient<Decision>> {
         let c = server.config();
         match self {
             Self::OpenAI => Box::new(OpenAIClient::new(c).unwrap()),
             Self::Anthropic => Box::new(AnthropicClient::new(c).unwrap()),
         }
     }
-    pub fn answer(self, text: &str) -> Value {
+    fn answer(self, text: &str) -> Value {
         match self {
             Self::OpenAI => {
                 json!({"status":"completed","output":[{"type":"reasoning","id":"reason-final","summary":[],"encrypted_content":"terminal-signature"},{"type":"message","id":"answer","role":"assistant","status":"completed","content":[{"type":"output_text","text":text}]}]})
@@ -62,7 +67,7 @@ impl Provider {
             }
         }
     }
-    pub fn tool(self, n: usize) -> Value {
+    fn tool(self, n: usize) -> Value {
         match self {
             Self::OpenAI => {
                 json!({"status":"completed","output":[{"type":"reasoning","id":format!("reason-{n}"),"summary":[],"encrypted_content":format!("signature-{n}")},{"type":"message","id":format!("message-{n}"),"role":"assistant","content":[{"type":"output_text","text":"working"}]},{"type":"function_call","id":format!("item-{n}"),"call_id":format!("native-{n}"),"name":"lookup","arguments":format!("{{\"n\":{n}}}") }]})
@@ -72,13 +77,13 @@ impl Provider {
             }
         }
     }
-    pub fn native(self, response: &Value) -> Value {
+    fn native(self, response: &Value) -> Value {
         match self {
             Self::OpenAI => response["output"].clone(),
             Self::Anthropic => response["content"].clone(),
         }
     }
-    pub fn request_native(self, request: &Value) -> Vec<Value> {
+    fn request_native(self, request: &Value) -> Vec<Value> {
         match self {
             Self::OpenAI => request["input"]
                 .as_array()
@@ -97,21 +102,21 @@ impl Provider {
         }
     }
 }
-pub fn text(s: &str) -> NonEmptyText {
+fn text(s: &str) -> NonEmptyText {
     NonEmptyText::new(s).unwrap()
 }
-pub fn user(s: &str) -> UserMessage {
+fn user(s: &str) -> UserMessage {
     UserMessage::new(text(s))
 }
-pub fn tool() -> ToolDefinition {
+fn tool() -> ToolDefinition {
     ToolDefinition::new(ToolName::new("lookup").unwrap(),text("Look up a value"),InputSchema::new(json!({"type":"object","properties":{"n":{"type":"integer","minimum":0}},"required":["n"],"additionalProperties":false})).unwrap())
 }
-pub fn session() -> Session {
+fn session() -> Session {
     let mut s = Session::new(SessionId::new("fixture").unwrap());
     s.start_turn(user("hello")).unwrap();
     s
 }
-pub fn context<O>(s: &Session) -> Context<O> {
+fn context<O>(s: &Session) -> Context<O> {
     Context::new(
         text("Be useful"),
         s.context_exchanges().unwrap(),
@@ -119,7 +124,7 @@ pub fn context<O>(s: &Session) -> Context<O> {
     )
     .unwrap()
 }
-pub fn complete<O>(generation: Generation<O>) -> (O, Option<Continuation<O>>) {
+fn complete<O>(generation: Generation<O>) -> (O, Option<Continuation<O>>) {
     match generation {
         Generation::Complete {
             output,
@@ -135,7 +140,7 @@ pub fn complete<O>(generation: Generation<O>) -> (O, Option<Continuation<O>>) {
         ),
     }
 }
-pub fn accept(s: &mut Session, output: AssistantMessage) {
+fn accept(s: &mut Session, output: AssistantMessage) {
     let turn = s.active_turn().unwrap().id();
     let calls = output
         .calls()
@@ -154,12 +159,12 @@ pub fn accept(s: &mut Session, output: AssistantMessage) {
     }
 }
 #[derive(Clone)]
-pub struct Reply {
-    pub status: u16,
-    pub body: String,
-    pub delay: Duration,
-    pub body_delay: Duration,
-    pub headers: Vec<(String, String)>,
+struct Reply {
+    status: u16,
+    body: String,
+    delay: Duration,
+    body_delay: Duration,
+    headers: Vec<(String, String)>,
 }
 impl From<Value> for Reply {
     fn from(value: Value) -> Self {
@@ -173,19 +178,19 @@ impl From<Value> for Reply {
     }
 }
 #[derive(Clone, Debug)]
-pub struct Request {
-    pub line: String,
-    pub headers: String,
-    pub body: Value,
+struct Request {
+    line: String,
+    headers: String,
+    body: Value,
 }
-pub struct Server {
-    pub url: String,
+struct Server {
+    url: String,
     requests: Arc<Mutex<Vec<Request>>>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Server {
-    pub fn new(responses: Vec<Reply>) -> Self {
+    fn new(responses: Vec<Reply>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/custom/v1", listener.local_addr().unwrap());
@@ -284,7 +289,7 @@ impl Server {
             worker: Some(worker),
         }
     }
-    pub fn config(&self) -> ClientConfig {
+    fn config(&self) -> ClientConfig {
         ClientConfig::new(
             &self.url,
             "secret-key",
@@ -293,10 +298,10 @@ impl Server {
         )
         .unwrap()
     }
-    pub fn requests(&self) -> Vec<Request> {
+    fn requests(&self) -> Vec<Request> {
         self.requests.lock().unwrap().clone()
     }
-    pub fn request(&self, index: usize) -> Request {
+    fn request(&self, index: usize) -> Request {
         let until = Instant::now() + Duration::from_secs(2);
         loop {
             if let Some(r) = self.requests().get(index) {
@@ -312,4 +317,18 @@ impl Drop for Server {
         self.stop.store(true, Ordering::SeqCst);
         self.worker.take().unwrap().join().unwrap();
     }
+}
+
+fn assert_safe(error: &ModelError) {
+    let text = format!("{error:?} {error}");
+    for secret in [
+        "API_KEY_SENTINEL",
+        "BODY_SENTINEL",
+        "URL_SENTINEL",
+        "secret-key",
+        "http://",
+    ] {
+        assert!(!text.contains(secret), "leak {text}");
+    }
+    assert!(error.source().is_none());
 }
