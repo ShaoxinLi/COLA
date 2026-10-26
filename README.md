@@ -14,8 +14,10 @@ restoration.
 The application port `cola::app::SessionStore` and filesystem adapter
 `cola::adapters::stores::JsonlSessionStore` persist complete session facts.
 The adapters `cola::adapters::tools::{BashTool, ReadFileTool, WriteFileTool}`
-execute Bash commands and file operations on the host. The agent execution
-loop and model integration are not implemented.
+execute Bash commands and file operations on the host. The blocking model adapters
+`cola::adapters::models::{OpenAIClient, AnthropicClient, GoogleClient}` implement
+`cola::app::ModelClient<O>` for assistant messages and review decisions, with
+checked native replay. The agent execution loop is not implemented.
 
 Implementations of `Tool` validate their argument fields and return
 `ToolOutcome`. Execution can block the caller. The caller selects the tool,
@@ -54,6 +56,9 @@ cargo run --example basic_tools
 ```
 
 ## Documentation
+
+- [Model clients](docs/model-clients.md) describes native APIs, exact model
+  profiles, typed output, replay binding, and transport limits.
 
 - [Basic tool adapters](docs/tools.md) describes arguments, host behavior,
   output limits, and blocking execution.
