@@ -13,9 +13,11 @@ restoration.
 
 The application port `cola::app::SessionStore` and filesystem adapter
 `cola::adapters::stores::JsonlSessionStore` persist complete session facts.
-The agent execution loop, model integration, and tool executors are not implemented.
+The adapters `cola::adapters::tools::{BashTool, ReadFileTool, WriteFileTool}`
+execute Bash commands and file operations on the host. The agent execution
+loop and model integration are not implemented.
 
-External implementations of `Tool` validate their argument fields and return
+Implementations of `Tool` validate their argument fields and return
 `ToolOutcome`. Execution can block the caller. The caller selects the tool,
 associates its outcome with the original call ID, and records the result in
 `Session`.
@@ -44,8 +46,17 @@ Run the persistence example to save and reload a session on a local filesystem.
 cargo run --example session_store -- /path/to/sessions
 ```
 
+Run the real tool example to write and read a temporary file and execute Bash.
+Bash must be available on PATH.
+
+```sh
+cargo run --example basic_tools
+```
+
 ## Documentation
 
+- [Basic tool adapters](docs/tools.md) describes arguments, host behavior,
+  output limits, and blocking execution.
 - [Session persistence](docs/session-store.md) describes atomic JSONL snapshots
   and recovery on a local filesystem.
 
