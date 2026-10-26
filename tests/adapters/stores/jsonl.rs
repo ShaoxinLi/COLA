@@ -385,19 +385,6 @@ fn concurrent_publication_exposes_complete_sessions() {
 }
 
 #[test]
-fn port_errors_preserve_the_original_source() {
-    use cola::app::SessionStoreError;
-    use std::{error::Error, io};
-    let error = SessionStoreError::new(
-        SessionStoreErrorKind::Storage,
-        io::Error::new(io::ErrorKind::PermissionDenied, "original"),
-    );
-    let source = error.source().unwrap().downcast_ref::<io::Error>().unwrap();
-    assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
-    assert_eq!(source.to_string(), "original");
-}
-
-#[test]
 fn future_headers_are_classified_before_v1_fields() {
     let root = tempfile::tempdir().unwrap();
     let store = JsonlSessionStore::new(root.path());

@@ -11,11 +11,16 @@ fn context_rejects_orphans_bad_order_unresolved_batches_and_inconsistent_outcome
     let turn = TurnId::new(1).unwrap();
     let answer = Message::Assistant(AssistantMessage::answer("done").unwrap());
     let invalid = vec![
-        (vec![], None),
-        (vec![Message::Tool(result("a"))], None),
+        (vec![], None, ContextError::MissingUser),
+        (
+            vec![Message::Tool(result("a"))],
+            None,
+            ContextError::MissingUser,
+        ),
         (
             vec![Message::User(user("read")), Message::Tool(result("a"))],
             None,
+            ContextError::InvalidMessageOrder,
         ),
         (
             vec![
@@ -23,6 +28,7 @@ fn context_rejects_orphans_bad_order_unresolved_batches_and_inconsistent_outcome
                 Message::Assistant(batch(&["a"])),
             ],
             None,
+            ContextError::UnresolvedToolBatch,
         ),
         (
             vec![
@@ -31,6 +37,7 @@ fn context_rejects_orphans_bad_order_unresolved_batches_and_inconsistent_outcome
                 Message::Tool(result("b")),
             ],
             None,
+            ContextError::MismatchedToolResult,
         ),
         (
             vec![
@@ -40,27 +47,36 @@ fn context_rejects_orphans_bad_order_unresolved_batches_and_inconsistent_outcome
                 Message::Tool(result("a")),
             ],
             None,
+            ContextError::MismatchedToolResult,
         ),
         (
             vec![Message::User(user("read")), Message::User(user("again"))],
             None,
+            ContextError::InvalidMessageOrder,
         ),
         (
             vec![Message::User(user("read")), answer.clone(), answer.clone()],
             Some(TurnOutcome::Completed),
+            ContextError::InvalidMessageOrder,
         ),
-        (vec![Message::User(user("read")), answer.clone()], None),
+        (
+            vec![Message::User(user("read")), answer.clone()],
+            None,
+            ContextError::InvalidOutcome,
+        ),
         (
             vec![Message::User(user("read"))],
             Some(TurnOutcome::Completed),
+            ContextError::InvalidOutcome,
         ),
         (
             vec![Message::User(user("read")), answer],
             Some(TurnOutcome::Interrupted(StopReason::UserCancelled)),
+            ContextError::InvalidOutcome,
         ),
     ];
-    for (messages, outcome) in invalid {
-        assert!(ContextExchange::new(turn, messages, outcome).is_err());
+    for (messages, outcome, expected) in invalid {
+        assert_eq!(ContextExchange::new(turn, messages, outcome), Err(expected));
     }
     let duplicate = vec![
         Message::User(user("read")),
