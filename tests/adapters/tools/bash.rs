@@ -1,4 +1,4 @@
-use super::contracts::{execute, failure, success};
+use super::{execute, failure, success};
 use cola::adapters::tools::BashTool;
 use serde_json::json;
 use tempfile::tempdir;

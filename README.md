@@ -18,9 +18,18 @@ The domain has no application or adapter dependency. Application contracts use
 domain values. Adapters implement the contracts. Callers own model invocation,
 tool selection, execution, continuation acceptance, and persistence ordering.
 
-Integration tests have separate entry points in `tests/domain.rs`, `tests/app.rs`,
-and `tests/adapters.rs`. Test files follow production ownership. Shared fixtures
-live beside the tests that use them.
+## Test structure
+
+Tests follow the same layer boundaries.
+
+| Entry point | Coverage and shared setup |
+| --- | --- |
+| [`tests/domain.rs`](tests/domain.rs) | Shared domain fixtures and per-module tests. Snapshot recovery stays with conversation tests. |
+| [`tests/app.rs`](tests/app.rs) | Provider-neutral model and persistence contracts. |
+| [`tests/adapters.rs`](tests/adapters.rs) | Model, store, and tool tests. The `tools` module owns shared tool contracts and helpers. |
+
+Model tests share a local HTTP server and provider fixtures in
+[`tests/adapters/models/support.rs`](tests/adapters/models/support.rs).
 
 ## Build and verify
 

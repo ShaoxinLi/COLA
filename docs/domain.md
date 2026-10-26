@@ -6,8 +6,7 @@ models, executes tools, and saves sessions.
 
 ## Module map
 
-The source modules own the following contracts. All public types are re-exported
-from `cola::domain`.
+All public types are re-exported from `cola::domain`.
 
 | Source | Contracts and objects |
 | --- | --- |
@@ -34,24 +33,11 @@ exception for optional assistant preambles.
 | `AssistantMessage::ToolRequests` | A nonempty batch and an optional preamble. A whitespace-only preamble becomes `None`. |
 | `Message` | `User(UserMessage)`, `Assistant(AssistantMessage)`, or `Tool(ToolResult)`. |
 
-`ValueError` reports constructor failures, including blank values, invalid names,
-non-object arguments, empty batches, and duplicate batch call IDs.
-
 ## Tool contracts
 
-`Tool` is a synchronous, object-safe execution contract. Implementations validate
-their own argument fields. Execution can block the caller.
-
-```rust
-use cola::domain::ToolOutcome;
-use serde_json::{Map, Value};
-
-pub trait Tool {
-	fn execute(&self, arguments: &Map<String, Value>) -> ToolOutcome;
-}
-```
-
-The tool data types separate model-visible definitions from executable behavior.
+`Tool::execute(&self, arguments: &Map<String, Value>) -> ToolOutcome` is
+synchronous and object safe. Implementations validate their own argument fields.
+Execution can block the caller. Definitions describe tools without executing them.
 
 | Type | Contents and guarantees |
 | --- | --- |
@@ -144,8 +130,6 @@ notices. Its constructor enforces the following message rules.
 
 ### History projections
 
-The projections expose different recorded facts.
-
 | Projection | Contents and limits |
 | --- | --- |
 | `Session::messages()` | All recorded messages, including unresolved tool requests and partial results. |
@@ -198,13 +182,12 @@ objects mirror the conversation hierarchy.
 | `ToolCallSnapshot` | Raw `id`, `name`, and JSON `arguments`. |
 | `ExecutionSnapshot` | `call_id`, typed `state`, and optional typed `resolution`. |
 
-`Session::restore()` checks raw values and replays normal transitions. It checks
+`Session::restore()` validates raw values through normal transitions. It checks
 turn numbering, call uniqueness, execution alignment and order, outcomes, and
 resolution eligibility. Failures return `RestoreError`.
 
-Restore closes formerly active work as `Interrupted(ProcessLost)`. It retains
-partial facts and never resumes or executes a call. A closed snapshot roundtrip
-preserves all facts, including resolution evidence.
+Restore closes active work as `Interrupted(ProcessLost)` without executing calls.
+Closed turns retain all facts, including partial batches and resolution evidence.
 
 Invariant-bearing domain types do not implement deserialization. Restoration
 checks structural consistency but does not authenticate recorded effects.
@@ -212,8 +195,6 @@ The [session persistence reference](session-store.md) describes the application
 port and the private JSONL representation.
 
 ## Errors
-
-The domain exposes typed failures at each validation boundary.
 
 | Error | Rejected input or operation |
 | --- | --- |

@@ -5,7 +5,6 @@ use cola::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
     error::Error,
     io::{Read, Write},
     net::TcpListener,
@@ -15,7 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -169,7 +168,7 @@ impl From<Value> for Reply {
             status: 200,
             body: value.to_string(),
             delay: Duration::ZERO,
-            body_delay: std::time::Duration::ZERO,
+            body_delay: Duration::ZERO,
             headers: vec![],
         }
     }
@@ -196,7 +195,7 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let worker = thread::spawn(move || {
-            let mut replies = VecDeque::from(responses);
+            let mut replies = responses.into_iter();
             while !stopped.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(v) => v,
@@ -247,11 +246,11 @@ impl Server {
                     body: serde_json::from_slice(&bytes[header_end..]).unwrap(),
                 };
                 received.lock().unwrap().push(request);
-                let reply = replies.pop_front().unwrap_or_else(|| Reply {
+                let reply = replies.next().unwrap_or_else(|| Reply {
                     status: 500,
                     body: "unexpected request".into(),
                     delay: Duration::ZERO,
-                    body_delay: std::time::Duration::ZERO,
+                    body_delay: Duration::ZERO,
                     headers: vec![],
                 });
                 thread::sleep(reply.delay);
@@ -299,14 +298,12 @@ impl Server {
         self.requests.lock().unwrap().clone()
     }
     pub(super) fn request(&self, index: usize) -> Request {
-        let until = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(r) = self.requests().get(index) {
-                return r.clone();
-            }
-            assert!(Instant::now() < until, "request missing");
-            thread::sleep(Duration::from_millis(1));
-        }
+        self.requests
+            .lock()
+            .unwrap()
+            .get(index)
+            .expect("request was recorded before the synchronous response")
+            .clone()
     }
 }
 impl Drop for Server {

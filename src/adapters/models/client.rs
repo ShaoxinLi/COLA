@@ -29,14 +29,11 @@ pub(super) enum OutputKind {
     Assistant,
     Decision,
 }
-pub(super) fn error(kind: ModelErrorKind) -> ModelError {
-    ModelError::new(kind)
-}
 pub(super) fn malformed() -> ModelError {
-    error(ModelErrorKind::MalformedResponse)
+    ModelError::new(ModelErrorKind::MalformedResponse)
 }
 pub(super) fn unsupported() -> ModelError {
-    error(ModelErrorKind::UnsupportedResponse)
+    ModelError::new(ModelErrorKind::UnsupportedResponse)
 }
 pub(super) fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, ModelError> {
     value.get(key).and_then(Value::as_str).ok_or_else(malformed)
@@ -92,7 +89,7 @@ pub(super) fn events<'a>(
                     } else if let AssistantMessage::Answer(text) = assistant {
                         events.push(Event::Answer(text));
                     } else {
-                        return Err(error(ModelErrorKind::MissingContinuation));
+                        return Err(ModelError::new(ModelErrorKind::MissingContinuation));
                     }
                 }
                 Message::Tool(result) => {
@@ -104,7 +101,7 @@ pub(super) fn events<'a>(
                                 .iter()
                                 .find(|call| call.call.id() == result.call_id())
                         })
-                        .ok_or_else(|| error(ModelErrorKind::MissingContinuation))?;
+                        .ok_or_else(|| ModelError::new(ModelErrorKind::MissingContinuation))?;
                     events.push(Event::Result(call, result));
                 }
             }
@@ -148,7 +145,7 @@ impl Engine {
         let old = continuation
             .map(|c| {
                 c.downcast::<Replay>()
-                    .ok_or_else(|| error(ModelErrorKind::ContinuationMismatch))
+                    .ok_or_else(|| ModelError::new(ModelErrorKind::ContinuationMismatch))
             })
             .transpose()?;
         if let Some(old) = old {
@@ -167,7 +164,7 @@ impl Engine {
                 .last()
                 .is_none_or(|e| e.outcome().is_some())
             {
-                return Err(error(ModelErrorKind::UnsupportedInput));
+                return Err(ModelError::new(ModelErrorKind::UnsupportedInput));
             }
         }
         let records = old.map_or(&[][..], |r| r.records.as_slice());
@@ -272,7 +269,8 @@ impl ClientConfig {
         timeout: Duration,
         max_response_bytes: NonZeroUsize,
     ) -> Result<Self, ModelError> {
-        let base = Url::parse(base_url).map_err(|_| error(ModelErrorKind::InvalidConfig))?;
+        let base =
+            Url::parse(base_url).map_err(|_| ModelError::new(ModelErrorKind::InvalidConfig))?;
         let has_userinfo = base_url.split_once("://").is_some_and(|(_, rest)| {
             rest.split(['/', '?', '#'])
                 .next()
@@ -290,10 +288,10 @@ impl ClientConfig {
             || api_key.trim().is_empty()
             || max_response_bytes.get() == usize::MAX
         {
-            return Err(error(ModelErrorKind::InvalidConfig));
+            return Err(ModelError::new(ModelErrorKind::InvalidConfig));
         }
-        let mut key =
-            HeaderValue::from_str(api_key).map_err(|_| error(ModelErrorKind::InvalidConfig))?;
+        let mut key = HeaderValue::from_str(api_key)
+            .map_err(|_| ModelError::new(ModelErrorKind::InvalidConfig))?;
         key.set_sensitive(true);
         Ok(Self {
             base,
@@ -316,7 +314,7 @@ impl Transport {
             .retry(reqwest::retry::never())
             .no_proxy()
             .build()
-            .map_err(|_| error(ModelErrorKind::InvalidConfig))?;
+            .map_err(|_| ModelError::new(ModelErrorKind::InvalidConfig))?;
         Ok(Self { config, client })
     }
     fn endpoint(&self, provider: Provider) -> Url {
@@ -344,9 +342,9 @@ impl Transport {
                     .config
                     .key
                     .to_str()
-                    .map_err(|_| error(ModelErrorKind::InvalidConfig))?;
+                    .map_err(|_| ModelError::new(ModelErrorKind::InvalidConfig))?;
                 let mut bearer = HeaderValue::from_str(&format!("Bearer {key}"))
-                    .map_err(|_| error(ModelErrorKind::InvalidConfig))?;
+                    .map_err(|_| ModelError::new(ModelErrorKind::InvalidConfig))?;
                 bearer.set_sensitive(true);
                 headers.insert("authorization", bearer);
             }
@@ -362,7 +360,7 @@ impl Transport {
             .json(body)
             .send()
             .map_err(|e| {
-                error(if e.is_timeout() {
+                ModelError::new(if e.is_timeout() {
                     ModelErrorKind::Timeout
                 } else {
                     ModelErrorKind::Transport
@@ -383,14 +381,14 @@ impl Transport {
         }
         let max = self.config.limit.get();
         if response.content_length().is_some_and(|n| n > max as u64) {
-            return Err(error(ModelErrorKind::ResponseTooLarge));
+            return Err(ModelError::new(ModelErrorKind::ResponseTooLarge));
         }
         let mut bytes = Vec::new();
         response
             .take(max as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| {
-                error(
+                ModelError::new(
                     if e.kind() == std::io::ErrorKind::TimedOut
                         || e.get_ref()
                             .and_then(|source| source.downcast_ref::<reqwest::Error>())
@@ -403,9 +401,10 @@ impl Transport {
                 )
             })?;
         if bytes.len() > max {
-            return Err(error(ModelErrorKind::ResponseTooLarge));
+            return Err(ModelError::new(ModelErrorKind::ResponseTooLarge));
         }
-        serde_json::from_slice(&bytes).map_err(|_| error(ModelErrorKind::MalformedResponse))
+        serde_json::from_slice(&bytes)
+            .map_err(|_| ModelError::new(ModelErrorKind::MalformedResponse))
     }
 }
 
@@ -460,10 +459,10 @@ impl Replay {
             || self.kind != kind
             || &self.model_id != model_id
         {
-            return Err(error(ModelErrorKind::ContinuationMismatch));
+            return Err(ModelError::new(ModelErrorKind::ContinuationMismatch));
         }
         if !self.accepts_exact_output_and_next_input(current) {
-            return Err(error(ModelErrorKind::ContinuationMismatch));
+            return Err(ModelError::new(ModelErrorKind::ContinuationMismatch));
         }
         Ok(())
     }
@@ -560,7 +559,7 @@ pub(super) fn require_history(
                 .any(|message| matches!(message, Message::Assistant(a) if a.calls().is_some()))
         })
     {
-        return Err(error(ModelErrorKind::MissingContinuation));
+        return Err(ModelError::new(ModelErrorKind::MissingContinuation));
     }
     Ok(())
 }
@@ -595,10 +594,7 @@ impl Output for AssistantMessage {
 }
 impl Output for Decision {
     const KIND: OutputKind = OutputKind::Decision;
-    fn decode(text: String, calls: Vec<ToolCall>) -> Result<Self, ModelError> {
-        if !calls.is_empty() {
-            return Err(malformed());
-        }
+    fn decode(text: String, _: Vec<ToolCall>) -> Result<Self, ModelError> {
         let value: DecisionWire = serde_json::from_str(&text).map_err(|_| malformed())?;
         let should_allow = value.should_allow;
         let reason = match value.reason {

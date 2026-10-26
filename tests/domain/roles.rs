@@ -1,4 +1,4 @@
-use super::support::text;
+use super::text;
 use cola::domain::{
     Assistant, AssistantMessage, Context, ContextError, Decision, ExecutionNotice, Session,
     SessionId, StopReason, ToolCall, ToolCallId, ToolCallReviewer, ToolCalls, ToolName,

@@ -1,4 +1,4 @@
-use super::support::text;
+use super::text;
 use cola::domain::{NonEmptyText, SessionId, ToolCallId, ToolName, TurnId, ValueError};
 
 #[test]

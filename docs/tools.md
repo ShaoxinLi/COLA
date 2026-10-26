@@ -6,8 +6,6 @@
 
 ## Implementations
 
-The adapter modules own their argument validation, definitions, and execution.
-
 | Adapter | Tool name | Required string fields | Success output | Source |
 | --- | --- | --- | --- | --- |
 | `BashTool` | `bash` | `command` | Captured process output. | [`bash.rs`](../src/adapters/tools/bash.rs) |
@@ -37,8 +35,6 @@ Two readers drain stdout and stderr concurrently. Each retains its first 64 KiB
 and discards subsequent bytes while continuing to drain. Truncated streams end
 with `[output truncated after 65536 bytes]`. Invalid UTF-8 becomes replacement
 characters.
-
-The outcome preserves the following process information.
 
 | Process result | Tool outcome |
 | --- | --- |
@@ -75,13 +71,9 @@ Writes follow host symlink and permission behavior. They are non-atomic and
 provide no durability guarantee. A failure can leave a created file or partial
 content. The adapter adds no retries.
 
-## Caller ownership and verification
+## Caller ownership
 
 The caller selects the adapter and records its outcome with the original call
 ID. `Session` owns call ordering and recorded facts. There is no built-in
-registry, agent loop, sandbox, or approval policy.
-
-Tests follow the implementation modules in `tests/adapters/tools/bash.rs` and
-`tests/adapters/tools/files.rs`. Shared argument, definition, and working-directory
-contracts live in `tests/adapters/tools/contracts.rs`. Tests execute real local
+registry, agent loop, sandbox, or approval policy. Tests execute real local
 processes and file operations.

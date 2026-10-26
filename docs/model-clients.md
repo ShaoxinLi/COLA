@@ -6,32 +6,12 @@ The caller owns context construction, session changes, and tool execution.
 
 ## Application contracts
 
-[`src/app/model_client.rs`](../src/app/model_client.rs) defines the port and its
-supporting types. It depends on domain values and has no provider configuration.
-
-```rust
-use cola::{
-	app::{Continuation, Generation, ModelError, ModelSettings},
-	domain::Context,
-};
-
-pub trait ModelClient<O> {
-	fn generate(
-		&self,
-		context: &Context<O>,
-		settings: &ModelSettings,
-		continuation: Option<&Continuation<O>>,
-	) -> Result<Generation<O>, ModelError>;
-}
-```
-
-`ModelClient<O>` is object safe. The output parameter binds the context, client,
-and continuation to the same output type. Fake implementations can return
-complete output without a continuation.
+[`ModelClient<O>`](../src/app/model_client.rs) defines synchronous, object-safe
+`generate(context, settings, continuation)`. Its output type `O` binds the context,
+client, and continuation. Implementations can return complete output without a
+continuation. Provider configuration belongs to the adapters.
 
 ### Settings and outcomes
-
-The application types describe caller intent and checked results.
 
 | Type | Contract |
 | --- | --- |
@@ -48,8 +28,6 @@ The application types describe caller intent and checked results.
 bodies, and underlying error sources. `kind()` and `http_status()` expose the
 safe classification.
 
-The error kinds identify the failed boundary.
-
 | Boundary | `ModelErrorKind` values |
 | --- | --- |
 | Configuration and input | `InvalidConfig`, `InvalidSettings`, `UnsupportedInput`. |
@@ -64,8 +42,7 @@ publishes the replacement token only after accepting the exact returned output
 into `Session`. Errors, refusals, incomplete responses, and rejected output leave
 the previous token available for reuse.
 
-The port does not define token serialization or reconstruction. The concrete
-adapters below define their own continuation checks.
+The port defines no token serialization or reconstruction.
 
 ## Adapter implementations
 
@@ -81,20 +58,19 @@ adapters below define their own continuation checks.
 
 ### Explicit configuration and transport
 
-`ClientConfig::new(base_url, api_key, timeout, max_response_bytes)` validates and
-stores connection settings. Each client constructor accepts a `ClientConfig`.
-Clients do not read environment credentials.
+`ClientConfig::new(base_url, api_key, timeout, max_response_bytes)` validates
+connection settings. Both client constructors accept a `ClientConfig`.
+Credentials are explicit.
 
 The base URL requires HTTP or HTTPS and a host. User information, query strings,
 and fragments are rejected. The key must be nonblank and valid as an HTTP header.
 The timeout must be positive and fit in `u64` milliseconds. The byte cap uses
 `NonZeroUsize` and rejects `usize::MAX`.
 
-Base paths are retained. OpenAI appends `/responses`; Anthropic appends
-`/messages`. Keys appear only in authentication headers. Both clients redact
-`Debug` output. Redirects, automatic retries, and environment proxies are disabled.
-The deadline covers the whole HTTP exchange, including body reads. Successful
-bodies are capped before JSON decoding, including chunked responses.
+Base paths are retained. Keys appear only in authentication headers, and clients
+redact `Debug` output. Redirects, retries, and environment proxies are disabled.
+The deadline covers the whole HTTP exchange. Body reads enforce the byte cap
+before JSON decoding, including chunked responses.
 
 Non-success HTTP responses retain their status and use these classifications.
 
@@ -108,29 +84,23 @@ Non-success HTTP responses retain their status and use these classifications.
 
 ### Provider requests
 
-Provider requests preserve the supplied model ID, effort, output limit, and tool
-schemas. The adapters have no model catalog, capability inference, effort
-fallback, or schema normalization.
+Requests preserve model IDs, efforts, output limits, and schemas without
+capability inference or normalization. Provider rejection returns a typed error.
 
 | Setting | OpenAI | Anthropic |
 | --- | --- | --- |
-| Native route | Responses. | Messages. |
+| Route appended to base path | `/responses` | `/messages` |
 | Authentication | `Authorization: Bearer ...`. | `x-api-key`, with `anthropic-version: 2026-10-21`. |
 | Output limit | `max_output_tokens`. | `max_tokens`. |
 | Assistant tools | Function schemas with `strict: false`. | Tools with `input_schema`. |
 | Decision format | `text.format` with a strict JSON schema. | `output_config.format` with a JSON schema. |
 | Native history | `store: false` and `reasoning.encrypted_content` requested. | Thinking, signatures, and redacted thinking retained when returned. |
 
-Effort has the following exact mapping.
-
 | `Effort` | OpenAI | Anthropic |
 | --- | --- | --- |
 | `Default` | Omit reasoning effort. | Omit effort and thinking. |
 | `Off` | `reasoning.effort = "none"`. | `thinking.type = "disabled"`. Omit effort. |
 | `Low`, `Medium`, `High`, `Xhigh`, `Max` | Exact lowercase `reasoning.effort`. | Exact lowercase `output_config.effort`. Omit thinking. |
-
-A provider can reject a model, effort, or schema. HTTP 400 returns
-`InvalidSettings` without changing or retrying the request.
 
 ### Checked outputs
 
@@ -161,11 +131,9 @@ Every complete assistant response returns a cumulative replacement continuation,
 including after a final answer. Supported native items retain their original
 fields and replay once at their recorded positions.
 
-The token binds the following facts.
-
-- The provider, normalized endpoint, and model ID.
-- All previous exchange boundaries, messages, outcomes, and notices.
-- The exact returned assistant message and native call correlations.
+The token binds the provider, normalized endpoint, model ID, and all prior
+exchange boundaries, messages, outcomes, and notices. It also binds the returned
+assistant message and native call correlations.
 
 Instructions, the tool catalog, effort, token limit, credentials, and transport
 limits can change. Existing history cannot change.
@@ -191,11 +159,8 @@ Tokens have no durable format or hidden cache and can grow with conversation
 length. These adapters provide no streaming, asynchronous calls, history fitting,
 model discovery, or agent loop.
 
-## Verification
+## Test scope
 
-Application-port tests live in `tests/app/model_client.rs`. Adapter tests live in
-`tests/adapters/models`, with common cases in `client.rs` and provider cases in
-`openai.rs` and `anthropic.rs`. Shared fixtures live in `tests/adapters/models/support.rs`.
-Common model cases exercise both providers through local HTTP fixtures. They check request
-bodies, headers, decoding, replay, safe errors, deadlines, redirects, and byte caps.
-These tests do not establish live-provider acceptance of a model or schema.
+Model tests use local HTTP fixtures for both providers. They verify requests,
+checked output, replay, error redaction, deadlines, redirects, and byte caps.
+They do not establish live-provider acceptance of a model or schema.

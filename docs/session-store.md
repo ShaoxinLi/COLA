@@ -6,22 +6,7 @@ to the domain.
 
 ## Application contract
 
-[`src/app/session_store.rs`](../src/app/session_store.rs) defines the synchronous,
-object-safe `cola::app::SessionStore` port.
-
-```rust
-use cola::{
-	app::SessionStoreError,
-	domain::{Session, SessionId},
-};
-
-pub trait SessionStore {
-	fn list(&self) -> Result<Vec<Session>, SessionStoreError>;
-	fn save(&self, session: &Session) -> Result<(), SessionStoreError>;
-	fn load(&self, id: &SessionId) -> Result<Session, SessionStoreError>;
-}
-```
-
+[`SessionStore`](../src/app/session_store.rs) is a synchronous, object-safe port.
 Each method operates on complete session state.
 
 | Method | Contract |
@@ -47,10 +32,9 @@ retains the underlying error.
 
 ## JSONL adapter
 
-[`src/adapters/stores/jsonl.rs`](../src/adapters/stores/jsonl.rs) owns
-`cola::adapters::stores::JsonlSessionStore`, its private wire types, and filesystem
-publication. `JsonlSessionStore::new(root)` stores the root path without accessing
-the filesystem. Save creates missing directories.
+[`JsonlSessionStore`](../src/adapters/stores/jsonl.rs) owns the wire types and
+filesystem publication. `new(root)` stores the path without filesystem access.
+Save creates missing directories.
 
 The adapter uses `Session::snapshot()` for export and `Session::restore()` for
 validated recovery. Domain types have no serialization derives or storage
@@ -68,8 +52,7 @@ ID against its filename. Only names matching 64 lowercase hexadecimal characters
 plus `.jsonl` are recognized. Temporary files and unrelated names are ignored.
 A corrupt recognized file fails the listing.
 
-A missing root gives an empty list and a `NotFound` load error. Listing is sorted
-by `SessionId` but is not a transaction across concurrent directory changes.
+Listing is not a transaction across concurrent directory changes.
 
 ### Version 1 records
 
@@ -83,8 +66,6 @@ A complete session with one answered turn has this representation.
 {"format":"cola.session","version":1,"session_id":"example","closed_turn_count":1,"active":false}
 {"record":"closed","turn":{"id":1,"user":"Hello","steps":[{"assistant":{"kind":"answer","text":"Hello"},"executions":[]}],"outcome":{"kind":"completed"}}}
 ```
-
-The private wire objects mirror the snapshot hierarchy.
 
 | Object | Fields |
 | --- | --- |
@@ -100,9 +81,9 @@ The private wire objects mirror the snapshot hierarchy.
 | Resolution | `disposition`, `source`, `evidence`. |
 | Turn outcome | `kind: completed`, `kind: interrupted` with `reason`, or `kind: failed` with `failure`. |
 
-Nested enum objects use a `kind` tag. Descriptions and evidence must be nonblank.
-The decoder rejects unknown fields, blank lines, malformed JSON, missing final
-LF, wrong record order or count, identity mismatches, and invalid domain state.
+Descriptions and evidence must be nonblank. The decoder rejects unknown fields,
+blank lines, malformed JSON, missing final LF, wrong record order or count,
+identity mismatches, and invalid domain state.
 Declared counts detect truncation that removes complete lines.
 
 Format and version are read before the strict version 1 header. Future versions
@@ -124,24 +105,21 @@ Publication has the following order.
 4. Sync the directory on Unix.
 
 Failures before replacement preserve the prior file. A Unix directory-sync error
-can return after new bytes become visible. Retrying the same save is safe.
+can return after new bytes become visible.
 
 Concurrent saves use separate temporary files. Saves of the same ID use the last
 rename and have no stale-write detection. Reads observe complete committed files.
 Unix temporary files start with mode `0600`, subject to the process umask.
 Orphan temporary files are ignored and are not automatically removed.
 
-## Checkpoint ordering
+## Dispatch checkpoints
 
-A caller records `Session::start_tool`, saves successfully, and then invokes the
-tool. After the tool returns, the caller records the result and saves again.
-A failed pre-dispatch save stops dispatch. Messages alone cannot preserve this
-distinction between a requested call and recorded dispatch intent.
+Persistence distinguishes a requested call from dispatch intent only when the
+caller records `Session::start_tool` and saves before invoking the tool. A failed
+save stops dispatch. After execution, the caller records the result and saves again.
 
-## Verification
+## Test scope
 
-Port error tests live in `tests/app/session_store.rs`. Adapter tests in
-`tests/adapters/stores/jsonl.rs` use real temporary files to verify complete
-facts, recovery, opaque IDs, corruption rejection, overwrite refusal, numeric
-fidelity, and concurrent publication. They do not simulate power loss or
-establish guarantees for network filesystems.
+Storage tests use real temporary files to check recovery, corruption rejection,
+overwrite refusal, numeric fidelity, and concurrent publication. They do not
+simulate power loss or establish guarantees for network filesystems.

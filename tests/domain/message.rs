@@ -1,4 +1,4 @@
-use super::support::call;
+use super::call;
 use cola::domain::{AssistantMessage, ToolCalls};
 
 #[test]
