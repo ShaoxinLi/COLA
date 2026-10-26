@@ -2,7 +2,7 @@ use super::{
     AssistantMessage, EffectResolution, ExecutionState, Message, NonEmptyText, Session, ToolCall,
     ToolCallId, ToolDefinition, ToolName, ToolResult, TurnId, TurnOutcome,
 };
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{collections::BTreeSet, error::Error, fmt, marker::PhantomData};
 
 /// Domain-derived facts, separate from user, assistant, and tool messages.
 /// An unknown effect stays unknown in the original history after reconciliation.
@@ -130,13 +130,22 @@ impl ContextExchange {
 
 /// Immutable model input data. This value performs no history selection, token
 /// measurement, persistence, prompt rendering, execution, or fitting policy.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Context {
+/// The output type associates input with the value an external model should produce.
+///
+/// ```compile_fail
+/// use cola::domain::{AssistantMessage, Context, Decision};
+/// fn assistant_input(_: Context<AssistantMessage>) {}
+/// fn review_input(context: Context<Decision>) {
+///     assistant_input(context);
+/// }
+/// ```
+pub struct Context<O> {
     instructions: NonEmptyText,
     exchanges: Vec<ContextExchange>,
     tools: Vec<ToolDefinition>,
+    output: PhantomData<fn() -> O>,
 }
-impl Context {
+impl<O> Context<O> {
     pub fn new(
         instructions: NonEmptyText,
         exchanges: Vec<ContextExchange>,
@@ -184,6 +193,7 @@ impl Context {
             instructions,
             exchanges,
             tools,
+            output: PhantomData,
         })
     }
     pub fn instructions(&self) -> &NonEmptyText {
@@ -204,6 +214,34 @@ impl Context {
         self.exchanges.iter().flat_map(|exchange| &exchange.notices)
     }
 }
+
+impl<O> Clone for Context<O> {
+    fn clone(&self) -> Self {
+        Self {
+            instructions: self.instructions.clone(),
+            exchanges: self.exchanges.clone(),
+            tools: self.tools.clone(),
+            output: PhantomData,
+        }
+    }
+}
+impl<O> fmt::Debug for Context<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Context")
+            .field("instructions", &self.instructions)
+            .field("exchanges", &self.exchanges)
+            .field("tools", &self.tools)
+            .finish()
+    }
+}
+impl<O> PartialEq for Context<O> {
+    fn eq(&self, other: &Self) -> bool {
+        self.instructions == other.instructions
+            && self.exchanges == other.exchanges
+            && self.tools == other.tools
+    }
+}
+impl<O> Eq for Context<O> {}
 
 fn validate_messages(
     messages: &[Message],
@@ -259,6 +297,16 @@ impl Session {
     /// effects, and reconciliations become notices instead of incomplete messages.
     /// Active work must already await the model. Every turn is included.
     pub fn context_exchanges(&self) -> Result<Vec<ContextExchange>, ContextError> {
+        let mut exchanges = self.closed_context_exchanges()?;
+        if let Some(turn) = self.active_turn() {
+            exchanges.push(ContextExchange::new(turn.id(), turn.messages(), None)?);
+        }
+        Ok(exchanges)
+    }
+
+    /// Projects closed turns with their recovery notices, excluding all active-turn messages.
+    /// This projection is available while an active tool batch is unresolved.
+    pub fn closed_context_exchanges(&self) -> Result<Vec<ContextExchange>, ContextError> {
         let mut exchanges = vec![];
         for turn in self.turns() {
             let mut messages = vec![Message::User(turn.user().clone())];
@@ -292,9 +340,6 @@ impl Session {
                 ContextExchange::new(turn.id(), messages, Some(turn.outcome().clone()))?;
             exchange.notices.extend(partial_notices);
             exchanges.push(exchange);
-        }
-        if let Some(turn) = self.active_turn() {
-            exchanges.push(ContextExchange::new(turn.id(), turn.messages(), None)?);
         }
         Ok(exchanges)
     }

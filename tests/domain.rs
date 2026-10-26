@@ -368,7 +368,7 @@ fn cancellation_preserves_returned_started_and_undispatched_facts() {
             .count(),
         1
     );
-    let context = Context::new(
+    let context = Context::<AssistantMessage>::new(
         text("Be accurate."),
         session.context_exchanges().unwrap(),
         vec![],
@@ -487,7 +487,7 @@ fn interruptions_and_failures_are_explicit_terminal_outcomes() {
             &TurnOutcome::Failed(failure)
         );
     }
-    let context = Context::new(
+    let context = Context::<AssistantMessage>::new(
         text("answer honestly"),
         session.context_exchanges().unwrap(),
         vec![],
@@ -751,7 +751,7 @@ fn context_accepts_complete_exchanges_and_active_model_wait_with_unique_catalog(
     session.record_assistant(second, batch(&["c"])).unwrap();
     finish_tool(&mut session, second, "c");
     let exchanges = session.context_exchanges().unwrap();
-    let context = Context::new(
+    let context = Context::<AssistantMessage>::new(
         text("Use tools carefully."),
         exchanges.clone(),
         vec![definition("read_file")],
@@ -766,7 +766,7 @@ fn context_accepts_complete_exchanges_and_active_model_wait_with_unique_catalog(
     assert_eq!(context.exchanges().len(), 2);
     assert_eq!(context.execution_notices().count(), 0);
     assert!(matches!(
-        Context::new(
+        Context::<AssistantMessage>::new(
             text("rules"),
             exchanges,
             vec![definition("read_file"), definition("read_file")]
@@ -791,7 +791,7 @@ fn context_rejects_duplicate_ids_across_exchanges_and_invalid_exchange_boundarie
         .unwrap()
     };
     assert!(matches!(
-        Context::new(
+        Context::<AssistantMessage>::new(
             text("rules"),
             vec![complete(1, "a"), complete(2, "a")],
             vec![]
@@ -799,7 +799,7 @@ fn context_rejects_duplicate_ids_across_exchanges_and_invalid_exchange_boundarie
         Err(ContextError::DuplicateCallId(_))
     ));
     assert_eq!(
-        Context::new(
+        Context::<AssistantMessage>::new(
             text("rules"),
             vec![complete(2, "a"), complete(1, "b")],
             vec![]
@@ -813,7 +813,7 @@ fn context_rejects_duplicate_ids_across_exchanges_and_invalid_exchange_boundarie
     )
     .unwrap();
     assert_eq!(
-        Context::new(text("rules"), vec![active, complete(2, "b")], vec![]),
+        Context::<AssistantMessage>::new(text("rules"), vec![active, complete(2, "b")], vec![]),
         Err(ContextError::ActiveExchangeNotLast)
     );
     let (mut cancelled, turn) = partial_turn();
@@ -823,7 +823,56 @@ fn context_rejects_duplicate_ids_across_exchanges_and_invalid_exchange_boundarie
     let mut exchanges = cancelled.context_exchanges().unwrap();
     exchanges.push(complete(2, "b"));
     assert_eq!(
-        Context::new(text("rules"), exchanges, vec![]),
+        Context::<AssistantMessage>::new(text("rules"), exchanges, vec![]),
         Err(ContextError::DuplicateCallId(id("b")))
     );
+}
+
+#[test]
+fn closed_projection_retains_recovery_facts_while_an_active_batch_is_pending() {
+    let (mut session, closed) = partial_turn();
+    session.interrupt(closed, StopReason::ProcessLost).unwrap();
+    let fact = resolution(ResolutionSource::Observation);
+    session
+        .resolve_effect(closed, &id("b"), fact.clone())
+        .unwrap();
+    let expected = session.context_exchanges().unwrap();
+    let active = session.start_turn(user("read another file")).unwrap();
+    session
+        .record_assistant(active, batch(&["pending"]))
+        .unwrap();
+    session.start_tool(active, &id("pending")).unwrap();
+    let before = session.snapshot();
+    let exchanges = session.closed_context_exchanges().unwrap();
+    assert_eq!(exchanges, expected);
+    assert_eq!(exchanges.len(), 1);
+    assert_eq!(
+        exchanges[0].messages(),
+        &[Message::User(user("read three files"))]
+    );
+    assert!(
+        matches!(&exchanges[0].notices()[0], ExecutionNotice::TurnClosed { turn_id, outcome: TurnOutcome::Interrupted(StopReason::ProcessLost) } if *turn_id == closed)
+    );
+    assert!(
+        matches!(&exchanges[0].notices()[1], ExecutionNotice::ConfirmedResult { call: c, result: r, .. } if c == &call("a") && r == &result("a"))
+    );
+    assert!(
+        matches!(&exchanges[0].notices()[2], ExecutionNotice::UnknownEffect { call: c, resolution: Some(r), .. } if c == &call("b") && r == &fact)
+    );
+    assert!(
+        matches!(&exchanges[0].notices()[3], ExecutionNotice::Undispatched { call: c, .. } if c == &call("c"))
+    );
+    assert_eq!(
+        session.context_exchanges(),
+        Err(ContextError::UnresolvedToolBatch)
+    );
+    assert_eq!(session.snapshot(), before);
+    session
+        .record_tool_result(active, result("pending"))
+        .unwrap();
+    let all = session.context_exchanges().unwrap();
+    assert_eq!(&all[..1], exchanges.as_slice());
+    assert_eq!(all[1].turn_id(), active);
+    assert_eq!(all[1].messages().len(), 3);
+    assert_eq!(session.closed_context_exchanges().unwrap(), exchanges);
 }

@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         turn,
         AssistantMessage::answer("notes.txt says: Meeting at 10.")?,
     )?;
-    let context = Context::new(
+    let context = Context::<AssistantMessage>::new(
         NonEmptyText::new("Answer using recorded facts.")?,
         session.context_exchanges()?,
         vec![],
