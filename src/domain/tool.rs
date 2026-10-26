@@ -2,6 +2,16 @@ use super::{NonEmptyText, ToolCallId, ToolName, ValueError};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 
+/// Synchronous execution implemented outside the domain library.
+///
+/// Implementations validate tool-specific argument fields and return ordinary
+/// failures as [`ToolOutcome::Failure`]. Execution can block the caller.
+/// The caller selects the implementation and associates its outcome with the
+/// original call ID in a [`ToolResult`].
+pub trait Tool {
+    fn execute(&self, arguments: &Map<String, Value>) -> ToolOutcome;
+}
+
 /// A JSON Schema descriptor with an object root and `"type": "object"`.
 ///
 /// Only those two structural conditions are checked. Other keywords, references,
