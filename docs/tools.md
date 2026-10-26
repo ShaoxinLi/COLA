@@ -85,14 +85,3 @@ semantics.
 The caller selects the adapter and records its outcome with the original call
 ID. `Session` continues to own tool ordering and recorded facts. There is no
 built-in registry, model loop, sandbox, or approval policy.
-
-The [basic_tools example](../examples/basic_tools.rs) writes and reads a temporary
-file, then runs Bash against it. It checks the actual outcomes and exits with an
-error if they differ from the expected content.
-
-```sh
-cargo run --example basic_tools
-```
-
-The [domain example](../examples/read_file.rs) remains a separate in-memory
-conversation with manually supplied output.

@@ -5,9 +5,6 @@ conversation facts and validates their order. Model clients, tool executors,
 persistence adapters, and the application loop are outside the domain module.
 The persistence port and filesystem adapter live elsewhere in the same crate.
 
-The [domain example](../examples/read_file.rs) supplies model and tool output
-manually. It performs no file operation.
-
 ## Tool execution contracts
 
 `Tool` defines executable behavior. Implementations remain outside the domain
