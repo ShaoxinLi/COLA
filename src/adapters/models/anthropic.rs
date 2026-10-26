@@ -1,6 +1,5 @@
 use super::client::{
-    self, Decoded, Event, OutputKind, Record, Snapshot, WireCall, array, events, malformed, string,
-    unsupported,
+    self, Decoded, Event, OutputKind, Snapshot, WireCall, array, malformed, string, unsupported,
 };
 use crate::{
     app::{IncompleteReason, ModelError, ModelSettings},
@@ -22,8 +21,8 @@ pub(super) fn request(
     settings: &ModelSettings,
     effort: Option<&str>,
     kind: OutputKind,
-    records: &[Record],
-) -> Result<Value, ModelError> {
+    events: Vec<Event<'_>>,
+) -> Value {
     let decision = kind == OutputKind::Decision;
     let mut messages = Vec::new();
     if decision {
@@ -35,7 +34,7 @@ pub(super) fn request(
             );
         }
     } else {
-        for event in events(snapshot, records)? {
+        for event in events {
             match event {
                 Event::User(text) | Event::Fact(text) => push(
                     &mut messages,
@@ -47,8 +46,8 @@ pub(super) fn request(
                     "assistant",
                     vec![json!({"type":"text","text":text.as_str()})],
                 ),
-                Event::Native(record) => push(&mut messages, "assistant", record.raw.clone()),
-                Event::Result(call, result) => {
+                Event::Native(raw) => push(&mut messages, "assistant", raw.to_vec()),
+                Event::Result(id, result) => {
                     let content = match result.outcome() {
                         ToolOutcome::Success(text) => text.as_str(),
                         ToolOutcome::Failure(error) => error.description().as_str(),
@@ -58,7 +57,7 @@ pub(super) fn request(
                         "user",
                         vec![json!({
                             "type": "tool_result",
-                            "tool_use_id": &call.id,
+                            "tool_use_id": id,
                             "is_error": matches!(result.outcome(), ToolOutcome::Failure(_)),
                             "content": content,
                         })],
@@ -97,7 +96,7 @@ pub(super) fn request(
                 .collect::<Vec<_>>()
         );
     }
-    Ok(body)
+    body
 }
 pub(super) fn decode(value: Value) -> Result<Decoded, ModelError> {
     let stop = string(&value, "stop_reason")?;

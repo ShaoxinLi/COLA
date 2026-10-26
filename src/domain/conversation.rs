@@ -104,6 +104,22 @@ pub struct Step {
     executions: Vec<ExecutionRecord>,
 }
 impl Step {
+    fn new(assistant: AssistantMessage) -> Self {
+        let executions = assistant.calls().map_or_else(Vec::new, |calls| {
+            calls
+                .as_slice()
+                .iter()
+                .map(|_| ExecutionRecord {
+                    state: ExecutionState::NotStarted,
+                    resolution: None,
+                })
+                .collect()
+        });
+        Self {
+            assistant,
+            executions,
+        }
+    }
     pub fn assistant(&self) -> &AssistantMessage {
         &self.assistant
     }
@@ -116,10 +132,70 @@ impl Step {
     fn calls(&self) -> &[ToolCall] {
         self.assistant.calls().map_or(&[], ToolCalls::as_slice)
     }
+    fn call_index(&self, call_id: &ToolCallId) -> Option<usize> {
+        self.calls().iter().position(|call| call.id() == call_id)
+    }
     fn pending_index(&self) -> Option<usize> {
         self.executions
             .iter()
             .position(|e| !matches!(e.state, ExecutionState::Returned(_)))
+    }
+    fn next_action(&self) -> NextAction {
+        match self.pending_index() {
+            None => NextAction::AskModel,
+            Some(index) => match self.executions[index].state {
+                ExecutionState::NotStarted => NextAction::Execute(self.calls()[index].id().clone()),
+                ExecutionState::Started => NextAction::AwaitTool,
+                ExecutionState::Returned(_) => unreachable!("pending_index excludes returns"),
+            },
+        }
+    }
+    fn start_tool(&mut self, call_id: &ToolCallId) -> Result<&ToolCall, SessionError> {
+        let index = self.call_index(call_id).ok_or(SessionError::UnknownCall)?;
+        match self.executions[index].state {
+            ExecutionState::Started => return Err(SessionError::AlreadyStarted),
+            ExecutionState::Returned(_) => return Err(SessionError::AlreadyReturned),
+            ExecutionState::NotStarted => {}
+        }
+        if self.pending_index() != Some(index) {
+            return Err(SessionError::OutOfOrder);
+        }
+        self.executions[index].state = ExecutionState::Started;
+        Ok(&self.calls()[index])
+    }
+    fn record_tool_result(&mut self, result: ToolResult) -> Result<(), SessionError> {
+        let index = self
+            .call_index(result.call_id())
+            .ok_or(SessionError::UnknownCall)?;
+        match self.executions[index].state {
+            ExecutionState::NotStarted => return Err(SessionError::NotStarted),
+            ExecutionState::Returned(_) => return Err(SessionError::AlreadyReturned),
+            ExecutionState::Started => {}
+        }
+        if self.pending_index() != Some(index) {
+            return Err(SessionError::OutOfOrder);
+        }
+        self.executions[index].state = ExecutionState::Returned(result.outcome().clone());
+        Ok(())
+    }
+    fn resolve_effect(
+        &mut self,
+        call_id: &ToolCallId,
+        resolution: &EffectResolution,
+    ) -> Option<Result<(), SessionError>> {
+        let index = self.call_index(call_id)?;
+        let execution = &mut self.executions[index];
+        if execution.state != ExecutionState::Started {
+            return Some(Err(SessionError::EffectNotUnknown));
+        }
+        match &execution.resolution {
+            Some(prior) if prior != resolution => {
+                return Some(Err(SessionError::ConflictingResolution));
+            }
+            Some(_) => {}
+            None => execution.resolution = Some(resolution.clone()),
+        }
+        Some(Ok(()))
     }
     pub(crate) fn messages(&self) -> Vec<Message> {
         let mut messages = vec![Message::Assistant(self.assistant.clone())];
@@ -315,14 +391,7 @@ impl Session {
         let Some(step) = active.steps().last() else {
             return NextAction::AskModel;
         };
-        match step.pending_index() {
-            None => NextAction::AskModel,
-            Some(index) => match step.executions[index].state {
-                ExecutionState::NotStarted => NextAction::Execute(step.calls()[index].id().clone()),
-                ExecutionState::Started => NextAction::AwaitTool,
-                ExecutionState::Returned(_) => unreachable!("pending_index excludes returns"),
-            },
-        }
+        step.next_action()
     }
     pub fn record_assistant(
         &mut self,
@@ -345,26 +414,13 @@ impl Session {
                 }
             }
         }
-        let executions = message.calls().map_or_else(Vec::new, |calls| {
-            calls
-                .as_slice()
-                .iter()
-                .map(|_| ExecutionRecord {
-                    state: ExecutionState::NotStarted,
-                    resolution: None,
-                })
-                .collect()
-        });
         let completed = matches!(message, AssistantMessage::Answer(_));
         self.active
             .as_mut()
             .expect("validated active turn")
             .record
             .steps
-            .push(Step {
-                assistant: message,
-                executions,
-            });
+            .push(Step::new(message));
         if completed {
             self.close(TurnOutcome::Completed);
         }
@@ -383,21 +439,7 @@ impl Session {
             .steps
             .last_mut()
             .ok_or(SessionError::UnknownCall)?;
-        let index = step
-            .calls()
-            .iter()
-            .position(|call| call.id() == call_id)
-            .ok_or(SessionError::UnknownCall)?;
-        match step.executions[index].state {
-            ExecutionState::Started => return Err(SessionError::AlreadyStarted),
-            ExecutionState::Returned(_) => return Err(SessionError::AlreadyReturned),
-            ExecutionState::NotStarted => {}
-        }
-        if step.pending_index() != Some(index) {
-            return Err(SessionError::OutOfOrder);
-        }
-        step.executions[index].state = ExecutionState::Started;
-        Ok(&step.calls()[index])
+        step.start_tool(call_id)
     }
     pub fn record_tool_result(
         &mut self,
@@ -410,21 +452,7 @@ impl Session {
             .steps
             .last_mut()
             .ok_or(SessionError::UnknownCall)?;
-        let index = step
-            .calls()
-            .iter()
-            .position(|call| call.id() == result.call_id())
-            .ok_or(SessionError::UnknownCall)?;
-        match step.executions[index].state {
-            ExecutionState::NotStarted => return Err(SessionError::NotStarted),
-            ExecutionState::Returned(_) => return Err(SessionError::AlreadyReturned),
-            ExecutionState::Started => {}
-        }
-        if step.pending_index() != Some(index) {
-            return Err(SessionError::OutOfOrder);
-        }
-        step.executions[index].state = ExecutionState::Returned(result.outcome().clone());
-        Ok(())
+        step.record_tool_result(result)
     }
     pub fn interrupt(&mut self, id: TurnId, reason: StopReason) -> Result<(), SessionError> {
         self.active(id)?;
@@ -459,23 +487,11 @@ impl Session {
             .iter_mut()
             .find(|turn| turn.id() == id)
             .ok_or(SessionError::TurnNotFound)?;
-        for step in &mut turn.record.steps {
-            if let Some(index) = step.calls().iter().position(|call| call.id() == call_id) {
-                let execution = &mut step.executions[index];
-                if execution.state != ExecutionState::Started {
-                    return Err(SessionError::EffectNotUnknown);
-                }
-                match &execution.resolution {
-                    Some(prior) if prior != &resolution => {
-                        return Err(SessionError::ConflictingResolution);
-                    }
-                    Some(_) => {}
-                    None => execution.resolution = Some(resolution),
-                }
-                return Ok(());
-            }
-        }
-        Err(SessionError::UnknownCall)
+        turn.record
+            .steps
+            .iter_mut()
+            .find_map(|step| step.resolve_effect(call_id, &resolution))
+            .unwrap_or(Err(SessionError::UnknownCall))
     }
 }
 

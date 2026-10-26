@@ -94,6 +94,12 @@ fn guard_rejections_are_atomic_and_started_calls_cannot_be_redispatched() {
     );
     session.record_assistant(turn, batch(&["a", "b"])).unwrap();
     assert_eq!(
+        reject_unchanged(&mut session, |s| s
+            .start_tool(turn, &id("missing"))
+            .map(|_| ())),
+        SessionError::UnknownCall
+    );
+    assert_eq!(
         reject_unchanged(&mut session, |s| s.start_tool(turn, &id("b")).map(|_| ())),
         SessionError::OutOfOrder
     );
@@ -112,6 +118,14 @@ fn guard_rejections_are_atomic_and_started_calls_cannot_be_redispatched() {
         SessionError::NotAwaitingModel
     );
     session.start_tool(turn, &id("a")).unwrap();
+    assert_eq!(
+        reject_unchanged(&mut session, |s| s.start_tool(turn, &id("b")).map(|_| ())),
+        SessionError::OutOfOrder
+    );
+    assert_eq!(
+        reject_unchanged(&mut session, |s| s.record_tool_result(turn, result("b"))),
+        SessionError::NotStarted
+    );
     assert_eq!(
         reject_unchanged(&mut session, |s| s.start_tool(turn, &id("a")).map(|_| ())),
         SessionError::AlreadyStarted

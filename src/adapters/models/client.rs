@@ -1,13 +1,13 @@
 use super::{anthropic, openai};
 use crate::{
     app::{
-        Continuation, Effort, Generation, IncompleteReason, ModelError, ModelErrorKind, ModelId,
+        Continuation, Effort, Generation, IncompleteReason, ModelError, ModelErrorKind,
         ModelSettings,
     },
     domain::{
         AssistantMessage, Context, ContextExchange, Decision, EffectDisposition, ExecutionNotice,
-        Message, NonEmptyText, ResolutionSource, StopReason, ToolCall, ToolCallId, ToolCalls,
-        ToolDefinition, ToolName, ToolOutcome, TurnFailure, TurnId, TurnOutcome,
+        NonEmptyText, ResolutionSource, StopReason, ToolCall, ToolCalls, ToolDefinition,
+        ToolOutcome, TurnFailure, TurnOutcome,
     },
 };
 use reqwest::{
@@ -63,54 +63,9 @@ pub(super) struct WireCall {
 pub(super) enum Event<'a> {
     User(String),
     Answer(&'a NonEmptyText),
-    Native(&'a Record),
-    Result(&'a NativeCall, &'a crate::domain::ToolResult),
+    Native(&'a [Value]),
+    Result(&'a str, &'a crate::domain::ToolResult),
     Fact(String),
-}
-pub(super) fn events<'a>(
-    snapshot: &'a Snapshot,
-    records: &'a [Record],
-) -> Result<Vec<Event<'a>>, ModelError> {
-    let mut events = Vec::new();
-    for exchange in &snapshot.exchanges {
-        for (index, message) in exchange.messages().iter().enumerate() {
-            match message {
-                Message::User(user) => events.push(Event::User(format!(
-                    "Turn {}\n{}",
-                    boundary(exchange),
-                    user.text().as_str()
-                ))),
-                Message::Assistant(assistant) => {
-                    if let Some(record) = records
-                        .iter()
-                        .find(|r| r.turn == exchange.turn_id() && r.index == index)
-                    {
-                        events.push(Event::Native(record));
-                    } else if let AssistantMessage::Answer(text) = assistant {
-                        events.push(Event::Answer(text));
-                    } else {
-                        return Err(ModelError::new(ModelErrorKind::MissingContinuation));
-                    }
-                }
-                Message::Tool(result) => {
-                    let call = records
-                        .iter()
-                        .find_map(|record| {
-                            record
-                                .calls
-                                .iter()
-                                .find(|call| call.call.id() == result.call_id())
-                        })
-                        .ok_or_else(|| ModelError::new(ModelErrorKind::MissingContinuation))?;
-                    events.push(Event::Result(call, result));
-                }
-            }
-        }
-        if let Some(fact) = notices(exchange.notices()) {
-            events.push(Event::Fact(fact));
-        }
-    }
-    Ok(events)
 }
 
 #[derive(Clone)]
@@ -142,37 +97,17 @@ impl Engine {
         };
         let endpoint = self.transport.endpoint(self.provider);
         let snapshot = Snapshot::of(context);
-        let old = continuation
-            .map(|c| {
-                c.downcast::<Replay>()
-                    .ok_or_else(|| ModelError::new(ModelErrorKind::ContinuationMismatch))
-            })
-            .transpose()?;
-        if let Some(old) = old {
-            old.check(
-                self.provider,
-                endpoint.as_str(),
-                O::KIND,
-                &settings.model_id,
-                &snapshot,
-            )?;
-        }
-        if O::KIND == OutputKind::Assistant {
-            require_history(&snapshot, old)?;
-            if snapshot
-                .exchanges
-                .last()
-                .is_none_or(|e| e.outcome().is_some())
-            {
-                return Err(ModelError::new(ModelErrorKind::UnsupportedInput));
-            }
-        }
-        let records = old.map_or(&[][..], |r| r.records.as_slice());
+        let old = replay::resume(
+            continuation,
+            self.provider,
+            endpoint.as_str(),
+            &settings.model_id,
+            &snapshot,
+        )?;
+        let events = replay::events(O::KIND, &snapshot, old)?;
         let body = match self.provider {
-            Provider::OpenAI => openai::request(&snapshot, settings, effort, O::KIND, records)?,
-            Provider::Anthropic => {
-                anthropic::request(&snapshot, settings, effort, O::KIND, records)?
-            }
+            Provider::OpenAI => openai::request(&snapshot, settings, effort, O::KIND, events),
+            Provider::Anthropic => anthropic::request(&snapshot, settings, effort, O::KIND, events),
         };
         let value = self
             .transport
@@ -181,69 +116,14 @@ impl Engine {
             Provider::OpenAI => openai::decode(value)?,
             Provider::Anthropic => anthropic::decode(value)?,
         };
-        let (text, wire, raw) = match decoded {
-            Decoded::Refused => return Ok(Generation::Refused { reason: None }),
-            Decoded::Incomplete(reason) => return Ok(Generation::Incomplete { reason }),
-            Decoded::Complete { text, calls, raw } => (text, calls, raw),
-        };
-        if O::KIND == OutputKind::Decision && !wire.is_empty() {
-            return Err(malformed());
-        }
-        let nonce = uuid::Uuid::new_v4();
-        let mut native = Vec::new();
-        let mut ids: std::collections::BTreeSet<String> = records
-            .iter()
-            .flat_map(|record| &record.calls)
-            .map(|call| call.id.clone())
-            .collect();
-        for (index, call) in wire.into_iter().enumerate() {
-            if call.id.trim().is_empty() || !ids.insert(call.id.clone()) {
-                return Err(malformed());
-            }
-            let name = ToolName::new(call.name).map_err(|_| malformed())?;
-            if !snapshot.tools.iter().any(|tool| tool.name() == &name) {
-                return Err(malformed());
-            }
-            let domain = ToolCall::new(
-                ToolCallId::new(format!("{nonce}:{index}")).map_err(|_| malformed())?,
-                name,
-                call.arguments,
-            )
-            .map_err(|_| malformed())?;
-            native.push(NativeCall {
-                call: domain,
-                id: call.id,
-            });
-        }
-        let output = O::decode(text, native.iter().map(|c| c.call.clone()).collect())?;
-        if O::KIND == OutputKind::Decision {
-            return Ok(Generation::Complete {
-                output,
-                continuation: None,
-            });
-        }
-        let receipt = output.receipt().ok_or_else(malformed)?;
-        let mut records = records.to_vec();
-        let last = snapshot.exchanges.last().ok_or_else(malformed)?;
-        records.push(Record {
-            turn: last.turn_id(),
-            index: last.messages().len(),
-            raw,
-            calls: native,
-        });
-        let state = Replay {
-            provider: self.provider,
-            endpoint: endpoint.to_string(),
-            kind: O::KIND,
-            model_id: settings.model_id.clone(),
+        replay::complete(
+            old,
+            self.provider,
+            endpoint.as_str(),
+            &settings.model_id,
             snapshot,
-            receipt,
-            records,
-        };
-        Ok(Generation::Complete {
-            output,
-            continuation: Some(Continuation::new(state)),
-        })
+            decoded,
+        )
     }
 }
 
@@ -423,145 +303,313 @@ impl Snapshot {
         }
     }
 }
-#[derive(Clone)]
-pub(super) struct NativeCall {
-    pub call: ToolCall,
-    pub id: String,
-}
-#[derive(Clone)]
-pub(super) struct Record {
-    pub turn: TurnId,
-    pub index: usize,
-    pub raw: Vec<Value>,
-    pub calls: Vec<NativeCall>,
-}
-#[derive(Clone)]
-pub(super) struct Replay {
-    pub(super) provider: Provider,
-    pub(super) endpoint: String,
-    pub(super) kind: OutputKind,
-    pub(super) model_id: ModelId,
-    pub(super) snapshot: Snapshot,
-    pub(super) receipt: AssistantMessage,
-    pub(super) records: Vec<Record>,
-}
-impl Replay {
-    pub(super) fn check(
-        &self,
-        provider: Provider,
-        endpoint: &str,
-        kind: OutputKind,
-        model_id: &ModelId,
-        current: &Snapshot,
-    ) -> Result<(), ModelError> {
-        if self.provider != provider
-            || self.endpoint != endpoint
-            || self.kind != kind
-            || &self.model_id != model_id
-        {
-            return Err(ModelError::new(ModelErrorKind::ContinuationMismatch));
-        }
-        if !self.accepts_exact_output_and_next_input(current) {
-            return Err(ModelError::new(ModelErrorKind::ContinuationMismatch));
-        }
-        Ok(())
+mod replay {
+    use super::{
+        Decoded, Event, Output, OutputKind, Provider, Snapshot, boundary, malformed, notices,
+    };
+    use crate::{
+        app::{Continuation, Generation, ModelError, ModelErrorKind, ModelId},
+        domain::{
+            AssistantMessage, ContextExchange, ExecutionNotice, Message, ToolCall, ToolCallId,
+            ToolName, TurnId, TurnOutcome,
+        },
+    };
+    use serde_json::Value;
+
+    #[derive(Clone)]
+    struct NativeCall {
+        call: ToolCall,
+        id: String,
     }
-    fn accepts_exact_output_and_next_input(&self, current: &Snapshot) -> bool {
-        let output = &self.receipt;
-        let old = &self.snapshot.exchanges;
-        let Some(last) = old.last() else {
-            return false;
-        };
-        if last.outcome().is_some()
-            || current.exchanges.len() < old.len()
-            || old[..old.len() - 1] != current.exchanges[..old.len() - 1]
-        {
-            return false;
-        }
-        let accepted = &current.exchanges[old.len() - 1];
-        if accepted.turn_id() != last.turn_id() || !accepted.messages().starts_with(last.messages())
-        {
-            return false;
-        }
-        let suffix = &accepted.messages()[last.messages().len()..];
-        if suffix.first() != Some(&Message::Assistant(output.clone())) {
-            return false;
-        }
-        match output {
-            AssistantMessage::Answer(_) => {
-                if suffix.len() != 1
-                    || accepted.outcome() != Some(&TurnOutcome::Completed)
-                    || accepted.notices() != last.notices()
-                {
-                    return false;
-                }
+    #[derive(Clone)]
+    struct Record {
+        turn: TurnId,
+        index: usize,
+        raw: Vec<Value>,
+        calls: Vec<NativeCall>,
+    }
+    #[derive(Clone)]
+    pub(super) struct Replay {
+        provider: Provider,
+        endpoint: String,
+        kind: OutputKind,
+        model_id: ModelId,
+        snapshot: Snapshot,
+        receipt: AssistantMessage,
+        records: Vec<Record>,
+    }
+    impl Replay {
+        fn check(
+            &self,
+            provider: Provider,
+            endpoint: &str,
+            kind: OutputKind,
+            model_id: &ModelId,
+            current: &Snapshot,
+        ) -> Result<(), ModelError> {
+            if self.provider != provider
+                || self.endpoint != endpoint
+                || self.kind != kind
+                || &self.model_id != model_id
+            {
+                return Err(ModelError::new(ModelErrorKind::ContinuationMismatch));
             }
-            AssistantMessage::ToolRequests { calls, .. } => {
-                if suffix.len() != calls.as_slice().len() + 1 {
-                    return false;
-                }
-                for (message, call) in suffix[1..].iter().zip(calls.as_slice()) {
-                    if !matches!(message, Message::Tool(result) if result.call_id() == call.id()) {
-                        return false;
-                    }
-                }
-                if accepted.outcome().is_none() {
-                    if accepted.notices() != last.notices() {
-                        return false;
-                    }
-                } else if !has_exact_closure_notice(accepted) {
-                    return false;
-                }
+            if !self.accepts_exact_output_and_next_input(current) {
+                return Err(ModelError::new(ModelErrorKind::ContinuationMismatch));
             }
+            Ok(())
         }
-        let newly_admitted_turns = &current.exchanges[old.len()..];
-        if !newly_admitted_turns.is_empty() && accepted.outcome().is_none() {
-            return false;
-        }
-        let mut previous = accepted.turn_id();
-        for (index, exchange) in newly_admitted_turns.iter().enumerate() {
-            if previous.get().checked_add(1) != Some(exchange.turn_id().get())
-                || !matches!(exchange.messages(), [Message::User(_)])
+        fn accepts_exact_output_and_next_input(&self, current: &Snapshot) -> bool {
+            let output = &self.receipt;
+            let old = &self.snapshot.exchanges;
+            let Some(last) = old.last() else {
+                return false;
+            };
+            if last.outcome().is_some()
+                || current.exchanges.len() < old.len()
+                || old[..old.len() - 1] != current.exchanges[..old.len() - 1]
             {
                 return false;
             }
-            if exchange.outcome().is_none() {
-                if index + 1 != newly_admitted_turns.len() || !exchange.notices().is_empty() {
-                    return false;
-                }
-            } else if !has_exact_closure_notice(exchange) {
+            let accepted = &current.exchanges[old.len() - 1];
+            if accepted.turn_id() != last.turn_id()
+                || !accepted.messages().starts_with(last.messages())
+            {
                 return false;
             }
-            previous = exchange.turn_id();
+            let suffix = &accepted.messages()[last.messages().len()..];
+            if suffix.first() != Some(&Message::Assistant(output.clone())) {
+                return false;
+            }
+            match output {
+                AssistantMessage::Answer(_) => {
+                    if suffix.len() != 1
+                        || accepted.outcome() != Some(&TurnOutcome::Completed)
+                        || accepted.notices() != last.notices()
+                    {
+                        return false;
+                    }
+                }
+                AssistantMessage::ToolRequests { calls, .. } => {
+                    if suffix.len() != calls.as_slice().len() + 1 {
+                        return false;
+                    }
+                    for (message, call) in suffix[1..].iter().zip(calls.as_slice()) {
+                        if !matches!(message, Message::Tool(result) if result.call_id() == call.id())
+                        {
+                            return false;
+                        }
+                    }
+                    if accepted.outcome().is_none() {
+                        if accepted.notices() != last.notices() {
+                            return false;
+                        }
+                    } else if !has_exact_closure_notice(accepted) {
+                        return false;
+                    }
+                }
+            }
+            let newly_admitted_turns = &current.exchanges[old.len()..];
+            if !newly_admitted_turns.is_empty() && accepted.outcome().is_none() {
+                return false;
+            }
+            let mut previous = accepted.turn_id();
+            for (index, exchange) in newly_admitted_turns.iter().enumerate() {
+                if previous.get().checked_add(1) != Some(exchange.turn_id().get())
+                    || !matches!(exchange.messages(), [Message::User(_)])
+                {
+                    return false;
+                }
+                if exchange.outcome().is_none() {
+                    if index + 1 != newly_admitted_turns.len() || !exchange.notices().is_empty() {
+                        return false;
+                    }
+                } else if !has_exact_closure_notice(exchange) {
+                    return false;
+                }
+                previous = exchange.turn_id();
+            }
+            true
         }
-        true
     }
-}
 
-fn has_exact_closure_notice(exchange: &ContextExchange) -> bool {
-    let Some(outcome @ (TurnOutcome::Interrupted(_) | TurnOutcome::Failed(_))) = exchange.outcome()
-    else {
-        return false;
-    };
-    matches!(exchange.notices(), [ExecutionNotice::TurnClosed { turn_id, outcome: notice_outcome }]
-        if *turn_id == exchange.turn_id() && notice_outcome == outcome)
-}
+    fn has_exact_closure_notice(exchange: &ContextExchange) -> bool {
+        let Some(outcome @ (TurnOutcome::Interrupted(_) | TurnOutcome::Failed(_))) =
+            exchange.outcome()
+        else {
+            return false;
+        };
+        matches!(exchange.notices(), [ExecutionNotice::TurnClosed { turn_id, outcome: notice_outcome }]
+            if *turn_id == exchange.turn_id() && notice_outcome == outcome)
+    }
 
-pub(super) fn require_history(
-    snapshot: &Snapshot,
-    replay: Option<&Replay>,
-) -> Result<(), ModelError> {
-    if replay.is_none()
-        && snapshot.exchanges.iter().any(|exchange| {
-            exchange
-                .messages()
-                .iter()
-                .any(|message| matches!(message, Message::Assistant(a) if a.calls().is_some()))
+    fn require_history(snapshot: &Snapshot, replay: Option<&Replay>) -> Result<(), ModelError> {
+        if replay.is_none()
+            && snapshot.exchanges.iter().any(|exchange| {
+                exchange
+                    .messages()
+                    .iter()
+                    .any(|message| matches!(message, Message::Assistant(a) if a.calls().is_some()))
+            })
+        {
+            return Err(ModelError::new(ModelErrorKind::MissingContinuation));
+        }
+        Ok(())
+    }
+
+    pub(super) fn resume<'a, O: Output>(
+        continuation: Option<&'a Continuation<O>>,
+        provider: Provider,
+        endpoint: &str,
+        model_id: &ModelId,
+        current: &Snapshot,
+    ) -> Result<Option<&'a Replay>, ModelError> {
+        let old = continuation
+            .map(|c| {
+                c.downcast::<Replay>()
+                    .ok_or_else(|| ModelError::new(ModelErrorKind::ContinuationMismatch))
+            })
+            .transpose()?;
+        if let Some(old) = old {
+            old.check(provider, endpoint, O::KIND, model_id, current)?;
+        }
+        if O::KIND == OutputKind::Assistant {
+            require_history(current, old)?;
+            if current
+                .exchanges
+                .last()
+                .is_none_or(|e| e.outcome().is_some())
+            {
+                return Err(ModelError::new(ModelErrorKind::UnsupportedInput));
+            }
+        }
+        Ok(old)
+    }
+
+    pub(super) fn events<'a>(
+        kind: OutputKind,
+        snapshot: &'a Snapshot,
+        previous: Option<&'a Replay>,
+    ) -> Result<Vec<Event<'a>>, ModelError> {
+        if kind == OutputKind::Decision {
+            return Ok(Vec::new());
+        }
+        let records = previous.map_or(&[][..], |replay| replay.records.as_slice());
+        let mut events = Vec::new();
+        for exchange in &snapshot.exchanges {
+            for (index, message) in exchange.messages().iter().enumerate() {
+                match message {
+                    Message::User(user) => events.push(Event::User(format!(
+                        "Turn {}\n{}",
+                        boundary(exchange),
+                        user.text().as_str()
+                    ))),
+                    Message::Assistant(assistant) => {
+                        if let Some(record) = records
+                            .iter()
+                            .find(|r| r.turn == exchange.turn_id() && r.index == index)
+                        {
+                            events.push(Event::Native(&record.raw));
+                        } else if let AssistantMessage::Answer(text) = assistant {
+                            events.push(Event::Answer(text));
+                        } else {
+                            return Err(ModelError::new(ModelErrorKind::MissingContinuation));
+                        }
+                    }
+                    Message::Tool(result) => {
+                        let call = records
+                            .iter()
+                            .find_map(|record| {
+                                record
+                                    .calls
+                                    .iter()
+                                    .find(|call| call.call.id() == result.call_id())
+                            })
+                            .ok_or_else(|| ModelError::new(ModelErrorKind::MissingContinuation))?;
+                        events.push(Event::Result(&call.id, result));
+                    }
+                }
+            }
+            if let Some(fact) = notices(exchange.notices()) {
+                events.push(Event::Fact(fact));
+            }
+        }
+        Ok(events)
+    }
+
+    pub(super) fn complete<O: Output>(
+        previous: Option<&Replay>,
+        provider: Provider,
+        endpoint: &str,
+        model_id: &ModelId,
+        snapshot: Snapshot,
+        decoded: Decoded,
+    ) -> Result<Generation<O>, ModelError> {
+        let records = previous.map_or(&[][..], |replay| replay.records.as_slice());
+        let (text, wire, raw) = match decoded {
+            Decoded::Refused => return Ok(Generation::Refused { reason: None }),
+            Decoded::Incomplete(reason) => return Ok(Generation::Incomplete { reason }),
+            Decoded::Complete { text, calls, raw } => (text, calls, raw),
+        };
+        if O::KIND == OutputKind::Decision && !wire.is_empty() {
+            return Err(malformed());
+        }
+        let nonce = uuid::Uuid::new_v4();
+        let mut native = Vec::new();
+        let mut ids: std::collections::BTreeSet<String> = records
+            .iter()
+            .flat_map(|record| &record.calls)
+            .map(|call| call.id.clone())
+            .collect();
+        for (index, call) in wire.into_iter().enumerate() {
+            if call.id.trim().is_empty() || !ids.insert(call.id.clone()) {
+                return Err(malformed());
+            }
+            let name = ToolName::new(call.name).map_err(|_| malformed())?;
+            if !snapshot.tools.iter().any(|tool| tool.name() == &name) {
+                return Err(malformed());
+            }
+            let domain = ToolCall::new(
+                ToolCallId::new(format!("{nonce}:{index}")).map_err(|_| malformed())?,
+                name,
+                call.arguments,
+            )
+            .map_err(|_| malformed())?;
+            native.push(NativeCall {
+                call: domain,
+                id: call.id,
+            });
+        }
+        let output = O::decode(text, native.iter().map(|c| c.call.clone()).collect())?;
+        if O::KIND == OutputKind::Decision {
+            return Ok(Generation::Complete {
+                output,
+                continuation: None,
+            });
+        }
+        let receipt = output.receipt().ok_or_else(malformed)?;
+        let mut records = records.to_vec();
+        let last = snapshot.exchanges.last().ok_or_else(malformed)?;
+        records.push(Record {
+            turn: last.turn_id(),
+            index: last.messages().len(),
+            raw,
+            calls: native,
+        });
+        let state = Replay {
+            provider,
+            endpoint: endpoint.to_owned(),
+            kind: O::KIND,
+            model_id: model_id.clone(),
+            snapshot,
+            receipt,
+            records,
+        };
+        Ok(Generation::Complete {
+            output,
+            continuation: Some(Continuation::new(state)),
         })
-    {
-        return Err(ModelError::new(ModelErrorKind::MissingContinuation));
     }
-    Ok(())
 }
 
 #[derive(Deserialize)]

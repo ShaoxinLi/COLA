@@ -1,6 +1,5 @@
 use super::client::{
-    self, Decoded, Event, OutputKind, Record, Snapshot, WireCall, array, events, malformed, string,
-    unsupported,
+    self, Decoded, Event, OutputKind, Snapshot, WireCall, array, malformed, string, unsupported,
 };
 use crate::app::{IncompleteReason, ModelError, ModelErrorKind, ModelSettings};
 use serde_json::{Value, json};
@@ -10,8 +9,8 @@ pub(super) fn request(
     settings: &ModelSettings,
     effort: Option<&str>,
     kind: OutputKind,
-    records: &[Record],
-) -> Result<Value, ModelError> {
+    events: Vec<Event<'_>>,
+) -> Value {
     let decision = kind == OutputKind::Decision;
     let mut input = Vec::new();
     if decision {
@@ -19,7 +18,7 @@ pub(super) fn request(
             input.push(json!({"role":"user","content":text}));
         }
     } else {
-        for event in events(snapshot, records)? {
+        for event in events {
             match event {
                 Event::User(text) | Event::Fact(text) => {
                     input.push(json!({"role": "user", "content": text}));
@@ -27,10 +26,10 @@ pub(super) fn request(
                 Event::Answer(text) => {
                     input.push(json!({"role": "assistant", "content": text.as_str()}));
                 }
-                Event::Native(record) => input.extend(record.raw.clone()),
-                Event::Result(call, result) => input.push(json!({
+                Event::Native(raw) => input.extend(raw.iter().cloned()),
+                Event::Result(id, result) => input.push(json!({
                     "type": "function_call_output",
-                    "call_id": &call.id,
+                    "call_id": id,
                     "output": client::outcome(result.outcome()).to_string(),
                 })),
             }
@@ -67,7 +66,7 @@ pub(super) fn request(
                 .collect::<Vec<_>>()
         );
     }
-    Ok(body)
+    body
 }
 pub(super) fn decode(value: Value) -> Result<Decoded, ModelError> {
     match string(&value, "status")? {
