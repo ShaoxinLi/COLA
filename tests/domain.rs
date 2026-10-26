@@ -4,8 +4,6 @@ mod context;
 mod conversation;
 #[path = "domain/message.rs"]
 mod message;
-#[path = "domain/recovery.rs"]
-mod recovery;
 #[path = "domain/roles.rs"]
 mod roles;
 #[path = "domain/support.rs"]
