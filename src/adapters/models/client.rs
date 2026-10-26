@@ -250,11 +250,12 @@ impl Engine {
     }
 }
 
-/// Connection configuration. A base path is retained; each adapter appends its native route.
-/// Redirects, retries and environment proxies are disabled. Secrets are header-only.
+/// Explicit HTTP connection settings with no environment credentials.
+/// Each adapter appends its native route to the configured base path.
+/// Redirects, retries, and environment proxies are disabled. Keys are sent in headers.
 #[derive(Clone)]
 pub struct ClientConfig {
-    pub(super) base: Url,
+    base: Url,
     key: HeaderValue,
     timeout: Duration,
     limit: NonZeroUsize,
@@ -303,12 +304,12 @@ impl ClientConfig {
     }
 }
 #[derive(Clone)]
-pub(super) struct Transport {
+struct Transport {
     config: ClientConfig,
     client: Client,
 }
 impl Transport {
-    pub fn new(config: ClientConfig) -> Result<Self, ModelError> {
+    fn new(config: ClientConfig) -> Result<Self, ModelError> {
         let client = Client::builder()
             .timeout(config.timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -318,7 +319,7 @@ impl Transport {
             .map_err(|_| error(ModelErrorKind::InvalidConfig))?;
         Ok(Self { config, client })
     }
-    pub fn endpoint(&self, provider: Provider) -> Url {
+    fn endpoint(&self, provider: Provider) -> Url {
         let mut url = self.config.base.clone();
         let mut segments = url
             .path_segments_mut()
@@ -335,12 +336,7 @@ impl Transport {
         drop(segments);
         url
     }
-    pub fn send(
-        &self,
-        provider: Provider,
-        endpoint: Url,
-        body: &Value,
-    ) -> Result<Value, ModelError> {
+    fn send(&self, provider: Provider, endpoint: Url, body: &Value) -> Result<Value, ModelError> {
         let mut headers = HeaderMap::new();
         match provider {
             Provider::OpenAI => {

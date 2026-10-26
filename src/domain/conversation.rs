@@ -279,11 +279,11 @@ impl Session {
             .map(|turn| &turn.record)
             .chain(self.active.iter().map(|turn| &turn.record))
     }
-    fn active(&self, id: TurnId) -> Result<&ActiveTurn, SessionError> {
+    fn active(&mut self, id: TurnId) -> Result<&mut ActiveTurn, SessionError> {
         if self.turns.iter().any(|turn| turn.id() == id) {
             return Err(SessionError::TurnClosed);
         }
-        match &self.active {
+        match &mut self.active {
             Some(turn) if turn.id() == id => Ok(turn),
             Some(_) => Err(SessionError::WrongTurn),
             None => Err(SessionError::NoActiveTurn),
@@ -378,7 +378,11 @@ impl Session {
         call_id: &ToolCallId,
     ) -> Result<&ToolCall, SessionError> {
         let active = self.active(id)?;
-        let step = active.steps().last().ok_or(SessionError::UnknownCall)?;
+        let step = active
+            .record
+            .steps
+            .last_mut()
+            .ok_or(SessionError::UnknownCall)?;
         let index = step
             .calls()
             .iter()
@@ -392,14 +396,6 @@ impl Session {
         if step.pending_index() != Some(index) {
             return Err(SessionError::OutOfOrder);
         }
-        let step = self
-            .active
-            .as_mut()
-            .expect("validated active turn")
-            .record
-            .steps
-            .last_mut()
-            .expect("validated step");
         step.executions[index].state = ExecutionState::Started;
         Ok(&step.calls()[index])
     }
@@ -409,7 +405,11 @@ impl Session {
         result: ToolResult,
     ) -> Result<(), SessionError> {
         let active = self.active(id)?;
-        let step = active.steps().last().ok_or(SessionError::UnknownCall)?;
+        let step = active
+            .record
+            .steps
+            .last_mut()
+            .ok_or(SessionError::UnknownCall)?;
         let index = step
             .calls()
             .iter()
@@ -423,15 +423,7 @@ impl Session {
         if step.pending_index() != Some(index) {
             return Err(SessionError::OutOfOrder);
         }
-        self.active
-            .as_mut()
-            .expect("validated active turn")
-            .record
-            .steps
-            .last_mut()
-            .expect("validated step")
-            .executions[index]
-            .state = ExecutionState::Returned(result.outcome().clone());
+        step.executions[index].state = ExecutionState::Returned(result.outcome().clone());
         Ok(())
     }
     pub fn interrupt(&mut self, id: TurnId, reason: StopReason) -> Result<(), SessionError> {
