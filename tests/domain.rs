@@ -1,5 +1,5 @@
 use cola::domain::*;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 fn text(value: &str) -> NonEmptyText {
     NonEmptyText::new(value).unwrap()
@@ -69,6 +69,67 @@ fn definition(name: &str) -> ToolDefinition {
         text("Read a file"),
         InputSchema::new(json!({"type":"object"})).unwrap(),
     )
+}
+
+#[test]
+fn external_tool_executes_arguments_and_records_success_or_failure() {
+    struct Echo;
+    impl Tool for Echo {
+        fn execute(&self, arguments: &Map<String, Value>) -> ToolOutcome {
+            match arguments.get("text").and_then(Value::as_str) {
+                Some(text) => ToolOutcome::Success(text.to_owned()),
+                None => ToolOutcome::Failure(ToolError::new(text("text must be a string"))),
+            }
+        }
+    }
+
+    let tool: &dyn Tool = &Echo;
+    for (arguments, expected) in [
+        (
+            json!({"text": "hello"}),
+            ToolOutcome::Success("hello".into()),
+        ),
+        (json!({"text": ""}), ToolOutcome::Success(String::new())),
+        (
+            json!({}),
+            ToolOutcome::Failure(ToolError::new(text("text must be a string"))),
+        ),
+        (
+            json!({"text": 42}),
+            ToolOutcome::Failure(ToolError::new(text("text must be a string"))),
+        ),
+    ] {
+        let mut session = session();
+        let turn = session.start_turn(user("echo the text")).unwrap();
+        let call =
+            ToolCall::new(id("echo-call"), ToolName::new("echo").unwrap(), arguments).unwrap();
+        session
+            .record_assistant(
+                turn,
+                AssistantMessage::tool_requests(None, ToolCalls::new(vec![call]).unwrap()),
+            )
+            .unwrap();
+        let call = session.start_tool(turn, &id("echo-call")).unwrap();
+        let result = ToolResult::new(call.id().clone(), tool.execute(call.arguments()));
+        session.record_tool_result(turn, result).unwrap();
+
+        assert_eq!(
+            session.messages().last(),
+            Some(&Message::Tool(ToolResult::new(
+                id("echo-call"),
+                expected.clone()
+            )))
+        );
+        assert_eq!(
+            session.active_turn().unwrap().steps()[0]
+                .executions()
+                .next()
+                .unwrap()
+                .state(),
+            &ExecutionState::Returned(expected)
+        );
+        assert_eq!(session.next_action(), NextAction::AskModel);
+    }
 }
 
 #[test]

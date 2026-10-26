@@ -14,6 +14,6 @@ pub use conversation::{
 };
 pub use message::{AssistantMessage, Message, UserMessage};
 pub use tool::{
-    InputSchema, ToolCall, ToolCalls, ToolDefinition, ToolError, ToolOutcome, ToolResult,
+    InputSchema, Tool, ToolCall, ToolCalls, ToolDefinition, ToolError, ToolOutcome, ToolResult,
 };
 pub use value::{NonEmptyText, SessionId, ToolCallId, ToolName, TurnId, ValueError};

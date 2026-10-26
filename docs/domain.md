@@ -7,6 +7,25 @@ persistence adapters, and the application loop are outside this library.
 The [domain example](../examples/read_file.rs) supplies model and tool output
 manually. It performs no file operation.
 
+## Tool execution contracts
+
+`Tool` defines executable behavior. Implementations remain outside the domain
+library. Its single method borrows the JSON object stored by `ToolCall`.
+
+```rust
+fn execute(&self, arguments: &serde_json::Map<String, serde_json::Value>) -> ToolOutcome;
+```
+
+Execution is synchronous and can block the caller. Each implementation validates
+its tool-specific argument fields. `ToolCall` guarantees only an object root,
+not conformance to `InputSchema`. Ordinary failures return `ToolOutcome::Failure`.
+`ToolOutcome::Success` accepts an empty string.
+
+The caller selects the implementation, passes `call.arguments()` to `execute`,
+and wraps the outcome in `ToolResult` with the original `call.id()`.
+The caller records that result through `Session::record_tool_result`.
+`Session` records execution state without invoking `Tool`.
+
 ## Conversation contracts
 
 `Session` owns closed `Turn` values and at most one `ActiveTurn`. Both use the

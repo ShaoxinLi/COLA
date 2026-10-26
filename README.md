@@ -7,10 +7,16 @@ with Rust.
 
 COLA is in early development. The domain layer is implemented as the
 `cola::domain` library, with conversation state, messages, tool definitions,
-context values, snapshot export, and validated snapshot restoration.
+the synchronous `Tool` execution contract, context values, snapshot export,
+and validated snapshot restoration.
 
 The agent execution loop, model integration, tool executors, and persistence
 adapters are not implemented.
+
+External implementations of `Tool` validate their argument fields and return
+`ToolOutcome`. Execution can block the caller. The caller selects the tool,
+associates its outcome with the original call ID, and records the result in
+`Session`.
 
 ## Build and test
 
