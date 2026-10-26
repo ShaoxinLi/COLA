@@ -169,7 +169,7 @@ implemented artifact.
 ## Implementation reconciliation
 
 The implementation follows the accepted port, ownership, and publication contract.
-The codec lives in private `src/adapters/stores/jsonl/wire.rs`. Domain types have
+The codec lives in private `src/adapters/stores/jsonl/format.rs`. Domain types have
 no serialization derives or storage dependencies. `serde_json/float_roundtrip`
 preserves the numeric regression fixture. Empty tagged variants use empty struct
 variants because serde unit variants accepted unknown fields in a negative test.

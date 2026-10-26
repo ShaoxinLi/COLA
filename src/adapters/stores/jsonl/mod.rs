@@ -1,4 +1,4 @@
-mod wire;
+mod format;
 
 use crate::{
     app::{SessionStore, SessionStoreError, SessionStoreErrorKind},
@@ -31,7 +31,8 @@ impl JsonlSessionStore {
         let bytes = fs::read(path)
             .map_err(read_error)
             .map_err(|e| context(e, path.display().to_string()))?;
-        let snapshot = wire::decode(&bytes).map_err(|e| context(e, path.display().to_string()))?;
+        let snapshot =
+            format::decode(&bytes).map_err(|e| context(e, path.display().to_string()))?;
         if path.file_name().and_then(|s| s.to_str())
             != Some(filename(&snapshot.session_id).as_str())
             || requested.is_some_and(|id| id.as_str() != snapshot.session_id)
@@ -79,8 +80,8 @@ impl SessionStore for JsonlSessionStore {
             Err(e) if e.kind() == SessionStoreErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let bytes = wire::encode(session.snapshot())?;
-        wire::decode(&bytes)?;
+        let bytes = format::encode(session.snapshot())?;
+        format::decode(&bytes)?;
         let mut staged = tempfile::Builder::new()
             .prefix(".cola-")
             .suffix(".tmp")

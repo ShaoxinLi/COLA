@@ -1,2 +1,2 @@
-#[path = "adapters/session_store.rs"]
-mod session_store;
+#[path = "adapters/jsonl_session_store.rs"]
+mod jsonl_session_store;
