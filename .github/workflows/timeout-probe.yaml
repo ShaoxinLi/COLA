@@ -1,0 +1,18 @@
+name: Runner timeout probe
+on:
+  pull_request:
+    branches: [main]
+permissions: {}
+jobs:
+  hold:
+    runs-on: [self-hosted, linux, x64, cola-ci]
+    timeout-minutes: 1
+    steps:
+      - name: Hold a child process past the timeout
+        shell: bash
+        run: |
+          echo "kind=timeout runner=$RUNNER_NAME uid=$(id -u) parent=$BASHPID"
+          sleep 600 &
+          child=$!
+          echo "probe-child=$child"
+          wait "$child"

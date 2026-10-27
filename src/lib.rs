@@ -7,3 +7,7 @@ pub mod domain;
 
 pub mod adapters;
 pub mod app;
+
+pub fn __ci_type_probe() -> u8 {
+    "broken"
+}

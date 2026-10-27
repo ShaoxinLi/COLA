@@ -1,0 +1,18 @@
+name: Runner cancellation probe
+on:
+  pull_request:
+    branches: [main]
+permissions: {}
+jobs:
+  hold:
+    runs-on: [self-hosted, linux, x64, cola-ci]
+    timeout-minutes: 5
+    steps:
+      - name: Hold a child process for cancellation
+        shell: bash
+        run: |
+          echo "kind=cancel runner=$RUNNER_NAME uid=$(id -u) parent=$BASHPID"
+          sleep 600 &
+          child=$!
+          echo "probe-child=$child"
+          wait "$child"
