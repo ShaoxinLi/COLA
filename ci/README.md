@@ -88,7 +88,8 @@ remaining processes when the service stops.
 
 Targets persist outside the workspace. Before checks, a runner clears only its
 own target cache if it exceeds 6 GiB. Cargo fingerprints decide which artifacts
-need recompilation. A toolchain or dependency change can produce a cold run.
+need recompilation. Cargo's default incremental compilation remains enabled.
+A toolchain or dependency change can produce a cold run.
 
 The official runner can update itself through the proxy. The provisioner's
 version and checksum pin the initial installation. Check online status after
