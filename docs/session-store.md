@@ -118,6 +118,12 @@ Persistence distinguishes a requested call from dispatch intent only when the
 caller records `Session::start_tool` and saves before invoking the tool. A failed
 save stops dispatch. After execution, the caller records the result and saves again.
 
+`AgentService` includes the review gate in its dispatch attempt. It saves
+`Started` before reviewer I/O, then invokes the target tool only on approval.
+A denial produces an explicit non-execution failure result, which is saved
+before the next call. A crash during review can therefore recover as an unknown
+effect even if no target tool ran. See the [agent loop](agent-service.md).
+
 ## Test scope
 
 Storage tests use real temporary files to check recovery, corruption rejection,

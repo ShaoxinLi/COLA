@@ -74,6 +74,7 @@ content. The adapter adds no retries.
 ## Caller ownership
 
 The caller selects the adapter and records its outcome with the original call
-ID. `Session` owns call ordering and recorded facts. There is no built-in
-registry, agent loop, sandbox, or approval policy. Tests execute real local
-processes and file operations.
+ID. `Session` owns call ordering and recorded facts.
+[AgentService](agent-service.md) supplies tool lookup, per-call review, execution,
+and result recording. Tool adapters provide no sandbox or approval policy.
+Tests execute real local processes and file operations.
