@@ -24,8 +24,11 @@ rule proxy sends crates.io traffic over the unreliable direct route.
 ## Provision the server
 
 The server needs Bash, Python 3, curl, tar, CA certificates, a C linker, systemd,
-the local `network-proxy.service`, and the
+`network-proxy.service` with an HTTP listener on `127.0.0.1:7890`,
+`naive-proxy.service` with a SOCKS listener on `127.0.0.1:1080`, and the
 [official runner's Linux dependencies](https://github.com/actions/runner/blob/main/src/Misc/layoutbin/installdependencies.sh).
+The rule proxy depends on NaiveProxy. Proxy outages fail network steps. CI does
+not fall back to the unreliable direct route for Cargo downloads.
 The provisioning script accepts the Linux x64 runner archive pinned by version
 and SHA-256 in `provision.sh`, plus an installed Linux x64 Rust toolchain directory
 containing Cargo, Clippy, and rustfmt. Obtain that toolchain with rustup using the
@@ -87,9 +90,9 @@ Targets persist outside the workspace. Before checks, a runner clears only its
 own target cache if it exceeds 6 GiB. Cargo fingerprints decide which artifacts
 need recompilation. A toolchain or dependency change can produce a cold run.
 
-The official runner updates itself through the proxy. The provisioner's version
-and checksum pin the initial installation. Existing registrations retain their
-identity after automatic updates. Review
+The official runner can update itself through the proxy. The provisioner's
+version and checksum pin the initial installation. Check online status after
+updates. Review
 [official releases](https://github.com/actions/runner/releases) when updating that
 initial pin. For Rust updates, change the toolchain file, stage the matching
 toolchain, and rerun provisioning while the runners are stopped.
