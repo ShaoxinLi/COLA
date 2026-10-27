@@ -15,6 +15,7 @@ Environment=CARGO_TARGET_DIR=/var/lib/cola-runners/%i/target
 Environment=CARGO_BUILD_JOBS=1
 Environment=CARGO_INCREMENTAL=0
 Environment=CARGO_TERM_COLOR=always
+Environment=CARGO_HTTP_PROXY=socks5h://127.0.0.1:1080
 Environment=http_proxy=http://127.0.0.1:7890
 Environment=https_proxy=http://127.0.0.1:7890
 Environment=no_proxy=localhost,127.0.0.1,::1

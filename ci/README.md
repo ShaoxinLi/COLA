@@ -18,6 +18,8 @@ disabled. For PRs, it checks GitHub's test merge commit, which includes the targ
 branch. The runner services use the existing rule-based HTTP proxy on
 `127.0.0.1:7890`, which routes blocked domains through NaiveProxy. Localhost
 bypasses the proxy so adapter tests can reach their local HTTP fixtures.
+Cargo uses NaiveProxy's SOCKS listener on `127.0.0.1:1080` directly because the
+rule proxy sends crates.io traffic over the unreliable direct route.
 
 ## Provision the server
 
@@ -67,6 +69,10 @@ provisioning and toolchain maintenance only when both runners are idle.
 Provisioning stops both services before switching the toolchain and restarts
 them after configuration. Each Rust version has its own root-owned directory,
 selected through an atomic symlink update. Versions never overlay one another.
+If provisioning fails after stopping the services, CI stays paused. Correct the
+reported error and rerun provisioning before expecting queued checks to start.
+
+For CI infrastructure edits, run `actionlint` and `shellcheck ci/*.sh` locally.
 
 ## Maintain the runners
 

@@ -15,9 +15,16 @@ rust_version=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "$script_dir/../rust-toolc
 
 printf '%s  %s\n' "$runner_sha256" "$archive" | sha256sum --check
 printf 'Initial runner release %s\n' "$runner_version"
-[[ $("$rust_source/bin/rustc" --version) == "rustc $rust_version "* ]]
-[[ -x "$rust_source/bin/cargo-clippy" && -x "$rust_source/bin/rustfmt" ]]
-[[ $rust_source != /opt/cola-ci/toolchain ]]
+for tool in cargo cargo-clippy clippy-driver cargo-fmt rustc rustdoc rustfmt; do
+  if [[ ! -x $rust_source/bin/$tool ]]; then
+    echo "Missing toolchain executable: $tool" >&2
+    exit 2
+  fi
+done
+if [[ $("$rust_source/bin/rustc" --version) != "rustc $rust_version "* ]]; then
+  echo "Expected Rust $rust_version in $rust_source" >&2
+  exit 2
+fi
 
 toolchain=/opt/cola-ci/toolchains/$rust_version
 install -d -m 0755 /opt/cola-ci/toolchains /var/lib/cola-runners
@@ -48,7 +55,10 @@ for slot in 1 2; do
   if [[ ! -f "$home/runner/.runner" ]]; then
     runuser -u "$user" -- tar -xzf - -C "$home/runner" < "$archive"
     if [[ -z ${registration_token:-} ]]; then
-      read -r registration_token
+      if ! read -r registration_token; then
+        echo 'A registration token is required on stdin' >&2
+        exit 2
+      fi
     fi
     (
       cd "$home/runner"
@@ -59,18 +69,23 @@ for slot in 1 2; do
         --name "cola-ci-$slot" --labels cola-ci --work _work --replace
     )
   else
-    runuser -u "$user" -- python3 - "$home/runner/.runner" "cola-ci-$slot" <<'PY'
+    runuser -u "$user" -- python3 -I - "$home/runner/.runner" "cola-ci-$slot" <<'PY'
 import json
+import os
+from pathlib import Path
 import sys
 
-with open(sys.argv[1], encoding="utf-8-sig") as stream:
+path = Path(sys.argv[1])
+with path.open(encoding="utf-8-sig") as stream:
     runner = json.load(stream)
 assert runner["agentName"] == sys.argv[2], "Runner name mismatch"
 assert runner["gitHubUrl"].rstrip("/") == "https://github.com/ShaoxinLi/COLA", "Repository mismatch"
 runner["disableUpdate"] = False
-with open(sys.argv[1], "w") as stream:
+temporary = path.with_name(".runner.next")
+with temporary.open("w") as stream:
     json.dump(runner, stream, indent=2)
     stream.write("\n")
+os.replace(temporary, path)
 PY
     [[ -x "$home/runner/bin/Runner.Listener" ]]
   fi
