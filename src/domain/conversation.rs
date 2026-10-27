@@ -172,9 +172,6 @@ impl Step {
             ExecutionState::Returned(_) => return Err(SessionError::AlreadyReturned),
             ExecutionState::Started => {}
         }
-        if self.pending_index() != Some(index) {
-            return Err(SessionError::OutOfOrder);
-        }
         self.executions[index].state = ExecutionState::Returned(result.outcome().clone());
         Ok(())
     }
@@ -677,7 +674,7 @@ impl Session {
         }
         match snapshot.outcome {
             Some(TurnOutcome::Completed) => {
-                if self.active.is_some() || self.turns.last().map(Turn::id) != Some(id) {
+                if self.active.is_some() {
                     return Err(RestoreError::InvalidSnapshot(
                         "completed turn must end with an answer",
                     ));

@@ -4,7 +4,7 @@ use crate::{
         AssistantSnapshot, EffectDisposition, EffectResolution, ExecutionSnapshot, ExecutionState,
         NonEmptyText, ResolutionSource, Session, SessionId, SessionSnapshot, StepSnapshot,
         StopReason, ToolCallSnapshot, ToolError, ToolOutcome, TurnFailure, TurnOutcome,
-        TurnSnapshot, ValueError,
+        TurnSnapshot,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -267,10 +267,7 @@ enum Failure {
     MalformedResponse { description: String },
 }
 
-fn json_error(e: serde_json::Error) -> SessionStoreError {
-    SessionStoreError::new(SessionStoreErrorKind::InvalidData, e)
-}
-fn value_error(e: ValueError) -> SessionStoreError {
+fn data_error(e: impl Error + Send + Sync + 'static) -> SessionStoreError {
     SessionStoreError::new(SessionStoreErrorKind::InvalidData, e)
 }
 fn encode(snapshot: SessionSnapshot) -> Result<Vec<u8>, SessionStoreError> {
@@ -292,7 +289,7 @@ fn encode(snapshot: SessionSnapshot) -> Result<Vec<u8>, SessionStoreError> {
     Ok(bytes)
 }
 fn line(bytes: &mut Vec<u8>, value: &impl Serialize) -> Result<(), SessionStoreError> {
-    serde_json::to_writer(&mut *bytes, value).map_err(json_error)?;
+    serde_json::to_writer(&mut *bytes, value).map_err(data_error)?;
     bytes.push(b'\n');
     Ok(())
 }
@@ -303,7 +300,7 @@ fn decode(bytes: &[u8]) -> Result<SessionSnapshot, SessionStoreError> {
     let mut lines = bytes[..bytes.len() - 1].split(|b| *b == b'\n');
     let header_bytes = lines.next().ok_or_else(|| invalid("missing header"))?;
     let header = (|| {
-        let probe: VersionProbe = serde_json::from_slice(header_bytes).map_err(json_error)?;
+        let probe: VersionProbe = serde_json::from_slice(header_bytes).map_err(data_error)?;
         if probe.format != "cola.session" {
             return Err(invalid("unknown session format"));
         }
@@ -316,14 +313,14 @@ fn decode(bytes: &[u8]) -> Result<SessionSnapshot, SessionStoreError> {
                 ),
             ));
         }
-        serde_json::from_slice::<Header>(header_bytes).map_err(json_error)
+        serde_json::from_slice::<Header>(header_bytes).map_err(data_error)
     })()
     .map_err(|e| context(e, "record 1".into()))?;
     let mut turns = vec![];
     let mut active = None;
     for (index, bytes) in lines.enumerate() {
         (|| {
-            let record: Record = serde_json::from_slice(bytes).map_err(json_error)?;
+            let record: Record = serde_json::from_slice(bytes).map_err(data_error)?;
             match record {
                 Record::Closed { turn }
                     if active.is_none() && turns.len() < header.closed_turn_count =>
@@ -466,7 +463,7 @@ impl TryFrom<Execution> for ExecutionSnapshot {
                 State::Returned { outcome } => ExecutionState::Returned(match outcome {
                     ToolReturn::Success { output } => ToolOutcome::Success(output),
                     ToolReturn::Failure { description } => ToolOutcome::Failure(ToolError::new(
-                        NonEmptyText::new(description).map_err(value_error)?,
+                        NonEmptyText::new(description).map_err(data_error)?,
                     )),
                 }),
             },
@@ -485,7 +482,7 @@ impl TryFrom<Execution> for ExecutionSnapshot {
                                 ResolutionSource::ApplicationAttestation
                             }
                         },
-                        NonEmptyText::new(r.evidence).map_err(value_error)?,
+                        NonEmptyText::new(r.evidence).map_err(data_error)?,
                     ))
                 })
                 .transpose()?,
@@ -530,10 +527,10 @@ impl TryFrom<Outcome> for TurnOutcome {
             }),
             Outcome::Failed { failure } => Self::Failed(match failure {
                 Failure::ModelFailure { description } => {
-                    TurnFailure::ModelFailure(NonEmptyText::new(description).map_err(value_error)?)
+                    TurnFailure::ModelFailure(NonEmptyText::new(description).map_err(data_error)?)
                 }
                 Failure::MalformedResponse { description } => TurnFailure::MalformedResponse(
-                    NonEmptyText::new(description).map_err(value_error)?,
+                    NonEmptyText::new(description).map_err(data_error)?,
                 ),
             }),
         })

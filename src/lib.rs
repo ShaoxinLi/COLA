@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
-//! COLA's synchronous conversation domain, host tools, and session persistence.
+//! Synchronous AI agent contracts, orchestration, and adapters.
 //!
-//! The library records facts and validates transitions. Callers supply model
-//! messages and tool results.
+//! The domain validates conversation facts. The application coordinates model
+//! requests, reviewed tool execution, and saves through caller-supplied adapters.
 pub mod domain;
 
 pub mod adapters;

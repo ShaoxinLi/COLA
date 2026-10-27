@@ -1,10 +1,6 @@
 # Rust build artifacts (including nested crates)
 target/
 
-# Frontend dependencies and build output
-/web/node_modules/
-/web/dist/
-
 # rustfmt backup files
 **/*.rs.bk
 
@@ -18,11 +14,6 @@ target/
 
 # macOS metadata
 .DS_Store
-
-# Keep Cargo.lock and web/package-lock.json tracked for reproducible builds.
-
-/web/test-results/
-/web/playwright-report/
 
 # Local conversations
 .cola/

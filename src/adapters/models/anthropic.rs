@@ -78,9 +78,6 @@ pub(super) fn request(
         body["output_config"] = json!({"effort":effort});
     }
     if decision {
-        if body.get("output_config").is_none() {
-            body["output_config"] = json!({});
-        }
         body["output_config"]["format"] =
             json!({"type":"json_schema","schema":client::decision_schema()});
     } else if !snapshot.tools.is_empty() {

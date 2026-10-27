@@ -273,11 +273,10 @@ where
                         };
                         if let Some(calls) = output.calls() {
                             for call in calls.as_slice() {
-                                if !self.tools.contains_key(call.name())
-                                    || !context
-                                        .tools()
-                                        .iter()
-                                        .any(|definition| definition.name() == call.name())
+                                if !context
+                                    .tools()
+                                    .iter()
+                                    .any(|definition| definition.name() == call.name())
                                 {
                                     return Err(AgentErrorKind::UnknownTool(call.clone()));
                                 }

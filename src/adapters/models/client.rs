@@ -644,13 +644,12 @@ impl Output for Decision {
     const KIND: OutputKind = OutputKind::Decision;
     fn decode(text: String, _: Vec<ToolCall>) -> Result<Self, ModelError> {
         let value: DecisionWire = serde_json::from_str(&text).map_err(|_| malformed())?;
-        let should_allow = value.should_allow;
         let reason = match value.reason {
             Value::Null => None,
             Value::String(text) => Some(NonEmptyText::new(text).map_err(|_| malformed())?),
             _ => return Err(malformed()),
         };
-        Ok(Decision::new(should_allow, reason))
+        Ok(Decision::new(value.should_allow, reason))
     }
     fn receipt(&self) -> Option<AssistantMessage> {
         None
