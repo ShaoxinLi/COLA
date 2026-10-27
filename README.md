@@ -33,15 +33,14 @@ Model tests share a local HTTP server and provider fixtures in
 
 ## Build and verify
 
-Use a Rust toolchain that supports the Rust 2024 edition. Run these commands from
-the repository root.
+Install Rust through rustup. The toolchain file selects the required compiler,
+rustfmt, and Clippy versions. Run the full CI check sequence from the repository
+root.
 
 ```sh
-cargo build
-cargo test --all-targets
-cargo test --doc
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+bash ci/check.sh
 ```
 
 Generate local API documentation with `cargo doc --no-deps`.
+
+See [CI runner operations](ci/README.md) for server setup, isolation, and maintenance.

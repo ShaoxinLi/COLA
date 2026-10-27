@@ -1,0 +1,44 @@
+[Unit]
+Description=COLA GitHub Actions runner %i
+Wants=network-online.target network-proxy.service
+After=network-online.target network-proxy.service
+
+[Service]
+User=cola-runner-%i
+Group=cola-runner-%i
+WorkingDirectory=/var/lib/cola-runners/%i/runner
+ExecStart=/var/lib/cola-runners/%i/runner/bin/runsvc.sh
+Environment=HOME=/var/lib/cola-runners/%i
+Environment=PATH=/opt/cola-ci/toolchain/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CARGO_HOME=/var/lib/cola-runners/%i/.cargo
+Environment=CARGO_TARGET_DIR=/var/lib/cola-runners/%i/target
+Environment=CARGO_BUILD_JOBS=1
+Environment=CARGO_INCREMENTAL=0
+Environment=CARGO_TERM_COLOR=always
+Environment=http_proxy=http://127.0.0.1:7890
+Environment=https_proxy=http://127.0.0.1:7890
+Environment=no_proxy=localhost,127.0.0.1,::1
+Environment=NO_PROXY=localhost,127.0.0.1,::1
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+CPUQuota=100%
+MemoryHigh=1280M
+MemoryMax=1536M
+TasksMax=512
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ReadWritePaths=/var/lib/cola-runners/%i
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
