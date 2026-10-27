@@ -2,7 +2,43 @@
 
 COLA (Coffee-Overclocked Little Agent) is an AI agent library written in Rust.
 It defines conversation contracts, model and storage ports, concrete adapters,
-and a synchronous agent loop in `AgentService`.
+and a synchronous agent loop in `AgentService`. The `cola` executable assembles
+these components from a JSON configuration file.
+
+## Run COLA
+
+Copy the configuration template from the repository root:
+
+```sh
+cp config.example.json config.json
+```
+
+Fill in `api_key` in `config.json`. The template selects `deepseek-flash` for
+both the assistant and tool reviewer through DeepSeek's Responses endpoint.
+`config.json` is ignored by Git. Keep the example's key empty.
+
+Start the CLI:
+
+```sh
+cargo run -- cli --config config.json
+```
+
+Enter `/new`, send a message, then enter `/exit`. Replies are JSON lines.
+
+To serve the same agent loop through HTTP instead:
+
+```sh
+cargo run -- web --config config.json --bind 127.0.0.1:8080
+```
+
+The executable registers Bash, file-read, and file-write tools using `tool_cwd`.
+Every proposed call is reviewed by the configured reviewer model before local
+execution. These tools use the host user's privileges; the working directory
+does not confine their access. The process keeps one service alive for its
+selected API mode. Use a separate session-store root for each running process.
+
+See [startup configuration](docs/api.md#executable-configuration) for fields,
+defaults, exits, and restart limits.
 
 ## Architecture
 
@@ -14,6 +50,7 @@ traits. Adapters implement those contracts and own external I/O.
 | `src/domain` | Checked values, conversation transitions, tools, context, and recovery. | [Domain contracts](docs/domain.md) |
 | `src/app` | Agent orchestration, model generation, and session persistence ports. | [Agent service](docs/agent-service.md), [model clients](docs/model-clients.md#application-contracts), [session persistence](docs/session-store.md#application-contract) |
 | `src/adapters` | Web and CLI APIs, OpenAI and Anthropic clients, JSONL storage, Bash, and file tools. | [Inbound APIs](#inbound-apis), [model clients](docs/model-clients.md#adapter-implementations), [session persistence](docs/session-store.md#jsonl-adapter), [tool adapters](docs/tools.md) |
+| `src/main.rs` | JSON configuration, context policies, component assembly, and process startup. | [Run COLA](#run-cola), [startup configuration](docs/api.md#executable-configuration) |
 
 `Session` validates and records facts without external I/O. `Assistant` and
 `ToolCallReviewer` assemble typed model input. `AgentService` coordinates model
@@ -98,7 +135,8 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Tests mirror the source layers in `tests/domain.rs`, `tests/app.rs`, and
-`tests/adapters.rs`. Model tests use local HTTP fixtures, while storage and tool
-tests use temporary files and real processes. They do not verify live providers.
+`tests/adapters.rs`. `tests/main.rs` launches the executable through both APIs.
+Model tests use local HTTP fixtures, while storage and tool tests use temporary
+files and real processes. Automated tests do not require live provider keys.
 
 Generate API reference documentation with `cargo doc --no-deps`.

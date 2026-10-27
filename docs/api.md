@@ -2,9 +2,74 @@
 
 Both adapters call one existing `AgentService`. They expose session creation,
 session listing, and chat turns through HTTP or a persistent command session.
-The embedding program supplies model configuration, storage, context assembly,
-tools, and process startup. COLA provides library entry points, not a standalone
-executable.
+Embedding programs supply model configuration, storage, context assembly,
+tools, and process startup. The `cola` executable supplies those collaborators
+from JSON configuration and runs either API.
+
+## Executable configuration
+
+| Command | Behavior |
+| --- | --- |
+| `cola cli --config PATH` | Reads commands from stdin and writes JSON replies to stdout. |
+| `cola web --config PATH [--bind ADDRESS]` | Serves HTTP on `ADDRESS`, defaulting to `127.0.0.1:8080`. |
+| `cola --help` | Prints usage without reading configuration or connecting to a provider. |
+
+`--config` is required for either API mode. `--bind` accepts a socket address and
+applies only to web mode. Port zero requests an available port. The bound
+address is written to stderr. Startup diagnostics also use stderr.
+
+The repository-root `config.example.json` is a template. `config.json` holds
+local values and is ignored by Git. The configuration is a JSON object with
+the following fields. Unknown and duplicate fields are rejected.
+
+| Field | Requirement or default |
+| --- | --- |
+| `protocol` | Required. `openai-responses` or `anthropic-messages`. |
+| `base_url` | Required. HTTP or HTTPS base URL without user information, a query, or a fragment. |
+| `api_key` | Required. Nonblank credential valid for an HTTP header. |
+| `assistant` | Required role configuration. |
+| `reviewer` | Required role configuration. |
+| `tool_cwd` | Required existing directory for host-tool execution. |
+| `store_root` | Required JSONL session directory. Created on the first save if absent. |
+| `timeout_ms` | Positive request timeout in milliseconds. Default `120000`. |
+| `max_response_bytes` | Positive response-body limit. Default `8388608`. |
+| `max_iterations` | Positive assistant generation limit per turn. Default `16`. |
+
+Each role has these fields:
+
+| Field | Requirement or default |
+| --- | --- |
+| `model` | Required nonblank model identifier. |
+| `effort` | `default`, `off`, `low`, `medium`, `high`, `xhigh`, or `max`. Default `default`. |
+| `max_output_tokens` | Positive output-token limit. Default `4096`. |
+
+Both roles use one protocol, base URL, and credential. Their model settings
+are independent. The protocol selects the wire format, not the model vendor.
+For example, the template uses `openai-responses` with
+`https://api.deepseek.com` and `deepseek-flash`. The adapters append `responses`
+or `messages` to the base path, so `base_url` does not include that final route.
+Startup validates local configuration. Remote authentication, model availability,
+and capability errors surface when a chat calls the provider.
+
+Relative configuration, tool, and store paths resolve against the process's
+initial working directory. The location of the JSON file does not change that
+base. Startup never changes the process working directory. Tool definitions
+come from one registration list and supply both model catalogs. The assistant
+receives full projected history. The reviewer receives closed history and an
+explicit description of the active turn and exact candidate call.
+
+| Process exit | Meaning |
+| --- | --- |
+| `0` | Help or all CLI commands succeeded. |
+| `1` | Setup, stream, server, or CLI service failure. |
+| `2` | Invalid startup arguments, configuration, or CLI input. |
+
+CLI invalid input takes precedence over an earlier service failure. HTTP
+service failures use the response statuses below and leave the server running.
+The executable preserves the adapters' runtime limits, including memory-only
+native continuations. Stored sessions with tool history cannot transparently
+resume after restart. One process owns each store root; startup adds no
+cross-process locking or graceful-shutdown protocol.
 
 ## Library entry points
 
