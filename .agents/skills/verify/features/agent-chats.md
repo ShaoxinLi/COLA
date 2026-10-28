@@ -1,47 +1,48 @@
 # Agent chats
 
-Rust callers create sessions and send user messages through `AgentService`.
-The service reviews each proposed call, runs allowed tools, saves progress,
-and returns the turn's messages.
+Rust callers create sessions and send messages through `AgentService`. Each
+operation acquires and reloads its archive. The service commits invocation intent,
+observations, review and tool effects at separate durability gates.
 
-## Sub-features
+## Public entry points
 
-- `chat-review` preserves the proposed batch and handles each approval or denial separately.
-- `chat-continue` retains native provider continuation across chats.
-- `chat-limit` drains the accepted tool batch before an iteration interruption.
-- `chat-block` retains live facts and blocks further I/O after save or reviewer failures.
-- `chat-reject` refuses duplicate registration, mismatched tools, and reused call IDs.
-- `chat-list` sorts stored sessions with resident facts taking precedence.
-- `chat-port-errors` preserves checked model identifiers and the original storage error source.
+Construct `AgentService::new(model, store, tools, settings)`. Call `new_session`,
+`chat`, `chat_with_history`, `inspect`, `list_sessions`, or `recover`.
+`RoleSettings` supplies instructions, model settings and context limits.
+The model port has pure `prepare` and effectful `invoke` methods. Rebuilding the
+service preserves continuation from disk; active abandoned work needs recovery.
 
-## How to get to it (user POV)
+## Drive
 
-Construct `cola::app::AgentService::new` with caller-supplied roles, clients,
-storage, tool definitions, and settings. Call `new_session()`, `chat(id, user)`,
-and `list_session()`. Keep the service alive between chats for continuation.
+After Launch and Doctor, set `COLA_VERIFY_FEATURE=agent-chats` and run
+`"$COLA_VERIFY_APP" --nocapture --test-threads=1` in the driver's capture block.
+Read `tests/app/agent_service.rs`, `context.rs`, `model_client.rs`, and
+`session_store.rs` before describing their assertions.
 
-## Driving it with the Rust test runner
+The full group covers selective approval and denial, per-call facts, iteration
+limits, all publication gates, owned uncertainty repair, separate unsaved
+observations, stopped reviewers, original ID scoping, invocation provenance,
+per-role context capacity, ownership exclusion and close-only idempotent recovery.
+`real_local_providers_correlate_denials_and_fresh_service_uses_portable_disk_history`
+combines real JSONL and both HTTP adapters with local fixtures and a tool double.
+`context::` covers whole-turn selection, required history, metadata omission,
+unknown effects and exact rendered byte admission.
 
-Preconditions:
+## Inbound consumers
 
-- Launch and Doctor pass. Set `COLA_VERIFY_FEATURE=agent-chats`.
-- Allow loopback listeners for the provider-backed cases. Fixtures supply all collaborators.
+After the same Doctor, set `COLA_VERIFY_FEATURE=inbound-apis` and run
+`"$COLA_VERIFY_ADAPTERS" api:: --nocapture --test-threads=1` in a separate capture
+block. `tests/adapters/api/{cli,web}.rs` drive command streams and loopback HTTP,
+strict boundaries, durable error views, recovery and real disk readback.
 
-Run `"$COLA_VERIFY_APP" --nocapture --test-threads=1` in the capture block.
-The cases live in `tests/app/agent_service.rs`, `tests/app/model_client.rs`,
-and `tests/app/session_store.rs`.
+`cargo test --locked --test main` separately drives the built executable with
+both protocol fixtures, startup configuration and cold CLI/Web continuation.
+For live DeepSeek and actual host-file reads, use the opt-in command documented
+in the repository README. It requires a private local configuration and creates
+its own disposable sessions. Never use a user's existing archive as a fixture.
 
-- Create a session, chat, review all approval combinations, and chat again through `selective_review_preserves_exact_batch_and_continues_the_same_turn`. Returned messages, target invocation records, saved facts, and listing prove the result.
-- Exercise tool failure and denial through `no_reason_denial_and_genuine_tool_failure_are_normal_results`. Both return ordinary tool results.
-- Exhaust generations through `assistant_attempt_limit_drains_each_tool_and_saves_interruption`. The saved interruption follows every tool receipt.
-- Inject checkpoint and reviewer failures through the group's failure cases. Assert blocked sessions make no subsequent I/O and keep progress accessible.
-- Run the native continuation cases, including `real_providers_receive_correlated_denials_and_keep_native_continuation_across_chats`. Captured HTTP requests preserve native correlations and denied results.
-- Run registration, catalog, ID reuse, missing-load, rejected-start, and listing cases. Rejections retain the existing session facts.
-- Construct model IDs and storage errors through `model_client::model_ids_preserve_nonblank_values_and_redact_diagnostics` and `session_store::port_errors_preserve_the_original_source`. Checked values and source chains remain available without leaking model IDs in diagnostics.
+## Limits
 
-## Gotchas
-
-- Most service cases use in-memory store and tool doubles. The native provider cases use the real JSONL store and HTTP adapters with local provider fixtures. They reload saved sessions from disk, but their tool target is a double. Use the host tool map for real Bash and file-tool execution.
-- `real_providers` means actual adapters against local HTTP fixtures. It does not mean a live provider call.
-- Continuations live in memory. Rebuilding a service cannot recreate native continuation from JSONL history.
-- Fixtures create sessions from scratch. Do not substitute an existing user session to satisfy a failed precondition.
+Fault injection proves controller ordering and outcomes at the public ports.
+It does not prove hardware power-loss behavior. Provider fixtures use dummy
+credentials; they do not establish live authentication, quotas or availability.

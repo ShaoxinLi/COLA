@@ -1,133 +1,81 @@
 # Domain contracts
 
-`cola::domain` owns checked values, conversation transitions, and model input.
-It has no dependency on the application or adapters and performs no external I/O.
-All public types are re-exported from `cola::domain`.
-
-## Module map
+`cola::domain` owns checked values, accepted conversation facts and execution transitions.
+It performs no external I/O and has no dependency on the application or adapters. All
+public domain types are re-exported from `cola::domain`.
 
 | Source | Responsibility |
-| --- | --- |
-| [`value.rs`](../src/domain/value.rs) | Text, identities, tool names, and value errors. |
-| [`message.rs`](../src/domain/message.rs) | User, assistant, and tool messages. |
-| [`tool.rs`](../src/domain/tool.rs) | Tool contracts, definitions, calls, batches, and results. |
-| [`conversation.rs`](../src/domain/conversation.rs) | Session transitions, execution facts, snapshots, and recovery. |
-| [`context.rs`](../src/domain/context.rs) | Checked exchanges and execution notices. |
-| [`roles.rs`](../src/domain/roles.rs) | Assistant and reviewer context assembly, and decisions. |
+|---|---|
+| [`value.rs`](../src/domain/value.rs) | Text, turn/generation identities, call references and timestamps. |
+| [`message.rs`](../src/domain/message.rs) | User, assistant and tool messages. |
+| [`tool.rs`](../src/domain/tool.rs) | Tool definitions, calls, batches, results and execution port. |
+| [`conversation.rs`](../src/domain/conversation.rs) | Session transitions, execution facts and faithful snapshots. |
+| [`roles.rs`](../src/domain/roles.rs) | The review decision value. |
 
-## Values and messages
+Context planning belongs to [the application](model-clients.md), separate from these facts.
 
-Constructors preserve valid input, including whitespace. `NonEmptyText`,
-`SessionId`, and `ToolCallId` reject blank strings. `TurnId` is a nonzero `u64`.
-`ToolName` matches `[A-Za-z_][A-Za-z0-9_-]*` without a length limit.
+## Values and identity
 
-An assistant message contains either a nonblank terminal answer or a nonempty
-batch of tool calls with distinct IDs. A batch can include a preamble.
-Whitespace-only preambles become `None`.
+Constructors preserve valid contents, including whitespace. `NonEmptyText`, `SessionId`
+and `ToolCallId` reject blank strings. Turn and generation IDs are nonzero. Tool names
+match `[A-Za-z_][A-Za-z0-9_-]*`.
 
-## Tool contracts
+`CallRef` pairs a source generation with the provider's unchanged call string. No separate
+UUID call identifier or reverse native-ID map is needed. A containing archive supplies the
+session scope. A closed turn may reuse a string from an earlier turn. A native active turn
+cannot contain ambiguous repeated call strings, and a batch cannot contain duplicate IDs.
 
-`Tool::execute` synchronously accepts JSON object arguments and returns
-`ToolOutcome`. Implementations validate their own fields and can block the caller.
-Empty success output is valid. Tool failure is an ordinary recorded return.
+Each accepted step has one authoritative `source_generation` link. Invocation metadata and
+original native observations belong to the application archive, not the domain message.
 
-`ToolDefinition` describes a tool without an executable implementation.
-`InputSchema` checks only that the schema is an object with `"type": "object"`.
-Neither it nor `ToolCall` validates argument conformance to that schema.
+## Messages and tools
 
-The caller selects an implementation and records a `ToolResult` with the original
-call ID. `Session` and `Context` do not resolve tools or check requested names
-against a catalog. Call IDs correlate facts but do not guarantee exactly-once
-effects. See the [host tool adapters](tools.md).
+An assistant message is either a nonblank terminal answer or a nonempty tool batch. A batch
+can contain a preamble; a whitespace-only preamble becomes absent.
 
-## Session transitions
+`Tool::execute` accepts JSON object arguments synchronously and returns `ToolOutcome`.
+Empty success output is valid. An actual tool failure is an ordinary recorded return.
+`ToolDefinition` describes a tool without executing it. `InputSchema` requires an object
+schema but does not validate each argument against that schema. The application resolves
+advertised names against registered tools.
 
-`Session` owns closed turns and at most one active turn. Each turn contains one
-user message and ordered assistant steps. Each requested call has an execution
-record. Getters expose immutable facts.
+## Execution state
 
-Rejected transitions leave the session unchanged. Active operations require the
-current `TurnId`. Calls address the latest batch in declaration order.
+| State | Fact |
+|---|---|
+| `Requested` | Review has not authorized target dispatch. |
+| `Denied` | Review denied the call; the target was not executed. |
+| `Approved` | A reviewer approved it, but dispatch has not started. |
+| `Started` | Dispatch intent is recorded; execution or its result may be unknown. |
+| `Returned` | An actual target outcome is recorded. |
 
-| Operation | Required state | Recorded change |
-| --- | --- | --- |
-| `start_turn(user)` | No active turn. | Allocates consecutive IDs starting at one and stores the user message. |
-| `record_assistant(id, message)` | `AskModel`, with call IDs unused throughout the session. | Adds a step. An answer closes the turn as `Completed`. |
-| `start_tool(id, call_id)` | The next call is `NotStarted`. | Records `Started` and returns the call before external I/O. |
-| `record_tool_result(id, result)` | The matching call is `Started`. | Records `Returned(outcome)`, including tool failures. |
-| `interrupt(id, reason)` | An active turn. | Closes it as `Interrupted` without inventing results. |
-| `fail(id, failure)` | An active turn. | Closes it as `Failed` without inventing results. |
-| `resolve_effect(id, call_id, resolution)` | A closed call remains `Started`. | Adds effect evidence without changing execution state. |
+Review records identify their reviewer generation and optional reason. `NextAction`
+distinguishes review, execution, waiting for an outstanding target, asking the model and
+waiting for the user. Denial is not an actual tool return. Its protocol projection explicitly
+states controller non-execution.
 
-`next_action()` returns `AwaitUser` when no turn is active, `AskModel` when no
-call is pending, `Execute(call_id)` for the next unstarted call, or `AwaitTool`
-for a started call without a return.
+Rejected transitions leave facts unchanged. Operations require the active turn and exact
+call occurrence. Calls are reviewed and dispatched in declaration order. No result can
+precede dispatch, no dispatched occurrence can be dispatched again, and no assistant output
+can bypass an unresolved active batch. An accepted answer closes its turn as completed.
 
-### Unknown effects and resolutions
+## Interruption and effect evidence
 
-`NotStarted` means undispatched under this protocol. `Started` records dispatch
-intent. A crash before actual tool I/O can therefore leave an unknown effect.
-Closing a turn neither cancels external work nor undoes effects.
+Closing a turn does not cancel external work or undo its effects. A dispatched call without
+a return remains unknown. Undispatched or denied calls remain known not executed.
 
-`EffectResolution` records whether the effect completed or was not performed,
-its source, and nonblank evidence. The caller verifies that evidence. Repeating
-an identical resolution succeeds. A conflicting resolution fails. Resolution
-preserves `Started`, creates no result, and never reopens a turn or schedules a retry.
-
-## Model input objects
-
-`Context<O>` associates input with expected output type `O`. It contains nonblank
-instructions, ordered `ContextExchange` values, and a catalog with unique tool
-names. Call IDs are unique across exchanges and notices. Turn IDs strictly
-increase. Empty or entirely closed history is valid.
-
-Each exchange starts with one user message and contains complete tool batches
-with returns in declaration order. Orphan results, repeated call IDs, and
-unresolved batches are rejected. A completed exchange ends in an answer.
-An active, interrupted, or failed exchange has no answer. Only the last exchange
-can be active, and it must await the model.
-
-### History projections
-
-| Projection | Contents and limits |
-| --- | --- |
-| `Session::messages()` | All recorded messages, including unresolved requests and partial results. |
-| `Session::context_exchanges()` | All turns as checked exchanges. Rejects an active unresolved batch. |
-| `Session::closed_context_exchanges()` | Closed turns only. Available while an active batch is pending. |
-| `Context::messages()` | Flat messages, excluding notices. |
-| `Context::execution_notices()` | Notices across all exchanges. |
-
-Closed partial batches become `Undispatched`, `UnknownEffect`, and
-`ConfirmedResult` notices instead of incomplete messages. Complete batches stay
-as messages. `TurnClosed` preserves interruption or failure. Notices describe
-facts and never fabricate tool returns. `Context` does not select or fit history.
-
-## Context assembly contracts
-
-`Assistant::context` builds `Context<AssistantMessage>` from immutable session
-facts. `ToolCallReviewer::context` also receives the exact call and builds
-`Context<Decision>`. Neither trait invokes a model or tool.
-
-The reviewer selects history and renders the call and relevant active-turn facts
-in its instructions. `closed_context_exchanges` remains available during a
-pending batch. There is no built-in lossless projection of an active review.
-`Decision` records allowance and an optional nonblank reason. It does not itself
-authorize execution, establish freshness, or verify call membership.
+`EffectResolution` records a completed or not-performed disposition, its provenance and
+nonblank evidence. Repeating identical evidence is idempotent. Conflicting evidence is
+rejected. Reconciliation preserves the original observation, creates no synthetic actual
+result, does not reopen a turn and schedules no retry.
 
 ## Snapshots and recovery
 
-`Session::snapshot()` exports facts without persistence. Freely constructible
-snapshot types mirror the session, turn, step, call, and execution hierarchy.
-Closed turns require an outcome. The active turn requires none.
+`Session::snapshot()` exports facts without performing persistence. `Session::restore()`
+validates values, ordering, call/execution alignment, source identities and legal outcomes.
+It preserves active work faithfully. Reading a snapshot does not declare a process lost.
 
-`Session::restore()` validates raw values through normal transitions. It checks
-turn numbering, call uniqueness, execution alignment and order, outcomes, and
-resolution eligibility. Failures return `RestoreError`.
-
-Restore closes active work as `Interrupted(ProcessLost)` without executing calls.
-Closed turns retain partial batches and resolution evidence. Validation checks
-structural consistency but does not authenticate recorded effects.
-
-Invariant-bearing domain types have no deserialization implementations.
-The [session persistence reference](session-store.md) describes the storage
-contract and JSONL format. Rust declarations define fields and error variants.
+Explicit application recovery acquires ownership and commits interruption and abandoned
+invocation facts. The [session archive](session-store.md) validates the relationship between
+domain steps, reviewer decisions and invocation evidence. Structural validation does not
+authenticate an external effect.

@@ -1,132 +1,102 @@
 # Model clients
 
-The application defines synchronous model generation. Adapters implement it for
-OpenAI Responses and Anthropic Messages. The caller owns context assembly,
-session transitions, tool execution, and acceptance of continuations.
+The application separates request preparation from model I/O. OpenAI Responses and
+Anthropic Messages implement the same typed, object-safe `ModelClient<O>` port.
 
-## Application contracts
+## Application contract
 
-[`ModelClient<O>`](../src/app/model_client.rs) defines object-safe
-`generate(context, settings, continuation)`. The output type `O` associates the
-context, client, and continuation. `ModelSettings` contains a nonblank `ModelId`,
-an `Effort`, and nonzero `max_output_tokens`. Model IDs preserve their contents
-and redact `Debug` output.
+`prepare(plan, settings)` renders and fits a credential-free `PreparedRequest<O>` without
+network access. `invoke(&prepared)` sends that exact request and returns `ObservedReply<O>`,
+including response metadata, bounded raw evidence and a typed result. `AgentService`
+commits the prepared intent before invoking it.
 
-`Generation::Complete` returns checked output and an optional replacement
-`Continuation<O>`. `Refused` carries an optional nonblank reason. `Incomplete`
-carries `OutputLimit` or `Other`. Neither stopped outcome exposes partial output.
+`Generation<O>` is complete output, refusal or incomplete generation. Rejected, malformed,
+transport and HTTP failures remain typed errors. Partial executable output never escapes
+a stopped or rejected response. Custom model clients can construct prepared and observed
+values without a private continuation constructor.
 
-A continuation is opaque, immutable, cloneable native model history. The caller
-accepts the exact returned output into `Session` before publishing the replacement token.
-Errors, refusals, incomplete responses, and rejected output leave the previous
-token available for reuse. The port defines no token serialization or recovery.
+`ModelSettings` preserves a nonblank model identifier, effort and nonzero output limit.
+Model IDs remain redacted in diagnostics. There is no model-name capability catalog or
+silent effort normalization.
 
-`ModelError::kind()` and `http_status()` expose a fixed error category and optional
-numeric status. Diagnostics exclude provider messages, URLs, credentials,
-request bodies, and underlying error sources.
+The response receipt records status, returned model, response/request IDs, usage and finish
+metadata when supplied. Missing values are not inferred. Capture distinguishes no response,
+complete received bytes, interrupted reads and a bounded truncated prefix. Authentication
+credentials are sent in headers rather than injected into the prepared body. Credential
+echoes cannot enter accepted output. Complete responses containing decoded credential echoes
+are masked, including echoes assembled across stopped text blocks. Copied metadata is
+scrubbed too. Partial or malformed capture redactions preserve length and leave unrelated
+bytes intact. This checks the configured credential, not arbitrary application secrets or
+every possible reconstruction of incomplete protocol data.
 
-## Adapter implementations
+## Durable context
 
-`cola::adapters::models` exports `OpenAIClient`, `AnthropicClient`, and
-`ClientConfig`. Both clients support `AssistantMessage` and `Decision` outputs.
-Provider request rendering and response decoding live in
-[`openai.rs`](../src/adapters/models/openai.rs) and
-[`anthropic.rs`](../src/adapters/models/anthropic.rs).
-[`client.rs`](../src/adapters/models/client.rs) owns shared transport, checked
-output conversion, native call correlation, replay, and history rendering.
+`ContextPlan<AssistantMessage>` derives input from a committed `SessionArchive`.
+`ContextPlan<Decision>` includes the exact candidate and active execution facts. Its
+`required` turn selection is an explicit policy seam for retaining earlier constraints.
 
-### Configuration and transport
+Historical closed turns become field-based factual groups. They retain original user and
+assistant text, tool names/arguments, actual results, controller denials, closure and unknown
+effect evidence. No model summarizes them. Historical model names, usage, timestamps and
+request IDs remain audit data rather than prompt prose.
 
-`ClientConfig::new(base_url, api_key, timeout, max_response_bytes)` validates
-explicit connection settings. Both client constructors accept this configuration.
+The active assistant turn uses the complete native bundle since its user input. Original
+provider items, opaque reasoning/thinking strings, signatures and call/result ordering stay
+intact. Results use the original call ID directly. Provider, endpoint, model and relevant
+thinking settings must remain compatible within that native cycle. Closed portable history
+allows model changes between turns.
 
-The base URL requires HTTP or HTTPS and a host. User information, queries, and
-fragments are rejected. The key must be nonblank and valid as an HTTP header.
-Timeouts must be positive and fit in `u64` milliseconds. The byte cap is a
-`NonZeroUsize` other than `usize::MAX`.
+## Selection and limits
 
-Base paths are retained. Keys appear only in authentication headers. Client
-`Debug` output is redacted. Redirects, retries, and environment proxies are
-disabled. The deadline covers the whole HTTP exchange. Body reads enforce the
-byte cap before JSON decoding, including chunked responses.
+`ContextPlan::fit` retains required groups and the newest optional whole-turn suffix that
+fits. Selected groups stay chronological. The manifest records included, omitted and
+required turn IDs, source revision and policy identity. One factual omission notice tells
+the model when earlier turns are absent.
 
-Non-success responses retain their HTTP status. Status `400` maps to
-`InvalidSettings`, `401` and `403` to `Authentication`, `429` to `RateLimited`,
-and `500` through `599` to `ProviderFailure`. Other failures map to `Http`.
+The actual rendered body is measured, including instructions, tool catalog and native
+protocol data. Mandatory and required groups are never silently split or dropped. If they
+cannot fit, preparation returns `ContextCapacity` before HTTP. Assistant and reviewer limits
+are independent; reviewer input has no callable tools.
 
-### Provider requests
+Request bytes are an exact measurement. Token use is a labeled UTF-8 byte estimate, not a
+provider tokenizer. The configured input allowance reserves output space. Opaque reasoning
+and vendor token accounting can still produce provider capacity rejection. Such failures
+are recorded; clients do not retry by changing the request.
 
-Requests preserve model IDs, efforts, output limits, and schemas without
-capability inference or normalization. Provider rejection returns a typed error.
+## HTTP adapters
+
+`ClientConfig::new(base_url, api_key, timeout, max_response_bytes)` takes explicit credentials
+and transport limits. Both clients append their native route to the configured base path.
+The base requires HTTP or HTTPS, a host, and no user information, query or fragment.
+Redirects, environment proxies and automatic retries are disabled. A deadline covers the
+whole exchange, including body reads. The byte cap also applies to chunked responses.
 
 | Setting | OpenAI | Anthropic |
-| --- | --- | --- |
-| Route appended to the base path | `/responses` | `/messages` |
-| Authentication | `Authorization: Bearer ...` | `x-api-key`, with `anthropic-version: 2026-10-21` |
+|---|---|---|
+| Route | `/responses` | `/messages` |
+| Credentials | Bearer header | `x-api-key` header |
 | Output limit | `max_output_tokens` | `max_tokens` |
 | Assistant tools | Function schemas with `strict: false` | Tools with `input_schema` |
-| Decision format | Strict JSON schema in `text.format` | JSON schema in `output_config.format` |
-| Native history | `store: false` and encrypted reasoning requested | Returned thinking, signatures, and redacted thinking retained |
+| Reviewer format | JSON schema in `text.format` | JSON schema in `output_config.format` |
+| Native evidence | Original output items, including encrypted reasoning | Original content blocks, including signed/redacted thinking |
 
-| `Effort` | OpenAI | Anthropic |
-| --- | --- | --- |
-| `Default` | Omit reasoning effort. | Omit effort and thinking. |
-| `Off` | Set `reasoning.effort` to `"none"`. | Set `thinking.type` to `"disabled"`. Omit effort. |
-| `Low`, `Medium`, `High`, `Xhigh`, `Max` | Exact lowercase `reasoning.effort`. | Exact lowercase `output_config.effort`. Omit thinking. |
+Default effort is omitted. Off sends OpenAI `none` or disables Anthropic thinking. Other
+efforts preserve their requested lowercase spelling. Providers may reject unsupported
+settings; that failure is recorded instead of silently choosing different settings.
 
-### Checked outputs
+Non-success responses retain numeric status. Authentication, rate limits, invalid settings,
+provider failures, deadlines, malformed data and oversize responses have distinct internal
+categories. Public error formatting excludes remote response bodies, credentials and URLs.
+Raw evidence is available through the durable archive rather than public error messages.
 
-Assistant generation requires an active last exchange. Complete text becomes an
-answer. Calls become a nonempty batch with offered names and JSON object
-arguments. Native call IDs must be nonblank and unique across the continuation.
-Domain call IDs are fresh UUID-based values independent of native IDs.
+## Verification
 
-Decision requests contain descriptive history and a descriptive catalog without
-callable tools. Empty history receives a neutral user prompt. Output contains
-exactly `should_allow: boolean` and `reason: string | null`. String reasons must
-be nonblank. Complete decisions return no continuation.
+Local HTTP fixtures check actual rendering, decoding, statuses, limits and native fidelity.
+They do not establish live provider acceptance. The separate
+[DeepSeek verification script](../scripts/verify-deepseek.py) drives the actual executable,
+real model/reviewer calls, file reads and cold CLI/Web restarts using a private local config.
+It records evidence without saving that credential-bearing config.
 
-Completion metadata takes precedence over content. Refusals and incomplete
-responses expose no partial executable output. Anthropic's
-`model_context_window_exceeded` maps to `Incomplete(Other)`. Unknown native items
-return `UnsupportedResponse`. Malformed supported items return `MalformedResponse`.
-
-OpenAI reasoning and function calls allow omitted or null optional statuses.
-Function-call item IDs can also be omitted or null. An explicit pending or
-incomplete item status prevents complete output.
-
-### Native replay
-
-Every complete assistant response returns a cumulative replacement continuation,
-including final answers. Native items retain their original fields and replay
-once at their recorded positions.
-
-The token binds the provider, normalized endpoint, model ID, prior exchanges,
-messages, outcomes, notices, returned assistant message, and native call
-correlations. Instructions, catalog, effort, token limit, credentials, and
-transport limits can change. Existing history cannot change.
-
-Replay accepts the exact assistant output followed by ordered actual tool
-returns, or an accepted answer that completes its exchange. A complete batch
-can close as interrupted or failed with its exact closure notice. Later exchanges
-can add user input and closed turns without assistant output.
-
-Unaccepted output, changed or omitted history, partial native batches, and
-mismatched tokens fail before HTTP. Notices never become invented native returns.
-
-### Recovery and limits
-
-JSONL recovery does not restore native continuations. Retained tool-request
-messages without a token return `MissingContinuation`, even for closed complete
-batches. Closed partial batches projected entirely as notices can form a new
-factual baseline. Historical plain answers can also form a baseline without
-restoring native reasoning.
-
-Tokens have no durable format or hidden cache and can grow with conversation
-length. Clients provide no streaming, asynchronous calls, history fitting,
-model discovery, or agent loop. `AgentService` supplies the
-[application loop](agent-service.md).
-
-Local HTTP tests cover requests, output validation, replay, error redaction,
-deadlines, redirects, and byte caps. They do not establish live-provider
-acceptance of a model or schema.
+`ResponseCapture::Interrupted` preserves the received prefix when a body read
+fails. It differs from a configured size-limit truncation and from receiving no
+response. Accepted output requires a complete captured response.

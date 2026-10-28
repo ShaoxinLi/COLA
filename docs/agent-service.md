@@ -1,92 +1,86 @@
 # Agent service
 
-[`AgentService`](../src/app/agent_service.rs) runs a user message through model
-requests, per-call review, tool execution, and saves. Keep the service alive
-across chat calls to retain each session's native model continuation.
+[`AgentService`](../src/app/agent_service.rs) runs model requests, independent tool review,
+execution and durable commits. Each operation reloads its session from the store. There is
+no resident session map or continuation token to retain between calls.
 
-## Collaborators and operations
+## Construction and operations
 
-The service receives a model client, session store, assistant, reviewer,
-registered tools, and `AgentSettings`. `Assistant` and `ToolCallReviewer` assemble
-input. The client implements both `ModelClient<AssistantMessage>` and
-`ModelClient<Decision>`, as both provider adapters do.
+Supply a model client, a `SessionStore`, registered tools and `AgentSettings`. The client
+implements `ModelClient<AssistantMessage>` and `ModelClient<Decision>`. Each role has model
+settings, instructions and context limits. Tool names must be unique.
 
-`AgentSettings` supplies separate assistant and reviewer model settings and a
-nonzero `max_iterations`. The two settings can select different models and
-efforts on the same provider client.
+| Operation | Result |
+|---|---|
+| `new_session()` | Commits an empty archive. |
+| `inspect(id)` | Reads the committed archive without changing active work. |
+| `list_sessions()` | Reads committed archives sorted by ID, without a memory overlay. |
+| `chat(id, user)` | Holds session ownership, runs one turn and returns its committed messages. |
+| `recover(id)` | Closes interrupted active work and records abandonment without running models or tools. |
 
-Tool names must be unique. The assistant can advertise a subset of registered
-tools with matching definitions. A tool adapter's `definition()` supplies both
-the catalog entry and the registration.
+A completed session can be reopened by a new service or process. An interrupted active
+session requires recovery before a new user turn. Recovering an idle session is a no-op.
 
-| Method | Result |
-| --- | --- |
-| `new_session()` | Saves an empty session and returns a clone. |
-| `chat(id, user)` | Runs one turn and returns that turn's messages, including its user message. |
-| `list_session()` | Returns sessions sorted by ID. Resident facts override stored copies. |
+## Invocation records
 
-Returned values cannot mutate the service.
+Every assistant and reviewer request has a session-local `GenerationId`. Before model I/O,
+the service commits the exact prepared request, requested model and settings, target,
+timestamp, context selection and budget measurement. An observed response is committed
+with its metadata, bounded native capture and accepted, refused, incomplete, rejected or
+failed outcome. Accepted assistant steps identify their source generation.
 
-## Per-call review
+A single turn can contain several assistant generations and several reviewer generations.
+Metadata belongs to those invocations rather than one model field on a whole turn. The
+archive preserves rejected and unsuccessful attempts as evidence without turning them into
+accepted messages. Missing served-model or usage fields remain unknown.
 
-The service accepts the exact assistant response and handles calls in declaration
-order. Each call gets a separate review. If a file read is approved and a log
-deletion is denied, the read executes and the deletion receives a failure result
-that states it was not executed and gives the denial reason.
+## Review and dispatch
 
-A denial is an ordinary `ToolOutcome::Failure`. It does not fail the turn or
-cancel sibling calls. If no reason is supplied, the result says so. Ordinary
-tool failures also return to the model.
+Calls are handled in declaration order. A reviewer receives the current user request, the
+exact candidate, prior sibling outcomes and selected historical facts. It has no callable
+tools. A denial records that the target was not executed. It remains distinct from an
+actual tool failure, even when the protocol conveys both through a tool-result channel.
 
-The reviewer receives the current session and exact call. Its context builder
-must include relevant active-turn facts, such as earlier results. See the
-[context assembly contracts](domain.md#context-assembly-contracts).
+The commit sequence is:
 
-## Persistence checkpoints
+1. Commit the user turn and the assistant invocation intent.
+2. Invoke the model and commit its observation together with any accepted output.
+3. Commit each reviewer invocation intent and observed decision.
+4. For an approved call, commit dispatch intent immediately before executing the target.
+5. Commit the actual return before continuing to the next call or model request.
 
-The service saves the accepted assistant response, then handles each call as
-follows.
+Reviewer failure leaves the target undispatched and closes the turn as failed. Approval is
+not dispatch. A committed `Started` without a committed return means the effect is unknown,
+including a crash just before execution. Recovery never repeats that effect automatically.
 
-1. Record `Started` and save before invoking the reviewer.
-2. On approval, execute the tool. On denial, create a non-execution result.
-3. Record and save the result before handling the next call.
+## Context selection
 
-Dispatch includes review. `Started` records an attempt and does not prove that
-the target tool ran. A failed intent save prevents review and execution. A crash
-during review can recover as an unknown effect. Denials and tool failures share
-the same outcome type and differ in their descriptions.
+Closed turns become deterministic factual groups. The active assistant turn retains the
+complete native bundle required for its current tool loop. No model is used to summarize
+history. The planner selects whole groups and the adapter fits the serialized request.
 
-The [session persistence reference](session-store.md#dispatch-checkpoints)
-describes the caller's checkpoint obligations.
+Historical model names and usage stay in the archive rather than prompt prose. Byte limits
+are exact; token figures are labeled estimates. A mandatory bundle that does not fit fails
+before HTTP rather than losing required protocol items. See [model clients](model-clients.md).
 
-## Failures and iteration limits
+## Commit failures
 
-`AgentError::kind()` identifies the cause. `progress()` exposes resident session
-facts when available. Those facts may be newer than stored data.
+`AgentError::durable()` reports the last confirmed archive. `uncommitted()` is separate
+working progress whose publication failed or remains uncertain. Read-only operations never
+overlay that working copy onto disk facts.
 
-| Failure | Result |
-| --- | --- |
-| Reviewer cannot produce a decision | Return the error, preserve the started call, and block the session. No target or later sibling runs. |
-| Save fails | Return the store error and checkpoint, preserve live facts, and block the session. Publication may already have happened. |
-| Assistant cannot complete | Return the typed cause and save the failed turn. |
-| Iteration limit is reached | Save `Interrupted(IterationLimit)` and return progress. |
+A transaction holds an exclusive per-session lock. A conflicting writer receives a busy
+error. Expected commit identity prevents stale snapshots from overwriting newer data.
+After uncertain publication, the service stops external dispatch. Resolution compares the
+exact proposed bytes and synchronizes them under ownership; merely seeing bytes on a read
+is not proof of durability. See [session persistence](session-store.md).
 
-A blocked session rejects later chats without further I/O. The service does not
-retry tools, reload over known results, or repair blocked sessions. Inspect
-progress before recreating the service after resolving the failure.
+`max_iterations` counts assistant generations, not reviews. Every call in an accepted batch
+is handled before checking the next assistant-generation budget. Exhaustion commits an
+`IterationLimit` interruption. There is no automatic model or tool retry.
 
-`max_iterations` counts assistant generations, excluding reviews and tool calls.
-A requested batch finishes before the next budget check. Its saved results may
-therefore receive no further model request in that turn.
+## Runtime limits
 
-## Lifetime and restart limits
-
-Continuations live in memory. Recreating the service loads saved facts through
-normal recovery, which closes active work as `ProcessLost` without repeating it.
-Provider adapters reject retained complete tool history without its continuation
-with `MissingContinuation`. See [recovery limits](model-clients.md#recovery-and-limits).
-
-Use one service writer per stored session. Storage has no stale-write detection
-across instances. Resident sessions and continuations remain in memory for the
-service's lifetime. The loop is synchronous, with no streaming, cancellation,
-automatic retries, or history fitting.
+The loop is synchronous. There is no streaming, cancellation, distributed writer lease,
+automatic interrupted-turn resumption or model-generated summarization. Same-session
+writers cooperate through local OS locks; unrelated sessions can proceed independently.

@@ -103,14 +103,14 @@ cat "$COLA_VERIFY_DOCTOR/doctor.log"
 Each run has its own build and temporary directories. HTTP fixtures bind
 `127.0.0.1:0`, so concurrent runs do not share ports. The host tool path-anchor
 test also creates a temporary directory in the checkout and removes it on drop.
-Use one service writer per session when adding journeys. Storage has no stale
-write detection. Never point a test at a user's `.cola` directory.
+Use disposable roots and honor exclusive per-session transactions. Storage
+rejects cooperating concurrent writers and stale commit candidates. Never point a test at a user's `.cola` directory.
 
 ## Drive
 
 Use the compiled Rust test runner. Filters are stable module paths from this
 checkout, not substring guesses about behavior. The following complete journey
-verifies JSONL persistence through `SessionStore::save`, `load`, and `list`.
+verifies JSONL persistence through `SessionStore` transactions, inspection and listing.
 
 ```bash
 COLA_VERIFY_FEATURE=session-persistence
@@ -136,8 +136,9 @@ external crate consumers of `cola`, so public session transitions are user
 operations. Most service cases substitute collaborators through production
 traits. The native provider service cases combine the real JSONL store and HTTP
 adapters with local provider fixtures and a tool double. Adapter tests separately
-verify real disk, subprocess, and HTTP effects. No journey combines live
-providers with real host tools.
+verify real disk, subprocess, and HTTP effects. These integration journeys use local provider fixtures. The opt-in DeepSeek
+harness documented in README separately combines a live model with host-file
+reads and CLI/Web process restarts.
 
 ## Evidence
 
@@ -153,7 +154,7 @@ cp -R tests/. "$COLA_VERIFY_EVIDENCE/test-sources/"
 ```
 
 Prove the action and resulting state through assertions on public return values
-and a second view of side effects. JSONL tests read raw bytes and load and list
+and a second view of side effects. JSONL tests read raw bytes and inspect and list
 stored sessions. Tool tests read actual files, check rejected writes leave bytes
 unchanged, and inspect real subprocess output. Provider tests inspect captured
 HTTP requests and public responses. A final screen or a successful build alone
@@ -161,8 +162,9 @@ does not prove a journey.
 
 Mocks belong at the library's existing `ModelClient`, `SessionStore`, and `Tool`
 ports. Local provider fixtures exercise real HTTP encoding and decoding.
-Even tests named `real_providers` use local fixtures. Report live provider auth,
-model availability, quotas, and current wire compatibility as unverified.
+Even tests named `real_providers` use local fixtures. For these fixture journeys, report live provider auth, model availability, quotas
+and current wire compatibility as unverified. Label a separate live DeepSeek
+run with its own configuration prerequisites and evidence.
 Temporary files disappear on normal test completion. Their read-back assertions
 and retained source are the evidence, not a retained raw session archive.
 

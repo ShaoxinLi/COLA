@@ -23,15 +23,15 @@ coverage. Inspect the saved source for the side-effect assertions being claimed.
 ## Proof and skip reporting
 
 Retain the action trace, test names, results, source, hashes, and exit status.
-The library has no browser, CLI, desktop window, or HTTP service of its own.
-Public API integration tests are its consumer journeys. Report fixture-based
+The library has CLI and HTTP inbound adapters, and a `cola` executable.
+Public library tests and adapter/executable journeys cover their entry points. Report fixture-based
 orchestration and local HTTP compatibility with those limits. A failed
 precondition is a failure to verify the feature, not permission to skip it.
 
 ## Features
 
-- [Agent chats](agent-chats.md) covers service creation, per-call review, continuation, limits, and failures.
-- [Session persistence](session-persistence.md) covers JSONL save, load, list, recovery, and refused writes.
+- [Agent chats](agent-chats.md) covers service creation, durable review, context selection, recovery, inbound APIs and failures.
+- [Session persistence](session-persistence.md) covers JSONL transactions, inspection, listing, ownership and uncertain publication.
 - [Host tools](host-tools.md) covers file reads and writes, Bash, validation, and path anchoring.
 - [Provider adapters](provider-adapters.md) covers OpenAI and Anthropic HTTP requests, responses, continuation, and errors.
-- [Conversation contracts](conversation-contracts.md) covers public values, session transitions, recovery, context, and caller-defined roles.
+- [Conversation contracts](conversation-contracts.md) covers public values, scoped identities, review/dispatch transitions and faithful restoration.

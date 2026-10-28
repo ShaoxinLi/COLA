@@ -35,7 +35,7 @@ The executable registers Bash, file-read, and file-write tools using `tool_cwd`.
 Every proposed call is reviewed by the configured reviewer model before local
 execution. These tools use the host user's privileges; the working directory
 does not confine their access. The process keeps one service alive for its
-selected API mode. Use a separate session-store root for each running process.
+selected API mode. Operations use per-session OS locks. Simultaneous writers to the same session receive a busy error.
 
 See [startup configuration](docs/api.md#executable-configuration) for fields,
 defaults, exits, and restart limits.
@@ -47,15 +47,12 @@ traits. Adapters implement those contracts and own external I/O.
 
 | Layer | Responsibility | Reference |
 | --- | --- | --- |
-| `src/domain` | Checked values, conversation transitions, tools, context, and recovery. | [Domain contracts](docs/domain.md) |
-| `src/app` | Agent orchestration, model generation, and session persistence ports. | [Agent service](docs/agent-service.md), [model clients](docs/model-clients.md#application-contracts), [session persistence](docs/session-store.md#application-contract) |
-| `src/adapters` | Web and CLI APIs, OpenAI and Anthropic clients, JSONL storage, Bash, and file tools. | [Inbound APIs](#inbound-apis), [model clients](docs/model-clients.md#adapter-implementations), [session persistence](docs/session-store.md#jsonl-adapter), [tool adapters](docs/tools.md) |
+| `src/domain` | Checked values, conversation transitions, tools, review, and recovery. | [Domain contracts](docs/domain.md) |
+| `src/app` | Agent orchestration, model generation, and session persistence ports. | [Agent service](docs/agent-service.md), [model clients](docs/model-clients.md), [session persistence](docs/session-store.md) |
+| `src/adapters` | Web and CLI APIs, OpenAI and Anthropic clients, JSONL storage, Bash, and file tools. | [Inbound APIs](#inbound-apis), [model clients](docs/model-clients.md), [session persistence](docs/session-store.md), [tool adapters](docs/tools.md) |
 | `src/main.rs` | JSON configuration, context policies, component assembly, and process startup. | [Run COLA](#run-cola), [startup configuration](docs/api.md#executable-configuration) |
 
-`Session` validates and records facts without external I/O. `Assistant` and
-`ToolCallReviewer` assemble typed model input. `AgentService` coordinates model
-requests, per-call review, tool execution, continuations, and saves. Callers
-supply its clients, store, roles, settings, and tools.
+`Session` validates and records facts without external I/O. `SessionArchive` adds invocation provenance and native evidence. Context plans select factual history separately from the complete archive. `AgentService` coordinates model requests, review, execution and commits. Callers supply its client, store, role settings and tools.
 
 ## Inbound APIs
 
@@ -79,6 +76,7 @@ WebApi::new(service).run(listener)?;
 | `POST /sessions` with an empty body or `{}` | Creates a session and returns `{"session": ...}` with status 201. |
 | `GET /sessions` | Returns `{"sessions": [...]}` sorted by ID. |
 | `POST /sessions/{session_id}/messages` with `{"text":"Hello"}` | Runs one turn and returns `{"session_id":"...","messages":[...]}`. |
+| `POST /sessions/{session_id}/recover` with an empty body or `{}` | Closes interrupted work without replaying model or tool effects. |
 
 Message requests use `Content-Type: application/json`. Request bodies are
 limited to 64 KiB. Session responses retain turn outcomes, active work, tool
@@ -98,11 +96,11 @@ let code = exit.code();
 The CLI keeps one selected session for the lifetime of `run`. `/new` creates
 and selects a session, `/sessions` lists sessions, and `/use ID` selects an
 opaque session ID without loading it. An ordinary nonblank line sends a
-message to the selected session. Prefix a literal slash with another slash,
+message to the selected session. `/recover` closes interrupted active work in that session without executing its tools. Prefix a literal slash with another slash,
 such as `//new`. `/exit` or EOF ends the session.
 
 Each non-exit command writes and flushes one JSON line. Replies use `kind`
-values `created`, `listed`, `chatted`, `selected`, or `error`. Blank lines emit
+values `created`, `listed`, `chatted`, `selected`, `recovered`, or `error`. Blank lines emit
 nothing. Input lines are limited to 64 KiB. Command failures preserve the
 running service. `CliExit::code()` returns 0 on success, 1 after a service
 failure, or 2 after invalid input. Stream failures return `io::Error`.
@@ -115,12 +113,11 @@ The server has no authentication, cancellation, or bounded
 shutdown. Choose a local bind address for local use. A disconnected client does
 not cancel an admitted turn, and the adapter does not retry it.
 
-Service failures return fixed diagnostic codes and messages with optional
-`progress` and `durability: "unconfirmed"`. Progress records known resident
-facts and does not prove that the last save succeeded. A tool denial remains a
-normal tool result. Keep the service alive across messages; stored facts alone
-cannot restore every native model continuation after restart. See the
-[service lifetime and restart limits](docs/agent-service.md#lifetime-and-restart-limits).
+Service failures return fixed diagnostic codes and safe messages. Durable progress is separate from
+uncommitted observations or uncertain publication. Inspection reads disk facts rather than a resident
+overlay. A fresh service can continue completed tool history from the archive. Interrupted active work
+requires explicit recovery; dispatched calls without a committed return remain unknown and are never
+automatically repeated. See [session operations](docs/agent-service.md).
 
 ## Verify changes
 
@@ -140,3 +137,15 @@ Model tests use local HTTP fixtures, while storage and tool tests use temporary
 files and real processes. Automated tests do not require live provider keys.
 
 Generate API reference documentation with `cargo doc --no-deps`.
+
+To verify the actual executable against real DeepSeek models with a private local configuration:
+
+```sh
+cargo build --locked
+python3 scripts/verify-deepseek.py --binary target/debug/cola --config config.json --evidence .scratch/deepseek-proof
+```
+
+The script uses the configured `api.deepseek.com` endpoint and model/reviewer, performs actual
+file reads, deletes the temporary fixtures, and checks that fresh CLI and Web processes answer
+from recorded history. It also checks durable request records and excludes credentials from evidence.
+The evidence directory must not already exist.

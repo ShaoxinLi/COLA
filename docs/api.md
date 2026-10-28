@@ -30,7 +30,7 @@ the following fields. Unknown and duplicate fields are rejected.
 | `assistant` | Required role configuration. |
 | `reviewer` | Required role configuration. |
 | `tool_cwd` | Required existing directory for host-tool execution. |
-| `store_root` | Required JSONL session directory. Created on the first save if absent. |
+| `store_root` | Required JSONL session directory. Created on the first publication if absent. |
 | `timeout_ms` | Positive request timeout in milliseconds. Default `120000`. |
 | `max_response_bytes` | Positive response-body limit. Default `8388608`. |
 | `max_iterations` | Positive assistant generation limit per turn. Default `16`. |
@@ -42,6 +42,8 @@ Each role has these fields:
 | `model` | Required nonblank model identifier. |
 | `effort` | `default`, `off`, `low`, `medium`, `high`, `xhigh`, or `max`. Default `default`. |
 | `max_output_tokens` | Positive output-token limit. Default `4096`. |
+| `context_window_tokens` | Positive total context allowance. Default `128000`. Must exceed the output reserve. |
+| `max_request_bytes` | Positive serialized request-byte ceiling. Default `1048576`. |
 
 Both roles use one protocol, base URL, and credential. Their model settings
 are independent. The protocol selects the wire format, not the model vendor.
@@ -55,7 +57,7 @@ Relative configuration, tool, and store paths resolve against the process's
 initial working directory. The location of the JSON file does not change that
 base. Startup never changes the process working directory. Tool definitions
 come from one registration list and supply both model catalogs. The assistant
-receives full projected history. The reviewer receives closed history and an
+receives deterministic facts from selected whole prior turns and the complete active protocol bundle. The reviewer receives closed history and an
 explicit description of the active turn and exact candidate call.
 
 | Process exit | Meaning |
@@ -66,10 +68,12 @@ explicit description of the active turn and exact candidate call.
 
 CLI invalid input takes precedence over an earlier service failure. HTTP
 service failures use the response statuses below and leave the server running.
-The executable preserves the adapters' runtime limits, including memory-only
-native continuations. Stored sessions with tool history cannot transparently
-resume after restart. One process owns each store root; startup adds no
-cross-process locking or graceful-shutdown protocol.
+Each operation acquires the session lock and reloads its archive. Closed sessions
+continue after process restart. Interrupted active sessions require explicit
+recovery, which closes the turn without repeating model or tool effects.
+Context admission reserves output tokens and estimates input tokens as the
+serialized UTF-8 byte length divided by three, rounded up. This is a configured
+allowance, not a provider tokenizer or a guarantee against provider limits.
 
 ## Library entry points
 
@@ -93,6 +97,7 @@ Application responses use `Content-Type: application/json`.
 | --- | --- | --- |
 | `POST /sessions` | Empty body or `{}` | `201`, `{"session": Session}` |
 | `GET /sessions` | Unused | `200`, `{"sessions": [Session, ...]}` |
+| `POST /sessions/{session_id}/recover` | Empty body or `{}` | `200`, `{"session": Session}` |
 | `POST /sessions/{session_id}/messages` | `{"text":"Hello"}` | `200`, `{"session_id":"...","messages":[Message, ...]}` |
 
 `Session` and `Message` are the JSON shapes below. Session listings
@@ -138,6 +143,7 @@ Each input line is a command or message. The CLI starts with no selected session
 | --- | --- | --- |
 | `/new` | Creates and selects a session. | `created` |
 | `/sessions` | Lists sessions sorted by ID. | `listed` |
+| `/recover` | Recovers the selected session without executing effects. | `recovered` |
 | `/use ID` | Selects the ID without loading or checking that the session exists. | `selected` |
 | Ordinary nonblank text | Runs a chat turn in the selected session. | `chatted` |
 | Text starting with `//` | Sends the text with one leading slash removed. | `chatted` |
@@ -155,7 +161,7 @@ Each reply is one flushed JSON line. Successful replies use these fields:
 
 | `kind` | Other fields |
 | --- | --- |
-| `created` | `session` |
+| `created`, `recovered` | `session` |
 | `listed` | `sessions` |
 | `selected` | `session_id` |
 | `chatted` | `session_id`, `messages` |
@@ -175,21 +181,25 @@ process. Invalid input takes precedence over service failures.
 
 ## Shared response shapes
 
-A newly created session is `{"id":"...","turns":[],"active":null}`.
+A newly created session is `{"id":"...","revision":1,"turns":[],"active":null}`.
 `turns` contains closed turns. `active` is the current turn or `null`.
 
 | Object | Fields |
 | --- | --- |
-| Session | `id`, `turns`, `active` |
+| Session | `id`, `revision`, `turns`, `active` |
 | Turn | Numeric `id`, `user` text, `steps`, `outcome` |
-| Step | `assistant`, `executions` |
+| Step | `source_generation`, `assistant`, `executions` |
 | Tool call | `id`, `name`, `arguments` object |
-| Execution | `call_id`, `state`, `resolution` |
+| Execution | `generation`, `call_id`, `state`, `resolution` |
 
 A step's `assistant.kind` is `answer` with `text`, or `tool_requests` with
 nullable `text` and a `calls` array. Execution state uses `kind` values
-`not_started`, `started`, or `returned`. A returned state also contains an
+`requested`, `denied`, `approved`, `started`, or `returned`. Review states
+include `reviewer` generation and optional `reason`. Started and returned states
+include the reviewer generation and timestamps. A returned state contains an
 `outcome` with `kind` equal to `success` or `failure`, plus `text`.
+`generation` scopes the original opaque tool-call ID. `revision` counts committed
+archive snapshots for concurrency control.
 
 `resolution` is `null` or contains `disposition`, `source`, and `evidence`.
 Dispositions are `completed` and `not_performed`. Sources are `observation`,
@@ -225,27 +235,30 @@ Both contain the same error object:
 		"message": "Session not found",
 		"role": null,
 		"progress": null,
-		"durability": "unconfirmed"
+		"uncommitted": null,
+		"durability": "committed"
 	}
 }
 ```
 
 `code` and `message` are fixed diagnostics. They exclude underlying provider and
 storage error text. `role` is `assistant`, `reviewer`, or `null`.
-`progress` is a session snapshot or `null`. The snapshot can contain changes
-that failed to save. `durability` is always `"unconfirmed"` and does not prove
-that the last save succeeded. An error does not imply that a tool had no effect.
+`progress` is the last confirmed durable snapshot or `null`. `uncommitted`
+contains a separate candidate snapshot when publication failed. `durability`
+is `committed`, `not_published`, or `uncertain`. Uncertainty stops effects until
+the same candidate is resolved or a fresh exclusive acquisition establishes
+the current archive. An error does not imply that a tool had no effect.
 
 | HTTP status | Error code |
 | --- | --- |
 | `400` | `invalid_input` |
 | `404` | `route_not_found`, `session_not_found` |
 | `405` | `method_not_allowed`, with an `Allow` header |
-| `409` | `session_blocked` |
+| `409` | `session_busy`, `recovery_required`, `commit_conflict` |
 | `413` | `body_too_large` |
 | `415` | `unsupported_media_type` |
-| `422` | `generation_refused`, `iteration_limit` |
-| `500` | `store_failure`, `context_failure`, `catalog_mismatch`, `unknown_tool`, `rejected_output`, `unexpected_state`, `duplicate_tool`, `internal_failure` |
+| `422` | `generation_refused`, `iteration_limit`, `context_capacity` |
+| `500` | `store_failure`, `commit_uncertain`, `rejected_output`, `duplicate_tool` |
 | `502` | `generation_incomplete`, `model_failure` |
 | `504` | `model_timeout` |
 
@@ -263,6 +276,6 @@ not retry that turn.
 
 The web server supports HTTP/1.1 over plain TCP. It has no TLS, authentication,
 connection cap, request deadline, or bounded shutdown.
-Native model continuations remain in memory. Stored session facts do
-not restore every continuation after restart. See
-[service lifetime and restart limits](agent-service.md#lifetime-and-restart-limits).
+The persisted archive supplies all continuation facts. Recovery records unknown
+started effects honestly; it never guesses a tool result. See
+[agent service](agent-service.md) for publication and recovery behavior.

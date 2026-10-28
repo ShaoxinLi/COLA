@@ -1,42 +1,35 @@
 # Conversation contracts
 
-Rust callers construct checked values, record conversation facts, recover
-interrupted work, and build typed context with their own assistant and reviewer.
+The domain records checked conversation and execution facts without external I/O.
+`GenerationId` identifies an invocation; `CallRef` combines it with the original
+opaque `ToolCallId`. Review, dispatch intent and actual returns are separate states.
 
-## Sub-features
+## Public entry points
 
-- `conversation-values` validates identities, schemas, messages, and decisions.
-- `conversation-turns` records batches and results, closes turns, and rejects invalid transitions atomically.
-- `conversation-recover` preserves dispatch intent and resolution evidence across snapshot restoration.
-- `conversation-context` projects valid exchanges and reports unresolved or inconsistent history.
-- `conversation-extension` supports caller-defined roles and tools through public traits.
+Construct `Session` and checked domain values. Use `start_turn`,
+`record_assistant`, `review_tool`, `start_tool`, `record_tool_result`,
+`interrupt`, `fail`, `resolve_effect`, `snapshot`, and `restore`.
+Restoration faithfully preserves active work. It does not implicitly record
+process loss. Explicit application recovery owns that operation.
 
-## How to get to it (user POV)
+## Drive
 
-Import `cola::domain`. Construct `Session` and checked messages, then call
-`start_turn`, `record_assistant`, `start_tool`, and `record_tool_result`.
-Call `interrupt`, `resolve_effect`, `snapshot`, and `restore` for recovery.
-Build `Context` or implement `Assistant`, `ToolCallReviewer`, and `Tool`.
+After Launch and Doctor, set `COLA_VERIFY_FEATURE=conversation-contracts` and run
+`"$COLA_VERIFY_DOMAIN" --nocapture --test-threads=1` in the capture block.
+Read `tests/domain/` and the constructors in `tests/domain.rs`.
 
-## Driving it with the Rust test runner
+`value::`, `message::`, `roles::`, and `tool::` cover checked identities, message
+batches, schemas, decisions and externally implemented tools. `conversation::`
+covers scoped IDs, approval/denial, ordered dispatch, actual outcomes, atomic
+rejection, faithful restoration and resolution evidence. Invalid snapshots are
+rejected without fabricating results.
 
-Preconditions:
+Context construction is an application concern. The old domain `Context`,
+`Assistant` and `ToolCallReviewer` traits have been removed. Run the full
+application group from the agent-chat map for `ContextPlan` and custom model ports.
 
-- Launch and Doctor pass. Set `COLA_VERIFY_FEATURE=conversation-contracts`.
-- Tests construct every value in memory. No seed files or credentials are needed.
+## Limits
 
-Run `"$COLA_VERIFY_DOMAIN" --nocapture --test-threads=1` in the capture block.
-Cases live in `tests/domain/` and share public constructors in `tests/domain.rs`.
-
-- Construct checked values, messages, schemas, tools, and decisions through `value::`, `message::`, `tool::`, and `roles::`. Assert accepted values and rejected inputs.
-- Record answers and multiple tool batches through `conversation::`. Compare public messages, outcomes, IDs, and unchanged snapshots after rejected transitions.
-- Interrupt partial dispatch and reconcile effects through the cancellation, restoration, and reconciliation cases. Assert retained started calls, provenance, evidence, and no fabricated results.
-- Build complete and closed context through `context::`. Invalid exchange order and unresolved batches fail without losing facts.
-- Implement caller-owned roles through `roles::external_roles_assemble_typed_context_through_trait_objects` and a tool through `tool::external_tool_executes_arguments_and_records_success_or_failure`. Trait-object outputs prove external implementation works.
-
-## Gotchas
-
-- Domain transitions are the library user's own operations. They perform no model, filesystem, or subprocess I/O.
-- Recording `Started` proves intent. It does not prove that a tool executed.
-- Recovery closes active work as `ProcessLost`. Resolution adds evidence without reopening the old turn.
-- Passing domain tests does not prove adapter effects. Use the relevant adapter map for disk, process, or HTTP behavior.
+`Started` proves committed dispatch intent, not a successful effect. Unknown
+started effects remain unknown until explicit evidence resolves them. Domain
+checks alone do not prove HTTP, filesystem or subprocess behavior.
