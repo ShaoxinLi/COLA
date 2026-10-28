@@ -5,6 +5,7 @@ use serde_json::Value;
 #[derive(Serialize)]
 pub(super) struct SessionDto {
     id: String,
+    revision: u64,
     turns: Vec<TurnDto>,
     active: Option<TurnDto>,
 }
@@ -19,6 +20,7 @@ pub(super) struct TurnDto {
 
 #[derive(Serialize)]
 pub(super) struct StepDto {
+    source_generation: u64,
     assistant: AssistantDto,
     executions: Vec<ExecutionDto>,
 }
@@ -44,6 +46,7 @@ pub(super) struct CallDto {
 
 #[derive(Serialize)]
 pub(super) struct ExecutionDto {
+    generation: u64,
     call_id: String,
     state: ExecutionStateDto,
     resolution: Option<ResolutionDto>,
@@ -52,9 +55,25 @@ pub(super) struct ExecutionDto {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum ExecutionStateDto {
-    NotStarted,
-    Started,
-    Returned { outcome: ToolOutcomeDto },
+    Requested,
+    Denied {
+        reviewer: u64,
+        reason: Option<String>,
+    },
+    Approved {
+        reviewer: u64,
+        reason: Option<String>,
+    },
+    Started {
+        reviewer: u64,
+        at: u64,
+    },
+    Returned {
+        reviewer: u64,
+        started_at: u64,
+        at: u64,
+        outcome: ToolOutcomeDto,
+    },
 }
 
 #[derive(Serialize)]
@@ -135,6 +154,7 @@ pub(super) struct FailureDto {
     message: &'static str,
     role: Option<ModelRoleDto>,
     progress: Option<SessionDto>,
+    uncommitted: Option<SessionDto>,
     durability: DurabilityDto,
 }
 
@@ -148,12 +168,15 @@ pub(super) enum ModelRoleDto {
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum DurabilityDto {
-    Unconfirmed,
+    Committed,
+    NotPublished,
+    Uncertain,
 }
 
 pub(super) enum FailureClass {
     NotFound,
-    Blocked,
+    Conflict,
+    Capacity,
     Refused,
     IterationLimit,
     Incomplete,
@@ -163,9 +186,11 @@ pub(super) enum FailureClass {
     Internal,
 }
 
-pub(super) fn session_dto(session: &Session) -> SessionDto {
+pub(super) fn session_dto(archive: &SessionArchive) -> SessionDto {
+    let session = archive.session();
     SessionDto {
         id: session.id().as_str().into(),
+        revision: archive.revision().get(),
         turns: session
             .turns()
             .iter()
@@ -186,16 +211,37 @@ pub(super) fn session_dto(session: &Session) -> SessionDto {
 }
 fn step_dto(step: &Step) -> StepDto {
     StepDto {
+        source_generation: step.source_generation().get(),
         assistant: assistant_dto(step.assistant()),
         executions: step
             .executions()
             .map(|e| ExecutionDto {
+                generation: e.call_ref().generation().get(),
                 call_id: e.call().id().as_str().into(),
                 state: match e.state() {
-                    ExecutionState::NotStarted => ExecutionStateDto::NotStarted,
-                    ExecutionState::Started => ExecutionStateDto::Started,
-                    ExecutionState::Returned(o) => ExecutionStateDto::Returned {
-                        outcome: tool_outcome_dto(o),
+                    ExecutionState::Requested => ExecutionStateDto::Requested,
+                    ExecutionState::Denied(review) => ExecutionStateDto::Denied {
+                        reviewer: review.reviewer().get(),
+                        reason: review.reason().map(|r| r.as_str().into()),
+                    },
+                    ExecutionState::Approved(review) => ExecutionStateDto::Approved {
+                        reviewer: review.reviewer().get(),
+                        reason: review.reason().map(|r| r.as_str().into()),
+                    },
+                    ExecutionState::Started { review, at } => ExecutionStateDto::Started {
+                        reviewer: review.reviewer().get(),
+                        at: at.unix_millis(),
+                    },
+                    ExecutionState::Returned {
+                        review,
+                        started_at,
+                        at,
+                        outcome,
+                    } => ExecutionStateDto::Returned {
+                        reviewer: review.reviewer().get(),
+                        started_at: started_at.unix_millis(),
+                        at: at.unix_millis(),
+                        outcome: tool_outcome_dto(outcome),
                     },
                 },
                 resolution: e.resolution().map(|r| ResolutionDto {
@@ -292,26 +338,55 @@ pub(super) struct ClassifiedFailure {
 }
 pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
     let (class, code, message, role) = match error.kind() {
-        AgentErrorKind::Store {
-            at: Checkpoint::LoadSession,
-            source,
-        } if source.kind() == SessionStoreErrorKind::NotFound => (
-            FailureClass::NotFound,
-            "session_not_found",
-            "Session not found",
+        AgentErrorKind::Store(source) => match source.kind() {
+            SessionStoreErrorKind::NotFound => (
+                FailureClass::NotFound,
+                "session_not_found",
+                "Session not found",
+                None,
+            ),
+            SessionStoreErrorKind::Busy => (
+                FailureClass::Conflict,
+                "session_busy",
+                "Session is busy",
+                None,
+            ),
+            _ => (
+                FailureClass::Store,
+                "store_failure",
+                "Session storage failed",
+                None,
+            ),
+        },
+        AgentErrorKind::Commit(CommitFault::Uncertain(_)) => (
+            FailureClass::Store,
+            "commit_uncertain",
+            "Session publication is uncertain",
             None,
         ),
-        AgentErrorKind::Store { .. } => (
+        AgentErrorKind::Commit(CommitFault::Conflict) => (
+            FailureClass::Conflict,
+            "commit_conflict",
+            "Session commit conflicts with stored data",
+            None,
+        ),
+        AgentErrorKind::Commit(CommitFault::NotPublished(_)) => (
             FailureClass::Store,
             "store_failure",
-            "Session storage failed",
+            "Session commit was not published",
             None,
         ),
-        AgentErrorKind::Blocked { .. } => (
-            FailureClass::Blocked,
-            "session_blocked",
-            "Session is blocked",
+        AgentErrorKind::RecoveryRequired => (
+            FailureClass::Conflict,
+            "recovery_required",
+            "Session recovery is required",
             None,
+        ),
+        AgentErrorKind::ContextCapacity { role } => (
+            FailureClass::Capacity,
+            "context_capacity",
+            "Required context exceeds the configured limits",
+            Some(*role),
         ),
         AgentErrorKind::Refused { role, .. } => (
             FailureClass::Refused,
@@ -325,23 +400,18 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             "Generation was incomplete",
             Some(*role),
         ),
-        AgentErrorKind::Model { role, source } => {
-            if source.kind() == ModelErrorKind::Timeout {
-                (
-                    FailureClass::Timeout,
-                    "model_timeout",
-                    "Model request timed out",
-                    Some(*role),
-                )
-            } else {
-                (
-                    FailureClass::Model,
-                    "model_failure",
-                    "Model request failed",
-                    Some(*role),
-                )
-            }
-        }
+        AgentErrorKind::Model { role, source } if source.kind() == ModelErrorKind::Timeout => (
+            FailureClass::Timeout,
+            "model_timeout",
+            "Model request timed out",
+            Some(*role),
+        ),
+        AgentErrorKind::Model { role, .. } => (
+            FailureClass::Model,
+            "model_failure",
+            "Model request failed",
+            Some(*role),
+        ),
         AgentErrorKind::IterationLimit => (
             FailureClass::IterationLimit,
             "iteration_limit",
@@ -354,36 +424,17 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             "Duplicate tool registration",
             None,
         ),
-        AgentErrorKind::CatalogMismatch(_) => (
-            FailureClass::Internal,
-            "catalog_mismatch",
-            "Tool catalog mismatch",
-            None,
-        ),
-        AgentErrorKind::UnknownTool(_) => (
-            FailureClass::Internal,
-            "unknown_tool",
-            "Assistant requested an unknown tool",
-            None,
-        ),
-        AgentErrorKind::Context { role, .. } => (
-            FailureClass::Internal,
-            "context_failure",
-            "Context assembly failed",
-            Some(*role),
-        ),
         AgentErrorKind::RejectedOutput(_) => (
             FailureClass::Internal,
             "rejected_output",
             "Session transition rejected",
             None,
         ),
-        AgentErrorKind::UnexpectedState => (
-            FailureClass::Internal,
-            "unexpected_state",
-            "Unexpected session state",
-            None,
-        ),
+    };
+    let durability = match error.kind() {
+        AgentErrorKind::Commit(CommitFault::Uncertain(_)) => DurabilityDto::Uncertain,
+        AgentErrorKind::Commit(_) => DurabilityDto::NotPublished,
+        _ => DurabilityDto::Committed,
     };
     ClassifiedFailure {
         class,
@@ -394,8 +445,9 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
                 ModelRole::Assistant => ModelRoleDto::Assistant,
                 ModelRole::Reviewer => ModelRoleDto::Reviewer,
             }),
-            progress: error.progress().map(session_dto),
-            durability: DurabilityDto::Unconfirmed,
+            progress: error.durable().map(session_dto),
+            uncommitted: error.uncommitted().map(session_dto),
+            durability,
         },
     }
 }
@@ -405,7 +457,8 @@ pub(super) fn input_failure(code: &'static str, message: &'static str) -> Failur
         message,
         role: None,
         progress: None,
-        durability: DurabilityDto::Unconfirmed,
+        uncommitted: None,
+        durability: DurabilityDto::Committed,
     }
 }
 pub(super) const INPUT_LIMIT: usize = 64 * 1024;

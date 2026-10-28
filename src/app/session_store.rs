@@ -1,32 +1,56 @@
-use crate::domain::{Session, SessionId};
+use super::{ArchiveChange, SessionArchive};
+use crate::domain::SessionId;
 use std::{error::Error, fmt};
 
-/// Synchronous persistence of complete session facts.
+/// Read-only inspection and exclusive transactional ownership of durable sessions.
 pub trait SessionStore {
-    /// Returns all sessions sorted by ID, recovering active turns as `ProcessLost`.
-    /// Recovery retains dispatch intent and does not write back. A missing store
-    /// returns an empty list. Any corrupt committed session fails the listing.
-    fn list(&self) -> Result<Vec<Session>, SessionStoreError>;
-    /// Replaces the saved state for this ID with all current session facts.
-    /// Active turns are saved faithfully without changing the live session.
-    /// Repeating an identical save is safe. Unreadable representations are
-    /// refused with `InvalidData`, preserving any previous saved state.
-    /// Corrupt or unsupported existing records are also preserved and refused.
-    /// An error after replacement may leave the new state visible; errors do
-    /// not imply rollback, and retrying the identical save is safe.
-    fn save(&self, session: &Session) -> Result<(), SessionStoreError>;
-    /// Loads a session or returns `NotFound` when its record is absent.
-    /// Recovery closes active turns as `ProcessLost`, retaining dispatch intent
-    /// and typed execution and effect-resolution facts without writing back.
-    fn load(&self, id: &SessionId) -> Result<Session, SessionStoreError>;
+    fn list(&self) -> Result<Vec<SessionArchive>, SessionStoreError>;
+    fn inspect(&self, id: &SessionId) -> Result<SessionArchive, SessionStoreError>;
+    fn create(&self, initial: &ArchiveChange) -> Result<(), CommitFault>;
+    fn acquire(
+        &self,
+        id: &SessionId,
+    ) -> Result<Box<dyn SessionTransaction + '_>, SessionStoreError>;
+}
+
+/// Exclusive ownership remains held through publication and any uncertainty repair.
+pub trait SessionTransaction {
+    fn confirmed(&self) -> &SessionArchive;
+    fn commit(&mut self, change: &ArchiveChange) -> Result<(), CommitFault>;
+    /// Reconciles exactly this candidate, including a file and directory sync barrier.
+    fn resolve(&mut self, change: &ArchiveChange) -> Result<(), CommitFault>;
+}
+
+#[derive(Debug)]
+pub enum CommitFault {
+    NotPublished(SessionStoreError),
+    Uncertain(SessionStoreError),
+    Conflict,
+}
+impl fmt::Display for CommitFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPublished(error) => write!(f, "snapshot not published: {error}"),
+            Self::Uncertain(error) => write!(f, "snapshot publication uncertain: {error}"),
+            Self::Conflict => f.write_str("snapshot publication conflict"),
+        }
+    }
+}
+impl Error for CommitFault {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::NotPublished(error) | Self::Uncertain(error) => Some(error),
+            Self::Conflict => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionStoreErrorKind {
     NotFound,
     InvalidData,
-    UnsupportedVersion,
     Storage,
+    Busy,
 }
 
 #[derive(Debug)]

@@ -1,4 +1,4 @@
-use super::{call, definition, id, session, text, user};
+use super::{approve, at, call, definition, generation, id, reference, session, text, user};
 use cola::domain::{
     AssistantMessage, ExecutionState, InputSchema, Message, NextAction, Tool, ToolCall, ToolCalls,
     ToolError, ToolName, ToolOutcome, ToolResult, ValueError,
@@ -40,12 +40,17 @@ fn external_tool_executes_arguments_and_records_success_or_failure() {
         session
             .record_assistant(
                 turn,
+                generation(1),
                 AssistantMessage::tool_requests(None, ToolCalls::new(vec![call]).unwrap()),
             )
             .unwrap();
-        let call = session.start_tool(turn, &id("echo-call")).unwrap();
-        let result = ToolResult::new(call.id().clone(), tool.execute(call.arguments()));
-        session.record_tool_result(turn, result).unwrap();
+        approve(&mut session, turn, "echo-call");
+        let reference = reference(&session, "echo-call");
+        let call = session.start_tool(turn, &reference, at(10)).unwrap();
+        let outcome = tool.execute(call.arguments());
+        session
+            .record_tool_result(turn, &reference, outcome, at(11))
+            .unwrap();
 
         assert_eq!(
             session.messages().last(),
@@ -54,13 +59,8 @@ fn external_tool_executes_arguments_and_records_success_or_failure() {
                 expected.clone()
             )))
         );
-        assert_eq!(
-            session.active_turn().unwrap().steps()[0]
-                .executions()
-                .next()
-                .unwrap()
-                .state(),
-            &ExecutionState::Returned(expected)
+        assert!(
+            matches!(session.active_turn().unwrap().steps()[0].executions().next().unwrap().state(), ExecutionState::Returned { outcome, started_at, at: returned_at, .. } if outcome == &expected && *started_at == at(10) && *returned_at == at(11))
         );
         assert_eq!(session.next_action(), NextAction::AskModel);
     }

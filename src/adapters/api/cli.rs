@@ -1,10 +1,7 @@
 use super::inbound;
 use crate::{
     app::{AgentService, ModelClient, SessionStore},
-    domain::{
-        Assistant, AssistantMessage, Decision, NonEmptyText, SessionId, ToolCallReviewer,
-        UserMessage,
-    },
+    domain::{AssistantMessage, Decision, NonEmptyText, SessionId, UserMessage},
 };
 use std::io::{self, BufRead, Write};
 
@@ -12,6 +9,9 @@ use std::io::{self, BufRead, Write};
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Reply {
     Created {
+        session: inbound::SessionDto,
+    },
+    Recovered {
         session: inbound::SessionDto,
     },
     Listed {
@@ -29,8 +29,8 @@ enum Reply {
     },
 }
 /// A persistent, synchronous JSON-line command session with one selected session.
-pub struct CliApp<M, S, A, R> {
-    service: AgentService<M, S, A, R>,
+pub struct CliApp<M, S> {
+    service: AgentService<M, S>,
 }
 /// Accumulated command outcome. Invalid input takes precedence over service failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,20 +52,18 @@ impl CliExit {
         }
     }
 }
-impl<M, S, A, R> CliApp<M, S, A, R>
+impl<M, S> CliApp<M, S>
 where
     M: ModelClient<AssistantMessage> + ModelClient<Decision>,
     S: SessionStore,
-    A: Assistant,
-    R: ToolCallReviewer,
 {
     /// Takes ownership of an existing service. Collaborators need not be `Send`.
-    pub fn new(service: AgentService<M, S, A, R>) -> Self {
+    pub fn new(service: AgentService<M, S>) -> Self {
         Self { service }
     }
     /// Runs until `/exit` or EOF, flushing each reply. Model and tool calls block input.
     /// Stream failures return immediately as I/O errors.
-    pub fn run<I: BufRead, O: Write>(mut self, mut input: I, mut output: O) -> io::Result<CliExit> {
+    pub fn run<I: BufRead, O: Write>(self, mut input: I, mut output: O) -> io::Result<CliExit> {
         let mut selected = None;
         let mut exit = CliExit::Success;
         while let Some(line) = read_line(&mut input)? {
@@ -85,15 +83,24 @@ where
             }
             let reply = if line == "/new" {
                 self.service.new_session().map(|s| {
-                    selected = Some(s.id().clone());
+                    selected = Some(s.session().id().clone());
                     Reply::Created {
                         session: inbound::session_dto(&s),
                     }
                 })
             } else if line == "/sessions" {
-                self.service.list_session().map(|sessions| Reply::Listed {
+                self.service.list_sessions().map(|sessions| Reply::Listed {
                     sessions: sessions.iter().map(inbound::session_dto).collect(),
                 })
+            } else if line == "/recover" {
+                if let Some(id) = &selected {
+                    self.service.recover(id).map(|report| Reply::Recovered {
+                        session: inbound::session_dto(report.archive()),
+                    })
+                } else {
+                    exit = CliExit::InvalidInput;
+                    Ok(invalid())
+                }
             } else if let Some(id) = line.strip_prefix("/use ") {
                 match SessionId::new(id) {
                     Ok(id) => {
@@ -118,9 +125,9 @@ where
                     .unwrap_or(&line);
                 let user =
                     UserMessage::new(NonEmptyText::new(text).expect("nonblank command text"));
-                self.service.chat(id, user).map(|messages| Reply::Chatted {
+                self.service.chat(id, user).map(|turn| Reply::Chatted {
                     session_id: id.as_str().into(),
-                    messages: inbound::message_dtos(&messages),
+                    messages: inbound::message_dtos(turn.messages()),
                 })
             } else {
                 exit = CliExit::InvalidInput;

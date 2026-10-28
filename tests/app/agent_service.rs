@@ -1,205 +1,45 @@
-#[allow(dead_code)]
-#[path = "../adapters/models/support.rs"]
-mod support;
-
 use cola::{adapters::stores::JsonlSessionStore, app::*, domain::*};
 use serde_json::{Map, Value, json};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, VecDeque},
-    num::NonZeroU32,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     rc::Rc,
 };
-use support::{PROVIDERS, Provider, Server, text, tool, user};
 
-type Script<O> = VecDeque<Result<Generation<O>, ModelError>>;
-
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
-struct Io {
-    assistant: usize,
-    review: usize,
-    context: usize,
-    review_context: usize,
-    save: usize,
-    load: usize,
-    list: usize,
-    targets: Vec<u64>,
+fn text(value: impl Into<String>) -> NonEmptyText {
+    NonEmptyText::new(value).unwrap()
 }
-
-#[derive(Clone, Default)]
-struct Store {
-    io: Rc<RefCell<Io>>,
-    saved: Rc<RefCell<BTreeMap<SessionId, Session>>>,
-    attempted: Rc<RefCell<Vec<Session>>>,
-    fault: Rc<RefCell<Option<(usize, bool)>>>,
-    list_fault: Rc<RefCell<bool>>,
+fn user(value: &str) -> UserMessage {
+    UserMessage::new(text(value))
 }
-fn storage_error() -> SessionStoreError {
-    SessionStoreError::new(
-        SessionStoreErrorKind::Storage,
-        std::io::Error::other("injected save failure"),
-    )
+fn tool() -> ToolDefinition {
+    ToolDefinition::new(ToolName::new("lookup").unwrap(), text("Look up a value"), InputSchema::new(json!({"type":"object","properties":{"n":{"type":"integer"}},"required":["n"],"additionalProperties":false})).unwrap())
 }
-impl SessionStore for Store {
-    fn save(&self, session: &Session) -> Result<(), SessionStoreError> {
-        self.io.borrow_mut().save += 1;
-        self.attempted.borrow_mut().push(session.clone());
-        let fault = self
-            .fault
-            .borrow()
-            .filter(|(n, _)| *n == self.io.borrow().save);
-        if fault != Some((self.io.borrow().save, false)) {
-            self.saved
-                .borrow_mut()
-                .insert(session.id().clone(), session.clone());
-        }
-        if fault.is_some() {
-            Err(storage_error())
-        } else {
-            Ok(())
-        }
-    }
-    fn load(&self, id: &SessionId) -> Result<Session, SessionStoreError> {
-        self.io.borrow_mut().load += 1;
-        self.saved
-            .borrow()
-            .get(id)
-            .map(|s| Session::restore(s.snapshot()).unwrap())
-            .ok_or_else(|| {
-                SessionStoreError::new(
-                    SessionStoreErrorKind::NotFound,
-                    std::io::Error::other("missing"),
-                )
-            })
-    }
-    fn list(&self) -> Result<Vec<Session>, SessionStoreError> {
-        self.io.borrow_mut().list += 1;
-        if *self.list_fault.borrow() {
-            return Err(storage_error());
-        }
-        Ok(self
-            .saved
-            .borrow()
-            .values()
-            .map(|s| Session::restore(s.snapshot()).unwrap())
-            .collect())
+fn model_settings() -> ModelSettings {
+    ModelSettings {
+        model_id: ModelId::new("requested-model").unwrap(),
+        effort: Effort::High,
+        max_output_tokens: NonZeroU32::new(1024).unwrap(),
     }
 }
-
-#[derive(Clone)]
-struct FakeModel {
-    assistant: Rc<RefCell<Script<AssistantMessage>>>,
-    reviewer: Rc<RefCell<Script<Decision>>>,
-    inputs: Rc<RefCell<Vec<Context<AssistantMessage>>>>,
-    io: Rc<RefCell<Io>>,
-}
-impl ModelClient<AssistantMessage> for FakeModel {
-    fn generate(
-        &self,
-        context: &Context<AssistantMessage>,
-        _: &ModelSettings,
-        _: Option<&Continuation<AssistantMessage>>,
-    ) -> Result<Generation<AssistantMessage>, ModelError> {
-        self.io.borrow_mut().assistant += 1;
-        self.inputs.borrow_mut().push(context.clone());
-        self.assistant
-            .borrow_mut()
-            .pop_front()
-            .expect("assistant script exhausted")
-    }
-}
-impl ModelClient<Decision> for FakeModel {
-    fn generate(
-        &self,
-        _: &Context<Decision>,
-        _: &ModelSettings,
-        continuation: Option<&Continuation<Decision>>,
-    ) -> Result<Generation<Decision>, ModelError> {
-        assert!(continuation.is_none());
-        self.io.borrow_mut().review += 1;
-        self.reviewer
-            .borrow_mut()
-            .pop_front()
-            .expect("review script exhausted")
-    }
-}
-
-struct AssistantContext {
-    catalog: Vec<ToolDefinition>,
-    fail: bool,
-    io: Rc<RefCell<Io>>,
-}
-impl Assistant for AssistantContext {
-    fn context(&self, session: &Session) -> Result<Context<AssistantMessage>, ContextError> {
-        self.io.borrow_mut().context += 1;
-        if self.fail {
-            return Err(ContextError::MissingUser);
-        }
-        Context::new(
-            text("Be useful"),
-            session.context_exchanges()?,
-            self.catalog.clone(),
-        )
-    }
-}
-struct ReviewContext {
-    fail: bool,
-    observed: Rc<RefCell<Vec<(Session, ToolCall)>>>,
-    io: Rc<RefCell<Io>>,
-}
-impl ToolCallReviewer for ReviewContext {
-    fn context(
-        &self,
-        session: &Session,
-        call: &ToolCall,
-    ) -> Result<Context<Decision>, ContextError> {
-        self.io.borrow_mut().review_context += 1;
-        self.observed
-            .borrow_mut()
-            .push((session.clone(), call.clone()));
-        if self.fail {
-            return Err(ContextError::UnresolvedToolBatch);
-        }
-        Context::new(
-            text(&format!(
-                "Review exact call {call:?}; active facts {:?}",
-                session.active_turn()
-            )),
-            session.closed_context_exchanges()?,
-            vec![],
-        )
-    }
-}
-struct Target {
-    io: Rc<RefCell<Io>>,
-    fail: bool,
-}
-impl Tool for Target {
-    fn execute(&self, arguments: &Map<String, Value>) -> ToolOutcome {
-        let n = arguments["n"].as_u64().unwrap();
-        self.io.borrow_mut().targets.push(n);
-        if self.fail {
-            ToolOutcome::Failure(ToolError::new(text("actual target failure")))
-        } else {
-            ToolOutcome::Success(format!("actual lookup result {n}"))
-        }
+fn limits(bytes: usize) -> ContextLimits {
+    ContextLimits {
+        input_tokens: NonZeroU64::new(1_000_000).unwrap(),
+        request_bytes: NonZeroUsize::new(bytes).unwrap(),
     }
 }
 fn settings(max: u32) -> AgentSettings {
+    let role = |instructions| RoleSettings {
+        model: model_settings(),
+        instructions: text(instructions),
+        limits: limits(1_000_000),
+    };
     AgentSettings {
-        assistant_model_settings: PROVIDERS[0].settings(),
-        reviewer_model_settings: PROVIDERS[1].settings(),
+        assistant: role("Assistant exact instructions"),
+        reviewer: role("Reviewer exact instructions"),
         max_iterations: NonZeroU32::new(max).unwrap(),
     }
-}
-fn complete<O>(output: O) -> Result<Generation<O>, ModelError> {
-    Ok(Generation::Complete {
-        output,
-        continuation: None,
-    })
-}
-fn answer(value: &str) -> Result<Generation<AssistantMessage>, ModelError> {
-    complete(AssistantMessage::answer(value).unwrap())
 }
 fn call(n: u64, name: &str) -> ToolCall {
     ToolCall::new(
@@ -210,17 +50,358 @@ fn call(n: u64, name: &str) -> ToolCall {
     .unwrap()
 }
 fn batch(calls: Vec<ToolCall>) -> Result<Generation<AssistantMessage>, ModelError> {
-    complete(AssistantMessage::tool_requests(
+    Ok(Generation::Complete(AssistantMessage::tool_requests(
         Some("exact preamble".into()),
         ToolCalls::new(calls).unwrap(),
+    )))
+}
+fn answer(value: &str) -> Result<Generation<AssistantMessage>, ModelError> {
+    Ok(Generation::Complete(
+        AssistantMessage::answer(value).unwrap(),
     ))
 }
+fn decision(allow: bool) -> Result<Generation<Decision>, ModelError> {
+    Ok(Generation::Complete(Decision::new(
+        allow,
+        Some(text("use read only")),
+    )))
+}
+fn storage_error() -> SessionStoreError {
+    SessionStoreError::new(
+        SessionStoreErrorKind::Storage,
+        std::io::Error::other("injected publication failure"),
+    )
+}
+fn missing_error() -> SessionStoreError {
+    SessionStoreError::new(
+        SessionStoreErrorKind::NotFound,
+        std::io::Error::other("missing"),
+    )
+}
 
-type Service = AgentService<FakeModel, Store, AssistantContext, ReviewContext>;
+#[derive(Clone, Copy, Debug)]
+enum Fault {
+    NotPublished,
+    UncertainUnpublished,
+    UncertainPublished,
+    RepairablePublished,
+    Conflict,
+}
+#[derive(Default)]
+struct StoreState {
+    bytes: BTreeMap<SessionId, Vec<u8>>,
+    owned: BTreeSet<SessionId>,
+    attempts: usize,
+    resolves: usize,
+    fault: Option<(usize, Fault)>,
+    list_fault: bool,
+    attempted: Vec<SessionArchive>,
+}
+#[derive(Clone, Default)]
+struct Store(Rc<RefCell<StoreState>>);
+impl Store {
+    fn inject(&self, attempt: usize, fault: Fault) {
+        self.0.borrow_mut().fault = Some((attempt, fault));
+    }
+    fn clear_fault(&self) {
+        self.0.borrow_mut().fault = None;
+    }
+    fn bytes(&self, id: &SessionId) -> Vec<u8> {
+        self.0.borrow().bytes[id].clone()
+    }
+    fn seed(&self, archive: SessionArchive) -> SessionId {
+        let change = ArchiveChange::initial(archive).unwrap();
+        let id = change.candidate().session().id().clone();
+        self.create(&change).unwrap();
+        id
+    }
+    fn publication(&self, change: &ArchiveChange) -> Result<(), CommitFault> {
+        let mut state = self.0.borrow_mut();
+        state.attempts += 1;
+        state.attempted.push(change.candidate().clone());
+        let fault = state
+            .fault
+            .filter(|(n, _)| *n == state.attempts)
+            .map(|(_, fault)| fault);
+        if !matches!(
+            fault,
+            Some(Fault::NotPublished | Fault::UncertainUnpublished | Fault::Conflict)
+        ) {
+            state.bytes.insert(
+                change.candidate().session().id().clone(),
+                change.encoded().to_vec(),
+            );
+        }
+        match fault {
+            Some(Fault::NotPublished) => Err(CommitFault::NotPublished(storage_error())),
+            Some(
+                Fault::UncertainUnpublished
+                | Fault::UncertainPublished
+                | Fault::RepairablePublished,
+            ) => Err(CommitFault::Uncertain(storage_error())),
+            Some(Fault::Conflict) => Err(CommitFault::Conflict),
+            None => Ok(()),
+        }
+    }
+}
+impl SessionStore for Store {
+    fn list(&self) -> Result<Vec<SessionArchive>, SessionStoreError> {
+        let state = self.0.borrow();
+        if state.list_fault {
+            return Err(storage_error());
+        }
+        state
+            .bytes
+            .values()
+            .map(|bytes| SessionArchive::decode(bytes))
+            .collect()
+    }
+    fn inspect(&self, id: &SessionId) -> Result<SessionArchive, SessionStoreError> {
+        SessionArchive::decode(self.0.borrow().bytes.get(id).ok_or_else(missing_error)?)
+    }
+    fn create(&self, change: &ArchiveChange) -> Result<(), CommitFault> {
+        if change.base_key().is_some()
+            || self
+                .0
+                .borrow()
+                .bytes
+                .contains_key(change.candidate().session().id())
+        {
+            return Err(CommitFault::Conflict);
+        }
+        self.publication(change)
+    }
+    fn acquire(
+        &self,
+        id: &SessionId,
+    ) -> Result<Box<dyn SessionTransaction + '_>, SessionStoreError> {
+        if self.0.borrow().owned.contains(id) {
+            return Err(SessionStoreError::new(
+                SessionStoreErrorKind::Busy,
+                std::io::Error::other("owned"),
+            ));
+        }
+        let confirmed = self.inspect(id)?;
+        self.0.borrow_mut().owned.insert(id.clone());
+        Ok(Box::new(Transaction {
+            store: self.clone(),
+            confirmed,
+        }))
+    }
+}
+struct Transaction {
+    store: Store,
+    confirmed: SessionArchive,
+}
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        self.store
+            .0
+            .borrow_mut()
+            .owned
+            .remove(self.confirmed.session().id());
+    }
+}
+impl SessionTransaction for Transaction {
+    fn confirmed(&self) -> &SessionArchive {
+        &self.confirmed
+    }
+    fn commit(&mut self, change: &ArchiveChange) -> Result<(), CommitFault> {
+        let current = self.store.bytes(self.confirmed.session().id());
+        if current != self.confirmed.encode().map_err(CommitFault::NotPublished)?
+            || change.base_key().map(|key| key.revision()) != Some(self.confirmed.revision())
+        {
+            return Err(CommitFault::Conflict);
+        }
+        self.store.publication(change)?;
+        self.confirmed =
+            SessionArchive::decode(change.encoded()).map_err(CommitFault::NotPublished)?;
+        Ok(())
+    }
+    fn resolve(&mut self, change: &ArchiveChange) -> Result<(), CommitFault> {
+        self.store.0.borrow_mut().resolves += 1;
+        let current = self.store.bytes(self.confirmed.session().id());
+        if current == change.encoded() {
+            if matches!(
+                self.store.0.borrow().fault,
+                Some((_, Fault::RepairablePublished))
+            ) {
+                self.confirmed =
+                    SessionArchive::decode(&current).map_err(CommitFault::NotPublished)?;
+                Ok(())
+            } else {
+                Err(CommitFault::Uncertain(storage_error()))
+            }
+        } else if current == self.confirmed.encode().map_err(CommitFault::NotPublished)? {
+            Err(CommitFault::NotPublished(storage_error()))
+        } else {
+            Err(CommitFault::Conflict)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Io {
+    assistant: usize,
+    reviewer: usize,
+    targets: Vec<u64>,
+}
+type Script<O> = VecDeque<Result<Generation<O>, ModelError>>;
+#[derive(Clone)]
+struct FakeModel {
+    assistant: Rc<RefCell<Script<AssistantMessage>>>,
+    reviewer: Rc<RefCell<Script<Decision>>>,
+    assistant_inputs: Rc<RefCell<Vec<Value>>>,
+    reviewer_inputs: Rc<RefCell<Vec<Value>>>,
+    io: Rc<RefCell<Io>>,
+    store: Store,
+}
+fn prepare<O>(
+    plan: &ContextPlan<O>,
+    settings: &ModelSettings,
+) -> Result<PreparedRequest<O>, ModelError> {
+    let mandatory = match plan.mandatory() {
+        Mandatory::Assistant { user, steps } => {
+            json!({"user":user,"native":steps.iter().map(|step| json!({"source":step.artifact().source().get(),"capture":format!("{:?}",step.artifact().capture()),"results":step.results().iter().map(|result| json!({"id":result.call_id().as_str(),"outcome":format!("{:?}",result.outcome())})).collect::<Vec<_>>()})).collect::<Vec<_>>()})
+        }
+        Mandatory::Reviewer { facts } => json!({"facts":facts}),
+    };
+    let catalog: Vec<_> = plan.tools().iter().map(|tool| json!({"name":tool.name().as_str(),"description":tool.description().as_str(),"schema":tool.input_schema().document()})).collect();
+    let fitted = plan.fit(|selection| json!({"instructions":plan.instructions().as_str(),"catalog":catalog,"callable_tools":[],"history":selection.history.iter().map(|group| json!({"user":group.user(),"record":group.record()})).collect::<Vec<_>>(),"notice":selection.notice,"mandatory":mandatory}))?;
+    Ok(PreparedRequest::new(
+        ModelTarget::new("fixture-protocol", "memory://credential-free"),
+        settings.clone(),
+        fitted,
+    ))
+}
+impl FakeModel {
+    fn assert_committed_intent<O>(&self, request: &PreparedRequest<O>, assistant: bool) {
+        let archives = self.store.list().unwrap();
+        let pending: Vec<_> = archives
+            .iter()
+            .flat_map(SessionArchive::generations)
+            .filter(|record| matches!(record.observation(), Observation::Pending))
+            .collect();
+        assert_eq!(
+            pending.len(),
+            1,
+            "exactly one intent must be durable before invocation"
+        );
+        let intent = pending[0].intent();
+        assert_eq!(intent.request(), request.body());
+        assert_eq!(intent.settings(), request.settings());
+        assert_eq!(intent.target(), request.target());
+        assert_eq!(intent.budget(), request.budget());
+        assert_eq!(
+            matches!(intent.role(), InvocationRole::Assistant { .. }),
+            assistant
+        );
+    }
+    fn receipt(&self, role: &str) -> ResponseReceipt {
+        ResponseReceipt {
+            http_status: Some(200),
+            served_model: Some("served-model".into()),
+            response_id: Some(format!("{role}-response")),
+            request_id: Some(format!("{role}-request")),
+            finish: Some("finished".into()),
+            usage: Some(Usage {
+                input_tokens: Some(17),
+                output_tokens: Some(9),
+            }),
+            capture: ResponseCapture::Complete(format!("raw {role} response").into_bytes()),
+        }
+    }
+}
+impl ModelClient<AssistantMessage> for FakeModel {
+    fn prepare(
+        &self,
+        plan: &ContextPlan<AssistantMessage>,
+        settings: &ModelSettings,
+    ) -> Result<PreparedRequest<AssistantMessage>, ModelError> {
+        prepare(plan, settings)
+    }
+    fn invoke(
+        &self,
+        request: &PreparedRequest<AssistantMessage>,
+    ) -> ObservedReply<AssistantMessage> {
+        self.assert_committed_intent(request, true);
+        self.io.borrow_mut().assistant += 1;
+        self.assistant_inputs
+            .borrow_mut()
+            .push(request.body().clone());
+        ObservedReply::new(
+            self.receipt("assistant"),
+            self.assistant
+                .borrow_mut()
+                .pop_front()
+                .expect("assistant script exhausted"),
+        )
+    }
+}
+impl ModelClient<Decision> for FakeModel {
+    fn prepare(
+        &self,
+        plan: &ContextPlan<Decision>,
+        settings: &ModelSettings,
+    ) -> Result<PreparedRequest<Decision>, ModelError> {
+        prepare(plan, settings)
+    }
+    fn invoke(&self, request: &PreparedRequest<Decision>) -> ObservedReply<Decision> {
+        self.assert_committed_intent(request, false);
+        self.io.borrow_mut().reviewer += 1;
+        self.reviewer_inputs
+            .borrow_mut()
+            .push(request.body().clone());
+        ObservedReply::new(
+            self.receipt("reviewer"),
+            self.reviewer
+                .borrow_mut()
+                .pop_front()
+                .expect("reviewer script exhausted"),
+        )
+    }
+}
+struct Target {
+    io: Rc<RefCell<Io>>,
+    fail: bool,
+    store: Store,
+}
+impl Tool for Target {
+    fn execute(&self, arguments: &Map<String, Value>) -> ToolOutcome {
+        let n = arguments["n"].as_u64().unwrap();
+        let archive = self
+            .store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|archive| archive.session().active_turn().is_some())
+            .unwrap();
+        let started: Vec<_> = archive
+            .session()
+            .active_turn()
+            .unwrap()
+            .steps()
+            .iter()
+            .flat_map(|step| step.executions())
+            .filter(|execution| matches!(execution.state(), ExecutionState::Started { .. }))
+            .collect();
+        assert_eq!(
+            started.len(),
+            1,
+            "dispatch intent must be committed before the effect"
+        );
+        assert_eq!(started[0].call().arguments(), arguments);
+        self.io.borrow_mut().targets.push(n);
+        if self.fail {
+            ToolOutcome::Failure(ToolError::new(text("actual target failure")))
+        } else {
+            ToolOutcome::Success(format!("actual lookup result {n}"))
+        }
+    }
+}
 struct Fixture {
     store: Store,
     model: FakeModel,
-    observed: Rc<RefCell<Vec<(Session, ToolCall)>>>,
 }
 impl Fixture {
     fn new(
@@ -228,84 +409,59 @@ impl Fixture {
         reviewer: Vec<Result<Generation<Decision>, ModelError>>,
     ) -> Self {
         let store = Store::default();
-        let model = FakeModel {
-            assistant: Rc::new(RefCell::new(assistant.into())),
-            reviewer: Rc::new(RefCell::new(reviewer.into())),
-            inputs: Default::default(),
-            io: store.io.clone(),
-        };
         Self {
+            model: FakeModel {
+                assistant: Rc::new(RefCell::new(assistant.into())),
+                reviewer: Rc::new(RefCell::new(reviewer.into())),
+                assistant_inputs: Default::default(),
+                reviewer_inputs: Default::default(),
+                io: Default::default(),
+                store: store.clone(),
+            },
             store,
-            model,
-            observed: Default::default(),
         }
     }
-    fn service(
-        &self,
-        max: u32,
-        assistant_fail: bool,
-        review_fail: bool,
-        target_fail: bool,
-        catalog: Vec<ToolDefinition>,
-    ) -> Service {
+    fn service(&self, settings: AgentSettings, fail: bool) -> AgentService<FakeModel, Store> {
         AgentService::new(
             self.model.clone(),
             self.store.clone(),
-            AssistantContext {
-                catalog,
-                fail: assistant_fail,
-                io: self.store.io.clone(),
-            },
-            ReviewContext {
-                fail: review_fail,
-                observed: self.observed.clone(),
-                io: self.store.io.clone(),
-            },
             vec![(
                 tool(),
                 Box::new(Target {
-                    io: self.store.io.clone(),
-                    fail: target_fail,
+                    io: self.model.io.clone(),
+                    fail,
+                    store: self.store.clone(),
                 }),
             )],
-            settings(max),
+            settings,
         )
         .unwrap()
     }
-    fn basic(&self, max: u32) -> Service {
-        self.service(max, false, false, false, vec![tool()])
+    fn basic(&self, max: u32) -> AgentService<FakeModel, Store> {
+        self.service(settings(max), false)
     }
 }
 fn results(messages: &[Message]) -> Vec<ToolResult> {
     messages
         .iter()
-        .filter_map(|m| {
-            if let Message::Tool(result) = m {
-                Some(result.clone())
-            } else {
-                None
-            }
+        .filter_map(|message| match message {
+            Message::Tool(result) => Some(result.clone()),
+            _ => None,
         })
         .collect()
 }
-fn assert_blocked(
-    service: &mut Service,
-    id: &SessionId,
-    io: &Rc<RefCell<Io>>,
-    checkpoint: Checkpoint,
-    progress: &Session,
-) {
-    let before = io.borrow().clone();
-    let error = service
-        .chat(id, user("must not perform any I/O"))
-        .unwrap_err();
-    assert!(matches!(error.kind(), AgentErrorKind::Blocked { at } if *at == checkpoint));
-    assert_eq!(error.progress(), Some(progress));
-    assert_eq!(*io.borrow(), before);
+fn facts(body: &Value) -> Value {
+    let value = body["mandatory"]["facts"]
+        .as_str()
+        .unwrap()
+        .split_once('\n')
+        .unwrap()
+        .1;
+    serde_json::from_str(value).unwrap()
 }
 
 #[test]
-fn selective_review_preserves_exact_batch_and_continues_the_same_turn() {
+fn selective_review_preserves_exact_batch_and_each_siblings_facts() {
     for allowed in [[true, false], [false, true], [false, false], [true, true]] {
         let proposal = AssistantMessage::tool_requests(
             Some("exact preamble".into()),
@@ -313,494 +469,741 @@ fn selective_review_preserves_exact_batch_and_continues_the_same_turn() {
         );
         let f = Fixture::new(
             vec![
-                complete(proposal.clone()),
+                Ok(Generation::Complete(proposal.clone())),
                 answer("adapted"),
                 answer("second turn"),
             ],
-            allowed
-                .into_iter()
-                .map(|allow| complete(Decision::new(allow, Some(text("use read only")))))
-                .collect(),
+            allowed.into_iter().map(decision).collect(),
         );
-        let mut agent = f.basic(2);
-        let session = agent.new_session().unwrap();
-        assert_eq!(f.store.load(session.id()).unwrap(), session);
-        let messages = agent.chat(session.id(), user("first request")).unwrap();
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[1], Message::Assistant(proposal));
-        let outcomes = results(&messages);
+        let agent = f.basic(2);
+        let archive = agent.new_session().unwrap();
+        let id = archive.session().id();
+        assert_eq!(f.store.inspect(id).unwrap(), archive);
+        let completed = agent.chat(id, user("first request")).unwrap();
+        assert_eq!(completed.messages().len(), 5);
+        assert_eq!(completed.messages()[1], Message::Assistant(proposal));
+        let outcomes = results(completed.messages());
         for (index, result) in outcomes.iter().enumerate() {
             assert_eq!(result.call_id(), call(index as u64 + 1, "lookup").id());
-            match result.outcome() {
-                ToolOutcome::Success(value) => {
-                    assert!(allowed[index]);
-                    assert_eq!(value, &format!("actual lookup result {}", index + 1));
-                }
-                ToolOutcome::Failure(error) => {
-                    assert!(!allowed[index]);
-                    assert_eq!(
-                        error.description().as_str(),
-                        "Not executed: tool call denied by review. Reason: use read only"
-                    );
-                }
-            }
+            let expected = if allowed[index] {
+                ToolOutcome::Success(format!("actual lookup result {}", index + 1))
+            } else {
+                ToolOutcome::Failure(ToolError::new(text(
+                    "Not executed: tool call denied by review. Reason: use read only",
+                )))
+            };
+            assert_eq!(result.outcome(), &expected);
         }
         assert_eq!(
-            f.store.io.borrow().targets,
+            f.model.io.borrow().targets,
             allowed
                 .iter()
                 .enumerate()
                 .filter_map(|(i, allow)| allow.then_some(i as u64 + 1))
                 .collect::<Vec<_>>()
         );
+        let reviewer = f.model.reviewer_inputs.borrow();
+        assert_eq!(reviewer.len(), 2);
+        let first = facts(&reviewer[0]);
+        let second = facts(&reviewer[1]);
         assert_eq!(
-            f.model.inputs.borrow()[1]
-                .messages()
-                .cloned()
-                .collect::<Vec<_>>(),
-            messages[..4]
+            first["candidate"],
+            json!({"id":"call-1","name":"lookup","arguments":{"n":1}})
         );
-        let observed = f.observed.borrow();
-        assert_eq!(observed.len(), 2);
-        assert_eq!(observed[1].1, call(2, "lookup"));
-        let active = observed[1].0.active_turn().unwrap();
-        assert_eq!(active.id().get(), 1);
-        assert_eq!(active.messages(), messages[..3]);
-        assert!(matches!(
-            active.steps()[0].executions().nth(1).unwrap().state(),
-            ExecutionState::Started
-        ));
-        drop(observed);
-        let next = agent.chat(session.id(), user("next request")).unwrap();
         assert_eq!(
-            next,
-            vec![
+            second["candidate"],
+            json!({"id":"call-2","name":"lookup","arguments":{"n":2}})
+        );
+        assert_eq!(second["active_turn"]["user"], "first request");
+        assert_eq!(
+            second["active_turn"]["steps"][0]["executions"][1]["state"],
+            json!({"kind":"requested"})
+        );
+        assert_eq!(
+            second["active_turn"]["steps"][0]["executions"][0]["state"]["kind"],
+            if allowed[0] { "returned" } else { "denied" }
+        );
+        assert_eq!(reviewer[1]["callable_tools"], json!([]));
+        drop(reviewer);
+        let next = agent.chat(id, user("next request")).unwrap();
+        assert_eq!(
+            next.messages(),
+            &[
                 Message::User(user("next request")),
                 Message::Assistant(AssistantMessage::answer("second turn").unwrap())
             ]
         );
-        assert_eq!(f.store.io.borrow().load, 1);
-        assert_eq!(agent.list_session().unwrap()[0].turns().len(), 2);
+        assert_eq!(agent.list_sessions().unwrap()[0].session().turns().len(), 2);
+        assert_eq!(f.model.io.borrow().assistant, 3);
     }
 }
 
 #[test]
-fn no_reason_denial_and_genuine_tool_failure_are_normal_results() {
+fn no_reason_denial_and_genuine_tool_failure_have_distinct_durable_states() {
     let f = Fixture::new(
         vec![
             batch(vec![call(1, "lookup"), call(2, "lookup")]),
             answer("done"),
         ],
         vec![
-            complete(Decision::new(false, None)),
-            complete(Decision::new(true, None)),
+            Ok(Generation::Complete(Decision::new(false, None))),
+            decision(true),
         ],
     );
-    let mut agent = f.service(2, false, false, true, vec![tool()]);
-    let session = agent.new_session().unwrap();
-    let messages = agent.chat(session.id(), user("request")).unwrap();
-    let outcomes = results(&messages);
-    assert!(
-        matches!(outcomes[0].outcome(), ToolOutcome::Failure(error) if error.description().as_str().contains("without providing a reason"))
+    let agent = f.service(settings(2), true);
+    let id = agent.new_session().unwrap().session().id().clone();
+    let completed = agent.chat(&id, user("request")).unwrap();
+    let outcomes = results(completed.messages());
+    assert_eq!(
+        outcomes[0].outcome(),
+        &ToolOutcome::Failure(ToolError::new(text(
+            "Not executed: tool call denied by review. Reason: Review denied the call without providing a reason."
+        )))
     );
     assert_eq!(
         outcomes[1].outcome(),
         &ToolOutcome::Failure(ToolError::new(text("actual target failure")))
     );
-    assert_eq!(f.store.io.borrow().targets, vec![2]);
+    let archive = f.store.inspect(&id).unwrap();
+    let states: Vec<_> = archive.session().turns()[0].steps()[0]
+        .executions()
+        .map(|e| e.state())
+        .collect();
+    assert!(matches!(states[0], ExecutionState::Denied(_)));
+    assert!(matches!(
+        states[1],
+        ExecutionState::Returned {
+            outcome: ToolOutcome::Failure(_),
+            ..
+        }
+    ));
+    assert_eq!(f.model.io.borrow().targets, vec![2]);
     assert_eq!(
-        f.store.load(session.id()).unwrap().turns()[0].outcome(),
+        archive.session().turns()[0].outcome(),
         &TurnOutcome::Completed
     );
 }
 
 #[test]
-fn assistant_attempt_limit_drains_each_tool_and_saves_interruption() {
+fn assistant_attempt_limit_drains_each_accepted_call_before_interruption() {
     let f = Fixture::new(
         vec![
             batch(vec![call(1, "lookup"), call(2, "lookup")]),
             answer("next turn"),
         ],
-        vec![
-            complete(Decision::new(false, None)),
-            complete(Decision::new(true, None)),
-        ],
+        vec![decision(false), decision(true)],
     );
-    let mut agent = f.basic(1);
-    let session = agent.new_session().unwrap();
-    let error = agent.chat(session.id(), user("request")).unwrap_err();
+    let agent = f.basic(1);
+    let id = agent.new_session().unwrap().session().id().clone();
+    let error = agent.chat(&id, user("request")).unwrap_err();
     assert!(matches!(error.kind(), AgentErrorKind::IterationLimit));
-    let progress = error.progress().unwrap();
-    assert!(progress.active_turn().is_none());
+    let durable = error.durable().unwrap();
     assert_eq!(
-        progress.turns()[0].outcome(),
+        durable.session().turns()[0].outcome(),
         &TurnOutcome::Interrupted(StopReason::IterationLimit)
     );
-    assert_eq!(results(&progress.messages()).len(), 2);
-    assert_eq!(f.store.load(session.id()).unwrap(), *progress);
-    assert_eq!(f.store.io.borrow().assistant, 1);
-    assert_eq!(f.store.io.borrow().review, 2);
-    assert_eq!(f.store.io.borrow().targets, vec![2]);
-    assert!(agent.chat(session.id(), user("follow up")).is_ok());
+    assert_eq!(results(&durable.session().messages()).len(), 2);
+    assert_eq!(f.store.inspect(&id).unwrap(), *durable);
+    assert_eq!(
+        *f.model.io.borrow(),
+        Io {
+            assistant: 1,
+            reviewer: 2,
+            targets: vec![2]
+        }
+    );
+    assert!(agent.chat(&id, user("follow up")).is_ok());
 }
 
 #[test]
-fn every_failed_save_preserves_live_facts_and_blocks_even_if_published() {
-    for (save, checkpoint) in [
-        (1, Checkpoint::NewSession),
-        (2, Checkpoint::StartedTurn),
-        (3, Checkpoint::AcceptedAssistant),
-        (4, Checkpoint::StartedTool),
-        (5, Checkpoint::ReturnedTool),
-        (6, Checkpoint::ClosedTurn),
-    ] {
-        for published in [false, true] {
+fn publication_faults_at_each_effect_gate_expose_only_confirmed_progress() {
+    for attempt in 2..=10 {
+        for fault in [
+            Fault::NotPublished,
+            Fault::UncertainUnpublished,
+            Fault::UncertainPublished,
+            Fault::Conflict,
+        ] {
             let f = Fixture::new(
-                vec![batch(vec![call(1, "lookup")])],
-                vec![complete(Decision::new(true, None))],
+                vec![batch(vec![call(1, "lookup")]), answer("done")],
+                vec![decision(true)],
             );
-            *f.store.fault.borrow_mut() = Some((save, published));
-            let mut agent = f.basic(1);
-            let (id, error) = if save == 1 {
-                let error = agent.new_session().unwrap_err();
-                (error.progress().unwrap().id().clone(), error)
-            } else {
-                let session = agent.new_session().unwrap();
-                (
-                    session.id().clone(),
-                    agent.chat(session.id(), user("request")).unwrap_err(),
-                )
-            };
-            assert!(matches!(error.kind(), AgentErrorKind::Store { at, .. } if *at == checkpoint));
-            let progress = error.progress().unwrap();
-            assert_eq!(progress, f.store.attempted.borrow().last().unwrap());
-            if published {
-                assert_eq!(f.store.saved.borrow().get(&id), Some(progress));
-            } else {
-                assert_ne!(f.store.saved.borrow().get(&id), Some(progress));
+            let agent = f.basic(2);
+            let id = agent.new_session().unwrap().session().id().clone();
+            f.store.inject(attempt, fault);
+            let error = agent.chat(&id, user("request")).unwrap_err();
+            match fault {
+                Fault::NotPublished | Fault::UncertainUnpublished => assert!(matches!(
+                    error.kind(),
+                    AgentErrorKind::Commit(CommitFault::NotPublished(_))
+                )),
+                Fault::UncertainPublished => assert!(matches!(
+                    error.kind(),
+                    AgentErrorKind::Commit(CommitFault::Uncertain(_))
+                )),
+                Fault::Conflict => assert!(matches!(
+                    error.kind(),
+                    AgentErrorKind::Commit(CommitFault::Conflict)
+                )),
+                Fault::RepairablePublished => unreachable!(),
             }
-            if save <= 4 {
-                assert_eq!(f.store.io.borrow().review, 0);
-                assert!(f.store.io.borrow().targets.is_empty());
-            } else {
-                assert_eq!(f.store.io.borrow().targets, vec![1]);
+            let committed = error.durable().unwrap();
+            let candidate = error.uncommitted().unwrap();
+            assert_eq!(committed.revision().get(), attempt as u64 - 1);
+            assert_eq!(candidate.revision().get(), attempt as u64);
+            let destination = agent.inspect(&id).unwrap();
+            assert_eq!(
+                destination,
+                if matches!(fault, Fault::UncertainPublished) {
+                    candidate.clone()
+                } else {
+                    committed.clone()
+                }
+            );
+            assert_eq!(agent.list_sessions().unwrap(), vec![destination]);
+            let expected_assistant = usize::from(attempt > 3) + usize::from(attempt > 9);
+            assert_eq!(
+                f.model.io.borrow().assistant,
+                expected_assistant,
+                "attempt {attempt} {fault:?}"
+            );
+            assert_eq!(f.model.io.borrow().reviewer, usize::from(attempt > 5));
+            assert_eq!(
+                f.model.io.borrow().targets,
+                if attempt > 7 { vec![1] } else { vec![] }
+            );
+            assert_eq!(
+                f.store.0.borrow().resolves,
+                usize::from(matches!(
+                    fault,
+                    Fault::UncertainPublished | Fault::UncertainUnpublished
+                ))
+            );
+        }
+    }
+}
+
+#[test]
+fn owned_uncertainty_repair_allows_exact_candidate_once_without_repeating_effects() {
+    for attempt in 2..=10 {
+        let f = Fixture::new(
+            vec![batch(vec![call(1, "lookup")]), answer("done")],
+            vec![decision(true)],
+        );
+        let agent = f.basic(2);
+        let id = agent.new_session().unwrap().session().id().clone();
+        f.store.inject(attempt, Fault::RepairablePublished);
+        let completed = agent.chat(&id, user("request")).unwrap();
+        assert_eq!(
+            completed.archive().session().turns()[0].outcome(),
+            &TurnOutcome::Completed
+        );
+        assert_eq!(
+            *f.model.io.borrow(),
+            Io {
+                assistant: 2,
+                reviewer: 1,
+                targets: vec![1]
             }
-            assert_blocked(&mut agent, &id, &f.store.io, checkpoint, progress);
-            assert_eq!(agent.list_session().unwrap(), vec![progress.clone()]);
-            *f.store.list_fault.borrow_mut() = true;
+        );
+        assert_eq!(f.store.0.borrow().resolves, 1);
+        assert_eq!(agent.inspect(&id).unwrap(), *completed.archive());
+    }
+}
+
+#[test]
+fn unsaved_answer_and_tool_return_remain_separate_from_disk_and_never_reexecute() {
+    for (attempt, returns) in [(8, true), (10, false)] {
+        let f = Fixture::new(
+            vec![
+                batch(vec![call(1, "lookup")]),
+                answer("done"),
+                answer("after recovery"),
+            ],
+            vec![decision(true)],
+        );
+        let agent = f.basic(2);
+        let id = agent.new_session().unwrap().session().id().clone();
+        f.store.inject(attempt, Fault::NotPublished);
+        let error = agent.chat(&id, user("request")).unwrap_err();
+        let disk = f.store.inspect(&id).unwrap();
+        assert_eq!(error.durable(), Some(&disk));
+        if returns {
             assert!(matches!(
-                agent.list_session().unwrap_err().kind(),
-                AgentErrorKind::Store {
-                    at: Checkpoint::ListSessions,
-                    ..
-                }
+                disk.session().active_turn().unwrap().steps()[0]
+                    .executions()
+                    .next()
+                    .unwrap()
+                    .state(),
+                ExecutionState::Started { .. }
             ));
-            assert_blocked(&mut agent, &id, &f.store.io, checkpoint, progress);
+            assert!(matches!(
+                error
+                    .uncommitted()
+                    .unwrap()
+                    .session()
+                    .active_turn()
+                    .unwrap()
+                    .steps()[0]
+                    .executions()
+                    .next()
+                    .unwrap()
+                    .state(),
+                ExecutionState::Returned { .. }
+            ));
+        } else {
+            assert!(disk.session().active_turn().is_some());
+            assert!(
+                error
+                    .uncommitted()
+                    .unwrap()
+                    .session()
+                    .active_turn()
+                    .is_none()
+            );
+            assert_eq!(
+                error.uncommitted().unwrap().session().turns()[0]
+                    .steps()
+                    .last()
+                    .unwrap()
+                    .assistant(),
+                &AssistantMessage::answer("done").unwrap()
+            );
         }
+        let io = f.model.io.borrow().clone();
+        assert!(matches!(
+            agent.chat(&id, user("must recover")).unwrap_err().kind(),
+            AgentErrorKind::RecoveryRequired
+        ));
+        assert_eq!(*f.model.io.borrow(), io);
+        f.store.clear_fault();
+        let recovered = agent.recover(&id).unwrap();
+        assert_eq!(*f.model.io.borrow(), io);
+        assert!(!recovered.archive().needs_recovery());
+        assert_eq!(agent.recover(&id).unwrap().archive(), recovered.archive());
+        agent.chat(&id, user("new request")).unwrap();
+        assert_eq!(f.model.io.borrow().targets, vec![1]);
     }
 }
 
 #[test]
-fn failed_answer_save_retains_the_completed_answer() {
-    for published in [false, true] {
-        let f = Fixture::new(vec![answer("completed answer")], vec![]);
-        *f.store.fault.borrow_mut() = Some((3, published));
-        let mut agent = f.basic(1);
-        let session = agent.new_session().unwrap();
-        let error = agent.chat(session.id(), user("request")).unwrap_err();
-        let progress = error.progress().unwrap();
-        assert_eq!(progress.turns()[0].outcome(), &TurnOutcome::Completed);
-        assert_eq!(
-            progress.messages().last(),
-            Some(&Message::Assistant(
-                AssistantMessage::answer("completed answer").unwrap()
-            ))
-        );
-        assert_blocked(
-            &mut agent,
-            session.id(),
-            &f.store.io,
-            Checkpoint::AcceptedAssistant,
-            progress,
-        );
-    }
+fn failed_denial_commit_never_dispatches_denied_target_or_later_sibling() {
+    let f = Fixture::new(
+        vec![batch(vec![call(1, "lookup"), call(2, "lookup")])],
+        vec![decision(false)],
+    );
+    let agent = f.basic(2);
+    let id = agent.new_session().unwrap().session().id().clone();
+    f.store.inject(6, Fault::NotPublished);
+    let error = agent.chat(&id, user("request")).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        AgentErrorKind::Commit(CommitFault::NotPublished(_))
+    ));
+    assert!(f.model.io.borrow().targets.is_empty());
+    let states: Vec<_> = error
+        .durable()
+        .unwrap()
+        .session()
+        .active_turn()
+        .unwrap()
+        .steps()[0]
+        .executions()
+        .map(|e| e.state())
+        .collect();
+    assert!(
+        states
+            .iter()
+            .all(|s| matches!(s, ExecutionState::Requested))
+    );
+    assert!(matches!(
+        error
+            .uncommitted()
+            .unwrap()
+            .session()
+            .active_turn()
+            .unwrap()
+            .steps()[0]
+            .executions()
+            .next()
+            .unwrap()
+            .state(),
+        ExecutionState::Denied(_)
+    ));
 }
 
 #[test]
-fn failed_denial_receipt_save_never_runs_the_denied_target_or_later_sibling() {
-    for published in [false, true] {
+fn reviewer_stopped_and_failed_attempts_record_evidence_without_dispatch_intent() {
+    for stopped in [
+        Err(ModelError::new(ModelErrorKind::Transport)),
+        Err(ModelError::new(ModelErrorKind::MalformedResponse)),
+        Ok(Generation::Refused {
+            reason: Some(text("refused")),
+        }),
+        Ok(Generation::Incomplete {
+            reason: IncompleteReason::OutputLimit,
+        }),
+    ] {
         let f = Fixture::new(
-            vec![batch(vec![call(1, "lookup"), call(2, "lookup")])],
-            vec![complete(Decision::new(false, Some(text("denied"))))],
+            vec![
+                batch(vec![call(1, "lookup"), call(2, "lookup")]),
+                answer("next"),
+            ],
+            vec![stopped],
         );
-        *f.store.fault.borrow_mut() = Some((5, published));
-        let mut agent = f.basic(2);
-        let session = agent.new_session().unwrap();
-        let error = agent.chat(session.id(), user("request")).unwrap_err();
-        let progress = error.progress().unwrap();
-        assert_eq!(results(&progress.messages()).len(), 1);
-        assert!(f.store.io.borrow().targets.is_empty());
-        assert_eq!(f.store.io.borrow().review, 1);
-        assert_blocked(
-            &mut agent,
-            session.id(),
-            &f.store.io,
-            Checkpoint::ReturnedTool,
-            progress,
+        let agent = f.basic(2);
+        let id = agent.new_session().unwrap().session().id().clone();
+        let error = agent.chat(&id, user("request")).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            AgentErrorKind::Model {
+                role: ModelRole::Reviewer,
+                ..
+            } | AgentErrorKind::Refused {
+                role: ModelRole::Reviewer,
+                ..
+            } | AgentErrorKind::Incomplete {
+                role: ModelRole::Reviewer,
+                ..
+            }
+        ));
+        let archive = f.store.inspect(&id).unwrap();
+        assert!(archive.session().active_turn().is_none());
+        assert_eq!(archive.generations().len(), 2);
+        assert!(matches!(
+            archive.generations()[1].intent().role(),
+            InvocationRole::Reviewer { .. }
+        ));
+        assert!(
+            matches!(archive.generations()[1].observation(),Observation::Observed{receipt:ResponseReceipt{capture:ResponseCapture::Complete(bytes),..},disposition:Disposition::Failed(_)|Disposition::Refused{..}|Disposition::Incomplete(_),..} if bytes == b"raw reviewer response")
         );
-    }
-}
-
-#[test]
-fn reviewer_infrastructure_errors_preserve_started_state_and_block() {
-    for failure in 0..5 {
-        let review = match failure {
-            0 | 4 => Err(ModelError::new(ModelErrorKind::Transport)),
-            1 => Ok(Generation::Refused {
-                reason: Some(text("cannot review")),
-            }),
-            2 => Ok(Generation::Incomplete {
-                reason: IncompleteReason::OutputLimit,
-            }),
-            _ => Err(ModelError::new(ModelErrorKind::MalformedResponse)),
-        };
-        let f = Fixture::new(
-            vec![batch(vec![call(1, "lookup"), call(2, "lookup")])],
-            vec![review],
+        assert!(
+            archive.session().turns()[0].steps()[0]
+                .executions()
+                .all(|e| matches!(e.state(), ExecutionState::Requested))
         );
-        let mut agent = f.service(2, false, failure == 4, false, vec![tool()]);
-        let session = agent.new_session().unwrap();
-        let error = agent.chat(session.id(), user("request")).unwrap_err();
-        match failure {
-            0 => assert!(
-                matches!(error.kind(), AgentErrorKind::Model { role: ModelRole::Reviewer, source } if source.kind() == ModelErrorKind::Transport)
-            ),
-            1 => assert!(
-                matches!(error.kind(), AgentErrorKind::Refused { role: ModelRole::Reviewer, reason: Some(reason) } if reason.as_str() == "cannot review")
-            ),
-            2 => assert!(matches!(
-                error.kind(),
-                AgentErrorKind::Incomplete {
-                    role: ModelRole::Reviewer,
-                    reason: IncompleteReason::OutputLimit
-                }
-            )),
-            3 => assert!(
-                matches!(error.kind(), AgentErrorKind::Model { role: ModelRole::Reviewer, source } if source.kind() == ModelErrorKind::MalformedResponse)
-            ),
-            _ => assert!(matches!(
-                error.kind(),
-                AgentErrorKind::Context {
-                    role: ModelRole::Reviewer,
-                    source: ContextError::UnresolvedToolBatch
-                }
-            )),
-        }
-        let progress = error.progress().unwrap();
-        assert_eq!(progress.next_action(), NextAction::AwaitTool);
-        assert!(f.store.io.borrow().targets.is_empty());
-        assert_eq!(f.store.io.borrow().save, 4);
-        assert_eq!(f.store.saved.borrow().get(session.id()), Some(progress));
-        assert_blocked(
-            &mut agent,
-            session.id(),
-            &f.store.io,
-            Checkpoint::StartedTool,
-            progress,
-        );
-        let recovered = f.store.load(session.id()).unwrap();
         assert_eq!(
-            recovered.turns()[0].outcome(),
-            &TurnOutcome::Interrupted(StopReason::ProcessLost)
+            *f.model.io.borrow(),
+            Io {
+                assistant: 1,
+                reviewer: 1,
+                targets: vec![]
+            }
         );
-        assert!(recovered.context_exchanges().unwrap()[0].notices().iter().any(|notice| matches!(notice, ExecutionNotice::UnknownEffect { call, .. } if call.id().as_str() == "call-1")));
+        assert_eq!(agent.recover(&id).unwrap().archive(), &archive);
+        agent.chat(&id, user("next request")).unwrap();
+        assert_eq!(f.model.io.borrow().targets, Vec::<u64>::new());
     }
 }
 
 #[test]
 fn assistant_failures_close_and_save_then_allow_another_chat() {
-    for failure in 0..7 {
-        let generation = match failure {
-            0 | 3 => Err(ModelError::new(ModelErrorKind::Transport)),
-            1 => Ok(Generation::Refused { reason: None }),
-            2 => Ok(Generation::Incomplete {
-                reason: IncompleteReason::Other,
-            }),
-            4 => Err(ModelError::new(ModelErrorKind::MalformedResponse)),
-            5 => Err(ModelError::new(ModelErrorKind::UnsupportedResponse)),
-            _ => Ok(Generation::Incomplete {
-                reason: IncompleteReason::OutputLimit,
-            }),
-        };
-        let f = Fixture::new(vec![generation, answer("next")], vec![]);
-        let mut agent = f.service(1, failure == 3, false, false, vec![tool()]);
-        let session = agent.new_session().unwrap();
-        let error = agent.chat(session.id(), user("request")).unwrap_err();
-        let progress = error.progress().unwrap();
-        assert!(progress.active_turn().is_none());
-        if failure == 3 {
-            assert!(matches!(
-                error.kind(),
-                AgentErrorKind::Context {
-                    role: ModelRole::Assistant,
-                    ..
-                }
-            ));
-            assert!(
-                matches!(progress.turns()[0].outcome(), TurnOutcome::Failed(TurnFailure::ModelFailure(reason)) if reason.as_str() == "Assistant context assembly failed")
-            );
-        } else if failure == 4 || failure == 5 {
-            assert!(matches!(
-                progress.turns()[0].outcome(),
-                TurnOutcome::Failed(TurnFailure::MalformedResponse(_))
-            ));
+    for stopped in [
+        Err(ModelError::http(ModelErrorKind::Authentication, 401)),
+        Err(ModelError::new(ModelErrorKind::Timeout)),
+        Err(ModelError::new(ModelErrorKind::MalformedResponse)),
+        Ok(Generation::Refused { reason: None }),
+        Ok(Generation::Incomplete {
+            reason: IncompleteReason::Other,
+        }),
+    ] {
+        let f = Fixture::new(vec![stopped, answer("recovered")], vec![]);
+        let agent = f.basic(2);
+        let id = agent.new_session().unwrap().session().id().clone();
+        let error = agent.chat(&id, user("request")).unwrap_err();
+        let archive = error.durable().unwrap();
+        assert!(archive.session().active_turn().is_none());
+        assert_eq!(archive.generations().len(), 1);
+        assert_eq!(f.store.inspect(&id).unwrap(), *archive);
+        assert_eq!(f.model.io.borrow().assistant, 1);
+        assert_eq!(
+            agent
+                .chat(&id, user("try another turn"))
+                .unwrap()
+                .messages()
+                .last(),
+            Some(&Message::Assistant(
+                AssistantMessage::answer("recovered").unwrap()
+            ))
+        );
+        assert_eq!(f.model.io.borrow().assistant, 2);
+    }
+}
+
+#[test]
+fn unknown_and_reused_active_calls_keep_raw_rejected_output_without_effects() {
+    for duplicate in [false, true] {
+        let rejected = if duplicate {
+            call(1, "lookup")
         } else {
-            assert!(matches!(
-                progress.turns()[0].outcome(),
-                TurnOutcome::Failed(TurnFailure::ModelFailure(_))
-            ));
-        }
-        assert_eq!(&f.store.load(session.id()).unwrap(), progress);
-        if failure != 3 {
-            assert!(agent.chat(session.id(), user("next request")).is_ok());
-        }
-    }
-}
-
-#[test]
-fn catalog_mismatch_and_unadvertised_calls_do_not_dispatch_or_record_output() {
-    for case in 0..4 {
-        let catalog = match case {
-            0 => vec![ToolDefinition::new(
-                tool().name().clone(),
-                text("different definition"),
-                tool().input_schema().clone(),
-            )],
-            1 => vec![ToolDefinition::new(
-                ToolName::new("unregistered").unwrap(),
-                text("unregistered"),
-                tool().input_schema().clone(),
-            )],
-            2 => vec![],
-            _ => vec![tool()],
+            call(99, "unadvertised")
         };
-        let name = if case == 3 { "unknown" } else { "lookup" };
-        let f = Fixture::new(vec![batch(vec![call(1, name)]), answer("next")], vec![]);
-        let mut agent = f.service(2, false, false, false, catalog);
-        let session = agent.new_session().unwrap();
-        let error = agent.chat(session.id(), user("request")).unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            AgentErrorKind::CatalogMismatch(_) | AgentErrorKind::UnknownTool(_)
-        ));
-        assert!(error.progress().unwrap().active_turn().is_none());
-        assert!(error.progress().unwrap().turns()[0].steps().is_empty());
-        assert_eq!(f.store.io.borrow().assistant, usize::from(case >= 2));
-        assert_eq!(f.store.io.borrow().review, 0);
-        assert!(f.store.io.borrow().targets.is_empty());
+        let f = Fixture::new(
+            vec![
+                batch(vec![call(1, "lookup")]),
+                batch(vec![rejected]),
+                answer("new turn"),
+            ],
+            vec![decision(true)],
+        );
+        let agent = f.basic(3);
+        let id = agent.new_session().unwrap().session().id().clone();
+        let error = agent.chat(&id, user("request")).unwrap_err();
+        assert!(matches!(error.kind(), AgentErrorKind::RejectedOutput(_)));
+        let archive = error.durable().unwrap();
+        assert_eq!(archive.session().turns()[0].steps().len(), 1);
+        assert_eq!(archive.generations().len(), 3);
+        assert!(
+            matches!(archive.generations()[2].observation(),Observation::Observed{disposition:Disposition::Rejected(_),receipt:ResponseReceipt{capture:ResponseCapture::Complete(bytes),..},..} if bytes == b"raw assistant response")
+        );
+        assert_eq!(f.model.io.borrow().targets, vec![1]);
+        agent.chat(&id, user("new request")).unwrap();
+        assert_eq!(f.model.io.borrow().targets, vec![1]);
+        let last = f.model.assistant_inputs.borrow().last().unwrap().clone();
+        assert_eq!(last["mandatory"]["native"], json!([]));
+        assert_eq!(last["history"].as_array().unwrap().len(), 1);
     }
 }
 
 #[test]
-fn reused_call_id_is_atomic_and_does_not_discard_earlier_progress() {
+fn complete_invocation_provenance_is_monotonic_and_roundtrips_public_store_codec() {
     let f = Fixture::new(
-        vec![
-            batch(vec![call(1, "lookup")]),
-            batch(vec![call(1, "lookup")]),
-            answer("next"),
-        ],
-        vec![complete(Decision::new(true, None))],
+        vec![batch(vec![call(1, "lookup")]), answer("done")],
+        vec![decision(false)],
     );
-    let mut agent = f.basic(3);
-    let session = agent.new_session().unwrap();
-    let error = agent.chat(session.id(), user("request")).unwrap_err();
-    assert!(
-        matches!(error.kind(), AgentErrorKind::RejectedOutput(SessionError::DuplicateCallId(id)) if id.as_str() == "call-1")
+    let agent = f.basic(2);
+    let id = agent.new_session().unwrap().session().id().clone();
+    let completed = agent.chat(&id, user("request exact whitespace  ")).unwrap();
+    let archive = SessionArchive::decode(&f.store.bytes(&id)).unwrap();
+    assert_eq!(&archive, completed.archive());
+    assert_eq!(
+        archive
+            .generations()
+            .iter()
+            .map(|r| r.id().get())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
     );
-    let progress = error.progress().unwrap();
-    assert_eq!(progress.turns()[0].steps().len(), 1);
-    assert!(matches!(
-        progress.turns()[0].outcome(),
-        TurnOutcome::Failed(TurnFailure::MalformedResponse(_))
-    ));
-    assert_eq!(f.store.io.borrow().targets, vec![1]);
-    assert_eq!(results(&progress.messages()).len(), 1);
-    assert!(agent.chat(session.id(), user("next request")).is_ok());
+    for record in archive.generations() {
+        let intent = record.intent();
+        assert_eq!(
+            intent.target(),
+            &ModelTarget::new("fixture-protocol", "memory://credential-free")
+        );
+        assert_eq!(intent.settings(), &model_settings());
+        assert_eq!(
+            intent.budget().request_bytes(),
+            serde_json::to_vec(intent.request()).unwrap().len()
+        );
+        assert_eq!(intent.budget().method(), TOKEN_ESTIMATE_METHOD);
+        let Observation::Observed {
+            at,
+            receipt,
+            disposition,
+        } = record.observation()
+        else {
+            panic!("missing observation")
+        };
+        assert!(*at >= intent.at());
+        assert_eq!(*disposition, Disposition::Accepted);
+        assert_eq!(receipt.served_model.as_deref(), Some("served-model"));
+        assert_eq!(receipt.http_status, Some(200));
+        assert_eq!(receipt.finish.as_deref(), Some("finished"));
+        assert_eq!(
+            receipt.usage,
+            Some(Usage {
+                input_tokens: Some(17),
+                output_tokens: Some(9)
+            })
+        );
+    }
+    assert_eq!(
+        archive.session().turns()[0].steps()[0].source_generation(),
+        archive.generations()[0].id()
+    );
+    assert_eq!(
+        archive.session().turns()[0].steps()[0]
+            .executions()
+            .next()
+            .unwrap()
+            .state()
+            .review()
+            .unwrap()
+            .reviewer(),
+        archive.generations()[1].id()
+    );
+    let encoded = String::from_utf8(f.store.bytes(&id)).unwrap();
+    assert!(!encoded.contains("\"version\""));
+    assert!(!encoded.contains("\"format\""));
 }
 
 #[test]
-fn duplicate_registration_is_rejected_and_listing_is_sorted_with_live_overlay() {
-    let f = Fixture::new(vec![answer("done")], vec![]);
+fn per_role_capacity_checks_prevent_http_and_leave_exact_typed_closure() {
+    for role in [ModelRole::Assistant, ModelRole::Reviewer] {
+        let f = Fixture::new(vec![batch(vec![call(1, "lookup")])], vec![]);
+        let mut config = settings(2);
+        match role {
+            ModelRole::Assistant => config.assistant.limits = limits(1),
+            ModelRole::Reviewer => config.reviewer.limits = limits(1),
+        }
+        let agent = f.service(config, false);
+        let id = agent.new_session().unwrap().session().id().clone();
+        let error = agent.chat(&id, user("request")).unwrap_err();
+        assert!(matches!(error.kind(),AgentErrorKind::ContextCapacity{role:r} if *r==role));
+        let durable = error.durable().unwrap();
+        assert_eq!(
+            durable.session().turns()[0].outcome(),
+            &TurnOutcome::Interrupted(StopReason::ContextCapacity)
+        );
+        assert_eq!(
+            f.model.io.borrow().assistant,
+            usize::from(role == ModelRole::Reviewer)
+        );
+        assert_eq!(f.model.io.borrow().reviewer, 0);
+        assert!(f.model.io.borrow().targets.is_empty());
+        assert_eq!(
+            durable.generations().len(),
+            usize::from(role == ModelRole::Reviewer)
+        );
+    }
+}
+
+#[test]
+fn duplicate_registration_listing_fault_and_missing_inspection_do_not_poison_other_sessions() {
+    let f = Fixture::new(vec![answer("usable")], vec![]);
     let duplicate = AgentService::new(
         f.model.clone(),
         f.store.clone(),
-        AssistantContext {
-            catalog: vec![],
-            fail: false,
-            io: f.store.io.clone(),
-        },
-        ReviewContext {
-            fail: false,
-            observed: f.observed.clone(),
-            io: f.store.io.clone(),
-        },
         vec![
             (
                 tool(),
                 Box::new(Target {
-                    io: f.store.io.clone(),
+                    io: f.model.io.clone(),
                     fail: false,
+                    store: f.store.clone(),
                 }) as Box<dyn Tool>,
             ),
             (
                 tool(),
                 Box::new(Target {
-                    io: f.store.io.clone(),
+                    io: f.model.io.clone(),
                     fail: false,
+                    store: f.store.clone(),
                 }) as Box<dyn Tool>,
             ),
         ],
-        settings(1),
+        settings(2),
     );
-    assert!(
-        matches!(duplicate.err().unwrap().kind(), AgentErrorKind::DuplicateTool(name) if name.as_str() == "lookup")
-    );
-    assert_eq!(*f.store.io.borrow(), Io::default());
-    let stored = Session::new(SessionId::new("zz-stored").unwrap());
-    f.store.save(&stored).unwrap();
-    let mut agent = f.basic(1);
-    let live = agent.new_session().unwrap();
-    agent.chat(live.id(), user("request")).unwrap();
-    let sessions = agent.list_session().unwrap();
+    assert!(matches!(
+        duplicate.err().unwrap().kind(),
+        AgentErrorKind::DuplicateTool(_)
+    ));
+    for id in ["z", "a"] {
+        f.store
+            .seed(SessionArchive::new(SessionId::new(id).unwrap()));
+    }
+    let agent = f.basic(2);
     assert_eq!(
-        sessions.iter().map(Session::id).collect::<Vec<_>>(),
-        vec![live.id(), stored.id()]
+        agent
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .map(|s| s.session().id().as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "z"]
     );
-    assert_eq!(sessions[0].turns()[0].outcome(), &TurnOutcome::Completed);
+    let missing = SessionId::new("missing").unwrap();
+    assert!(
+        matches!(agent.inspect(&missing).unwrap_err().kind(),AgentErrorKind::Store(source)if source.kind()==SessionStoreErrorKind::NotFound)
+    );
+    f.store.0.borrow_mut().list_fault = true;
+    assert!(matches!(
+        agent.list_sessions().unwrap_err().kind(),
+        AgentErrorKind::Store(_)
+    ));
+    f.store.0.borrow_mut().list_fault = false;
+    agent
+        .chat(&SessionId::new("a").unwrap(), user("request"))
+        .unwrap();
+    assert_eq!(f.model.io.borrow().assistant, 1);
 }
+
+#[test]
+fn owned_session_rejects_chat_and_recovery_before_any_effect_and_releases_normally() {
+    let f = Fixture::new(vec![answer("after release")], vec![]);
+    let agent = f.basic(2);
+    let id = agent.new_session().unwrap().session().id().clone();
+    let transaction = f.store.acquire(&id).unwrap();
+    for error in [
+        agent.chat(&id, user("busy")).unwrap_err(),
+        agent.recover(&id).unwrap_err(),
+    ] {
+        assert!(
+            matches!(error.kind(),AgentErrorKind::Store(source)if source.kind()==SessionStoreErrorKind::Busy)
+        );
+    }
+    assert_eq!(*f.model.io.borrow(), Io::default());
+    drop(transaction);
+    agent.chat(&id, user("released")).unwrap();
+    assert_eq!(f.model.io.borrow().assistant, 1);
+}
+
+#[test]
+fn new_session_publication_failure_is_typed_and_has_no_effect() {
+    for fault in [
+        Fault::NotPublished,
+        Fault::UncertainPublished,
+        Fault::Conflict,
+    ] {
+        let f = Fixture::new(vec![], vec![]);
+        f.store.inject(1, fault);
+        let agent = f.basic(1);
+        let error = agent.new_session().unwrap_err();
+        assert!(matches!(error.kind(), AgentErrorKind::Commit(_)));
+        assert!(error.durable().is_none());
+        assert_eq!(error.uncommitted().unwrap().revision().get(), 1);
+        assert_eq!(*f.model.io.borrow(), Io::default());
+        assert_eq!(
+            agent.list_sessions().unwrap().len(),
+            usize::from(matches!(fault, Fault::UncertainPublished))
+        );
+    }
+}
+
+#[allow(dead_code)]
+#[path = "../adapters/models/support.rs"]
+mod support;
+use support::{PROVIDERS, Provider, Server};
 
 struct ProviderClients {
     assistant: Box<dyn ModelClient<AssistantMessage>>,
     reviewer: Box<dyn ModelClient<Decision>>,
 }
 impl ModelClient<AssistantMessage> for ProviderClients {
-    fn generate(
+    fn prepare(
         &self,
-        context: &Context<AssistantMessage>,
+        plan: &ContextPlan<AssistantMessage>,
         settings: &ModelSettings,
-        continuation: Option<&Continuation<AssistantMessage>>,
-    ) -> Result<Generation<AssistantMessage>, ModelError> {
-        self.assistant.generate(context, settings, continuation)
+    ) -> Result<PreparedRequest<AssistantMessage>, ModelError> {
+        self.assistant.prepare(plan, settings)
+    }
+    fn invoke(
+        &self,
+        request: &PreparedRequest<AssistantMessage>,
+    ) -> ObservedReply<AssistantMessage> {
+        self.assistant.invoke(request)
     }
 }
 impl ModelClient<Decision> for ProviderClients {
-    fn generate(
+    fn prepare(
         &self,
-        context: &Context<Decision>,
+        plan: &ContextPlan<Decision>,
         settings: &ModelSettings,
-        continuation: Option<&Continuation<Decision>>,
-    ) -> Result<Generation<Decision>, ModelError> {
-        self.reviewer.generate(context, settings, continuation)
+    ) -> Result<PreparedRequest<Decision>, ModelError> {
+        self.reviewer.prepare(plan, settings)
+    }
+    fn invoke(&self, request: &PreparedRequest<Decision>) -> ObservedReply<Decision> {
+        self.reviewer.invoke(request)
     }
 }
 fn native_batch(provider: Provider) -> Value {
@@ -816,125 +1219,197 @@ fn native_batch(provider: Provider) -> Value {
         .push(second[key].as_array().unwrap().last().unwrap().clone());
     response
 }
+struct NativeTarget {
+    io: Rc<RefCell<Io>>,
+    store: JsonlSessionStore,
+}
+impl Tool for NativeTarget {
+    fn execute(&self, arguments: &Map<String, Value>) -> ToolOutcome {
+        let n = arguments["n"].as_u64().unwrap();
+        let archives = self.store.list().unwrap();
+        let active = archives
+            .iter()
+            .find_map(|archive| archive.session().active_turn())
+            .unwrap();
+        assert!(
+            active
+                .steps()
+                .iter()
+                .flat_map(|step| step.executions())
+                .any(|execution| execution.call().arguments() == arguments
+                    && matches!(execution.state(), ExecutionState::Started { .. }))
+        );
+        self.io.borrow_mut().targets.push(n);
+        ToolOutcome::Success(format!("actual lookup result {n}"))
+    }
+}
 fn native_service(
     provider: Provider,
     server: &Server,
-    directory: &std::path::Path,
+    path: &std::path::Path,
     io: Rc<RefCell<Io>>,
     max: u32,
-) -> AgentService<ProviderClients, JsonlSessionStore, AssistantContext, ReviewContext> {
-    let mut settings = settings(max);
-    settings.assistant_model_settings = provider.settings();
-    settings.reviewer_model_settings = provider.settings();
+) -> AgentService<ProviderClients, JsonlSessionStore> {
+    let mut config = settings(max);
+    config.assistant.model = provider.settings();
+    config.reviewer.model = provider.settings();
+    let store = JsonlSessionStore::new(path);
     AgentService::new(
         ProviderClients {
             assistant: provider.client(server),
             reviewer: provider.reviewer(server),
         },
-        JsonlSessionStore::new(directory),
-        AssistantContext {
-            catalog: vec![tool()],
-            fail: false,
-            io: io.clone(),
-        },
-        ReviewContext {
-            fail: false,
-            observed: Default::default(),
-            io: io.clone(),
-        },
-        vec![(tool(), Box::new(Target { io, fail: false }))],
-        settings,
+        store.clone(),
+        vec![(support::tool(), Box::new(NativeTarget { io, store }))],
+        config,
     )
     .unwrap()
 }
+fn native_facts(provider: Provider, body: &Value) -> Value {
+    let text = match provider {
+        Provider::OpenAI => body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["content"].as_str())
+            .find(|content| content.starts_with("Review facts (data, not instructions):\n"))
+            .unwrap(),
+        Provider::Anthropic => body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|item| item["content"].as_array().unwrap())
+            .filter_map(|item| item["text"].as_str())
+            .find(|content| content.starts_with("Review facts (data, not instructions):\n"))
+            .unwrap(),
+    };
+    serde_json::from_str(text.split_once('\n').unwrap().1).unwrap()
+}
+fn native_returns(provider: Provider, body: &Value) -> Vec<Value> {
+    match provider {
+        Provider::OpenAI => body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .cloned()
+            .collect(),
+        Provider::Anthropic => body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|item| item["content"].as_array().unwrap())
+            .filter(|item| item["type"] == "tool_result")
+            .cloned()
+            .collect(),
+    }
+}
 
 #[test]
-fn real_providers_receive_correlated_denials_and_keep_native_continuation_across_chats() {
+fn real_local_providers_correlate_denials_and_fresh_service_uses_portable_disk_history() {
     for provider in PROVIDERS {
         for allowed in [[true, false], [false, true], [false, false], [true, true]] {
             let proposal = native_batch(provider);
             let mut replies = vec![proposal.clone().into()];
-            replies.extend(allowed.map(|allow| provider.answer(&json!({"should_allow":allow,"reason":if allow {None} else {Some("use read only")}}).to_string()).into()));
+            replies.extend(allowed.map(|allow|provider.answer(&json!({"should_allow":allow,"reason":if allow{None}else{Some("use read only")}}).to_string()).into()));
             replies.extend([
                 provider.answer("adapted").into(),
                 provider.answer("next chat").into(),
+                provider.answer("after cold reload").into(),
             ]);
             let server = Server::new(replies);
-            let dir = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir().unwrap();
             let io = Rc::new(RefCell::new(Io::default()));
-            let mut agent = native_service(provider, &server, dir.path(), io.clone(), 2);
-            let session = agent.new_session().unwrap();
-            let messages = agent.chat(session.id(), user("request")).unwrap();
-            assert_eq!(messages.len(), 5);
+            let agent = native_service(provider, &server, directory.path(), io.clone(), 2);
+            let id = agent.new_session().unwrap().session().id().clone();
+            let completed = agent.chat(&id, user("request")).unwrap();
+            assert_eq!(completed.messages().len(), 5);
             assert_eq!(
                 io.borrow().targets,
                 allowed
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, allow)| allow.then_some(i as u64 + 1))
+                    .filter_map(|(index, allow)| allow.then_some(index as u64 + 1))
                     .collect::<Vec<_>>()
             );
+            let feedback = server.request(3).body;
             assert_eq!(
-                provider.request_native(&server.request(3).body),
+                provider.request_native(&feedback),
                 provider.native(&proposal).as_array().unwrap().clone()
             );
-            let feedback = server.request(3).body;
-            let sent = feedback.to_string();
-            assert!(sent.contains("native-1") && sent.contains("native-2"));
-            for (index, allow) in allowed.iter().enumerate() {
-                let value = if *allow {
-                    format!("actual lookup result {}", index + 1)
-                } else {
-                    "Not executed: tool call denied by review. Reason: use read only".into()
-                };
-                assert!(sent.contains(&value));
-                if index == 0 {
-                    assert!(server.request(2).body.to_string().contains(&value));
-                }
+            let expected:Vec<Value>=allowed.iter().enumerate().map(|(index,allow)|{
+            let output=if *allow{format!("actual lookup result {}",index+1)}else{"Not executed: tool call denied by review. Reason: use read only".into()};
+            match provider{
+                Provider::OpenAI=>json!({"type":"function_call_output","call_id":format!("native-{}",index+1),"output":if *allow{json!({"success":true,"output":output})}else{json!({"success":false,"error":output})}.to_string()}),
+                Provider::Anthropic=>json!({"type":"tool_result","tool_use_id":format!("native-{}",index+1),"is_error":!*allow,"content":output}),
             }
+        }).collect();
+            assert_eq!(native_returns(provider, &feedback), expected);
+            let review = native_facts(provider, &server.request(2).body);
+            assert_eq!(
+                review["candidate"],
+                json!({"id":"native-2","name":"lookup","arguments":{"n":2}})
+            );
+            assert_eq!(review["active_turn"]["user"], "request");
+            assert_eq!(
+                review["active_turn"]["steps"][0]["executions"][1]["state"],
+                json!({"kind":"requested"})
+            );
+            assert_eq!(
+                review["active_turn"]["steps"][0]["executions"][0]["state"]["kind"],
+                if allowed[0] { "returned" } else { "denied" }
+            );
+            assert!(server.request(2).body.get("tools").is_none());
+            let next = agent.chat(&id, user("follow up")).unwrap();
+            assert_eq!(next.messages().len(), 2);
+            drop(agent);
+            let cold = native_service(provider, &server, directory.path(), io.clone(), 2);
+            let last = cold.chat(&id, user("after reload")).unwrap();
+            assert_eq!(
+                last.messages(),
+                &[
+                    Message::User(user("after reload")),
+                    Message::Assistant(AssistantMessage::answer("after cold reload").unwrap())
+                ]
+            );
+            assert_eq!(server.requests().len(), 6);
+            let cold_request = server.request(5).body;
+            assert!(native_returns(provider, &cold_request).is_empty());
             match provider {
-                Provider::OpenAI => assert_eq!(
-                    feedback["input"]
+                Provider::OpenAI => assert!(
+                    !cold_request["input"]
                         .as_array()
                         .unwrap()
                         .iter()
-                        .filter(|item| item["type"] == "function_call_output")
-                        .count(),
-                    2
+                        .any(|item| item["type"] == "function_call" || item["type"] == "reasoning")
                 ),
-                Provider::Anthropic => {
-                    let returns =
-                        feedback["messages"].as_array().unwrap().last().unwrap()["content"]
-                            .as_array()
-                            .unwrap()
-                            .clone();
-                    assert_eq!(returns.len(), 2);
-                    for (index, result) in returns.iter().enumerate() {
-                        assert_eq!(result["is_error"], !allowed[index]);
-                    }
-                }
+                Provider::Anthropic => assert!(
+                    !cold_request["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|item| item["content"].as_array().unwrap())
+                        .any(|item| matches!(
+                            item["type"].as_str(),
+                            Some("tool_use" | "thinking" | "redacted_thinking")
+                        ))
+                ),
             }
-            let second = agent.chat(session.id(), user("follow up")).unwrap();
-            assert_eq!(second.len(), 2);
-            assert_eq!(server.requests().len(), 5);
-            let persisted = JsonlSessionStore::new(dir.path())
-                .load(session.id())
+            let persisted = JsonlSessionStore::new(directory.path())
+                .inspect(&id)
                 .unwrap();
-            assert_eq!(persisted.turns().len(), 2);
-            assert_eq!(persisted.turns()[0].messages(), messages);
-            let mut cold = native_service(provider, &server, dir.path(), io.clone(), 2);
-            let error = cold.chat(session.id(), user("after reload")).unwrap_err();
-            assert!(
-                matches!(error.kind(), AgentErrorKind::Model { role: ModelRole::Assistant, source } if source.kind() == ModelErrorKind::MissingContinuation)
+            assert_eq!(persisted.session().turns().len(), 3);
+            assert_eq!(
+                persisted.session().turns()[0].messages(),
+                completed.messages()
             );
-            assert!(error.progress().unwrap().active_turn().is_none());
-            assert_eq!(server.requests().len(), 5);
+            assert_eq!(persisted.generations().len(), 6);
         }
     }
 }
 
 #[test]
-fn real_provider_final_budget_denial_is_durable_and_next_chat_replays_it() {
+fn real_local_provider_final_budget_denial_is_durable_and_next_chat_replays_facts() {
     for provider in PROVIDERS {
         let server = Server::new(vec![
             native_batch(provider).into(),
@@ -946,31 +1421,35 @@ fn real_provider_final_budget_denial_is_durable_and_next_chat_replays_it() {
                 .into(),
             provider.answer("next chat").into(),
         ]);
-        let dir = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let io = Rc::new(RefCell::new(Io::default()));
-        let mut agent = native_service(provider, &server, dir.path(), io.clone(), 1);
-        let session = agent.new_session().unwrap();
-        let error = agent.chat(session.id(), user("request")).unwrap_err();
+        let agent = native_service(provider, &server, directory.path(), io.clone(), 1);
+        let id = agent.new_session().unwrap().session().id().clone();
+        let error = agent.chat(&id, user("request")).unwrap_err();
         assert!(matches!(error.kind(), AgentErrorKind::IterationLimit));
         assert_eq!(
-            error.progress().unwrap().turns()[0].outcome(),
+            error.durable().unwrap().session().turns()[0].outcome(),
             &TurnOutcome::Interrupted(StopReason::IterationLimit)
         );
-        assert_eq!(results(&error.progress().unwrap().messages()).len(), 2);
+        assert_eq!(
+            results(&error.durable().unwrap().session().messages()).len(),
+            2
+        );
         assert!(io.borrow().targets.is_empty());
         assert_eq!(server.requests().len(), 3);
-        assert!(agent.chat(session.id(), user("follow up")).is_ok());
-        assert!(
-            server
-                .request(3)
-                .body
-                .to_string()
-                .contains("without providing a reason")
-        );
+        drop(agent);
+        let cold = native_service(provider, &server, directory.path(), io.clone(), 1);
+        cold.chat(&id, user("follow up")).unwrap();
+        let request = server.request(3).body;
+        assert!(native_returns(provider, &request).is_empty());
+        let encoded = request.to_string();
+        assert!(encoded.contains("denied by review"));
+        assert!(encoded.contains("iteration_limit"));
         assert_eq!(
-            JsonlSessionStore::new(dir.path())
-                .load(session.id())
+            JsonlSessionStore::new(directory.path())
+                .inspect(&id)
                 .unwrap()
+                .session()
                 .turns()
                 .len(),
             2
@@ -985,15 +1464,20 @@ struct InvalidSecondProposal {
     duplicate: bool,
 }
 impl ModelClient<AssistantMessage> for InvalidSecondProposal {
-    fn generate(
+    fn prepare(
         &self,
-        context: &Context<AssistantMessage>,
+        plan: &ContextPlan<AssistantMessage>,
         settings: &ModelSettings,
-        continuation: Option<&Continuation<AssistantMessage>>,
-    ) -> Result<Generation<AssistantMessage>, ModelError> {
-        let mut generated = self.native.generate(context, settings, continuation)?;
+    ) -> Result<PreparedRequest<AssistantMessage>, ModelError> {
+        self.native.prepare(plan, settings)
+    }
+    fn invoke(
+        &self,
+        request: &PreparedRequest<AssistantMessage>,
+    ) -> ObservedReply<AssistantMessage> {
+        let mut observed = self.native.invoke(request);
         self.generations.set(self.generations.get() + 1);
-        if let Generation::Complete { output, .. } = &mut generated {
+        if let Ok(Generation::Complete(output)) = &mut observed.result {
             match self.generations.get() {
                 1 => *self.first.borrow_mut() = Some(output.clone()),
                 2 => {
@@ -1009,185 +1493,313 @@ impl ModelClient<AssistantMessage> for InvalidSecondProposal {
                 _ => {}
             }
         }
-        Ok(generated)
+        observed
     }
 }
 impl ModelClient<Decision> for InvalidSecondProposal {
-    fn generate(
+    fn prepare(
         &self,
-        context: &Context<Decision>,
+        plan: &ContextPlan<Decision>,
         settings: &ModelSettings,
-        continuation: Option<&Continuation<Decision>>,
-    ) -> Result<Generation<Decision>, ModelError> {
-        self.native.generate(context, settings, continuation)
+    ) -> Result<PreparedRequest<Decision>, ModelError> {
+        self.native.prepare(plan, settings)
+    }
+    fn invoke(&self, request: &PreparedRequest<Decision>) -> ObservedReply<Decision> {
+        self.native.invoke(request)
     }
 }
 
 #[test]
-fn rejected_native_output_never_replaces_the_accepted_continuation() {
+fn rejected_native_output_stays_audit_only_and_next_chat_uses_accepted_facts() {
     for provider in PROVIDERS {
         for duplicate in [true, false] {
             let first = provider.tool(1);
+            let rejected = provider.tool(2);
             let server = Server::new(vec![
                 first.clone().into(),
                 provider
                     .answer(&json!({"should_allow":true,"reason":null}).to_string())
                     .into(),
-                provider.tool(2).into(),
+                rejected.clone().into(),
                 provider.answer("recovered next chat").into(),
             ]);
-            let dir = tempfile::tempdir().unwrap();
+            let directory = tempfile::tempdir().unwrap();
             let io = Rc::new(RefCell::new(Io::default()));
             let native = ProviderClients {
                 assistant: provider.client(&server),
                 reviewer: provider.reviewer(&server),
             };
-            let mut model_settings = settings(3);
-            model_settings.assistant_model_settings = provider.settings();
-            model_settings.reviewer_model_settings = provider.settings();
-            let mut agent = AgentService::new(
+            let mut config = settings(3);
+            config.assistant.model = provider.settings();
+            config.reviewer.model = provider.settings();
+            let store = JsonlSessionStore::new(directory.path());
+            let agent = AgentService::new(
                 InvalidSecondProposal {
                     native,
                     first: RefCell::new(None),
                     generations: std::cell::Cell::new(0),
                     duplicate,
                 },
-                JsonlSessionStore::new(dir.path()),
-                AssistantContext {
-                    catalog: vec![tool()],
-                    fail: false,
-                    io: io.clone(),
-                },
-                ReviewContext {
-                    fail: false,
-                    observed: Default::default(),
-                    io: io.clone(),
-                },
+                store.clone(),
                 vec![(
-                    tool(),
-                    Box::new(Target {
+                    support::tool(),
+                    Box::new(NativeTarget {
                         io: io.clone(),
-                        fail: false,
-                    }),
+                        store: store.clone(),
+                    }) as Box<dyn Tool>,
                 )],
-                model_settings,
+                config,
             )
             .unwrap();
-            let session = agent.new_session().unwrap();
-            let error = agent.chat(session.id(), user("request")).unwrap_err();
-            if duplicate {
-                assert!(matches!(
-                    error.kind(),
-                    AgentErrorKind::RejectedOutput(SessionError::DuplicateCallId(_))
-                ));
-            } else {
-                assert!(matches!(error.kind(), AgentErrorKind::UnknownTool(_)));
-            }
-            let progress = error.progress().unwrap();
-            assert_eq!(progress.turns()[0].steps().len(), 1);
+            let id = agent.new_session().unwrap().session().id().clone();
+            let error = agent.chat(&id, user("request")).unwrap_err();
+            assert!(matches!(error.kind(), AgentErrorKind::RejectedOutput(_)));
+            let archive = error.durable().unwrap();
+            assert_eq!(archive.session().turns()[0].steps().len(), 1);
             assert!(matches!(
-                progress.turns()[0].outcome(),
+                archive.session().turns()[0].outcome(),
                 TurnOutcome::Failed(TurnFailure::MalformedResponse(_))
             ));
             assert_eq!(io.borrow().targets, vec![1]);
-            let next = agent.chat(session.id(), user("next user request")).unwrap();
+            let Observation::Observed {
+                receipt,
+                disposition,
+                ..
+            } = archive.generations()[2].observation()
+            else {
+                panic!("missing rejected evidence")
+            };
+            assert!(matches!(disposition, Disposition::Rejected(_)));
+            let ResponseCapture::Complete(bytes) = &receipt.capture else {
+                panic!("raw response missing")
+            };
+            assert_eq!(serde_json::from_slice::<Value>(bytes).unwrap(), rejected);
+            let next = agent.chat(&id, user("next user request")).unwrap();
             assert_eq!(
-                next.last(),
+                next.messages().last(),
                 Some(&Message::Assistant(
                     AssistantMessage::answer("recovered next chat").unwrap()
                 ))
             );
-            assert_eq!(
-                provider.request_native(&server.request(3).body),
-                provider.native(&first).as_array().unwrap().clone()
-            );
+            let request = server.request(3).body;
+            assert!(native_returns(provider, &request).is_empty());
+            assert!(!request.to_string().contains("signature-2"));
+            assert!(!request.to_string().contains("native-2"));
+            assert!(request.to_string().contains("actual lookup result 1"));
             assert_eq!(io.borrow().targets, vec![1]);
-            assert_eq!(
-                JsonlSessionStore::new(dir.path())
-                    .load(session.id())
-                    .unwrap()
-                    .turns()
-                    .len(),
-                2
-            );
+            assert_eq!(store.inspect(&id).unwrap().session().turns().len(), 2);
         }
     }
 }
 
-#[test]
-fn missing_load_does_not_poison_the_cache() {
-    let f = Fixture::new(vec![answer("found later")], vec![]);
-    let mut agent = f.basic(1);
-    let session = Session::new(SessionId::new("not-present-yet").unwrap());
-    let error = agent.chat(session.id(), user("first attempt")).unwrap_err();
-    assert!(
-        matches!(error.kind(), AgentErrorKind::Store { at: Checkpoint::LoadSession, source } if source.kind() == SessionStoreErrorKind::NotFound)
-    );
-    assert!(error.progress().is_none());
-    assert_eq!(f.store.io.borrow().assistant, 0);
-    f.store.save(&session).unwrap();
-    assert_eq!(
-        agent.chat(session.id(), user("now present")).unwrap().len(),
-        2
-    );
-    assert_eq!(f.store.io.borrow().load, 2);
-}
-
-#[test]
-fn rejected_start_preserves_and_blocks_the_resident_session_atomically() {
-    struct UnrecoveredStore(Session, Rc<RefCell<Io>>);
-    impl SessionStore for UnrecoveredStore {
-        fn save(&self, _: &Session) -> Result<(), SessionStoreError> {
-            panic!("a rejected start must not save")
-        }
-        fn load(&self, _: &SessionId) -> Result<Session, SessionStoreError> {
-            self.1.borrow_mut().load += 1;
-            Ok(self.0.clone())
-        }
-        fn list(&self) -> Result<Vec<Session>, SessionStoreError> {
-            self.1.borrow_mut().list += 1;
-            Ok(vec![Session::restore(self.0.snapshot()).unwrap()])
-        }
+fn interrupted_archive(phase: usize) -> SessionArchive {
+    let mut archive =
+        SessionArchive::new(SessionId::new(format!("recovery-phase-{phase}")).unwrap());
+    let turn = archive
+        .session_mut()
+        .start_turn(user("original authorization"))
+        .unwrap();
+    if phase == 0 {
+        return archive;
     }
-    let f = Fixture::new(vec![], vec![]);
-    let mut active = Session::new(SessionId::new("unrecovered").unwrap());
-    active.start_turn(user("existing user")).unwrap();
-    let mut agent = AgentService::new(
-        f.model.clone(),
-        UnrecoveredStore(active.clone(), f.store.io.clone()),
-        AssistantContext {
-            catalog: vec![tool()],
-            fail: false,
-            io: f.store.io.clone(),
-        },
-        ReviewContext {
-            fail: false,
-            observed: f.observed.clone(),
-            io: f.store.io.clone(),
-        },
-        vec![],
-        settings(1),
+    let plan = ContextPlan::assistant(
+        &archive,
+        text("assistant"),
+        vec![tool()],
+        limits(1_000_000),
+        &[],
     )
     .unwrap();
-    let error = agent
-        .chat(active.id(), user("must not replace the existing user"))
-        .unwrap_err();
-    assert!(matches!(
-        error.kind(),
-        AgentErrorKind::RejectedOutput(SessionError::ActiveTurnExists)
-    ));
-    assert_eq!(error.progress(), Some(&active));
-    let before = f.store.io.borrow().clone();
-    let blocked = agent
-        .chat(active.id(), user("must not reload"))
-        .unwrap_err();
-    assert!(matches!(
-        blocked.kind(),
-        AgentErrorKind::Blocked {
-            at: Checkpoint::StartedTurn
+    let request = prepare(&plan, &model_settings()).unwrap();
+    let source = archive
+        .begin_generation(InvocationRole::Assistant { turn }, &request)
+        .unwrap();
+    if phase == 1 {
+        return archive;
+    }
+    archive
+        .record_observation(
+            source,
+            Timestamp::now(),
+            ResponseReceipt {
+                capture: ResponseCapture::Complete(b"proposal evidence".to_vec()),
+                ..Default::default()
+            },
+            Disposition::Accepted,
+        )
+        .unwrap();
+    archive
+        .session_mut()
+        .record_assistant(
+            turn,
+            source,
+            AssistantMessage::tool_requests(
+                None,
+                ToolCalls::new(vec![call(1, "lookup"), call(2, "lookup")]).unwrap(),
+            ),
+        )
+        .unwrap();
+    if phase == 2 {
+        return archive;
+    }
+    let call = CallRef::new(source, call(1, "lookup").id().clone());
+    let plan = ContextPlan::reviewer(
+        &archive,
+        &call,
+        text("reviewer"),
+        vec![tool()],
+        limits(1_000_000),
+        &[],
+    )
+    .unwrap();
+    let request = prepare(&plan, &model_settings()).unwrap();
+    let reviewer = archive
+        .begin_generation(InvocationRole::Reviewer { call: call.clone() }, &request)
+        .unwrap();
+    if phase == 3 {
+        return archive;
+    }
+    archive
+        .record_observation(
+            reviewer,
+            Timestamp::now(),
+            ResponseReceipt {
+                capture: ResponseCapture::Complete(b"review evidence".to_vec()),
+                ..Default::default()
+            },
+            Disposition::Accepted,
+        )
+        .unwrap();
+    archive
+        .session_mut()
+        .review_tool(turn, &call, reviewer, &Decision::new(phase != 4, None))
+        .unwrap();
+    if phase <= 5 {
+        return archive;
+    }
+    archive
+        .session_mut()
+        .start_tool(turn, &call, Timestamp::now())
+        .unwrap();
+    if phase == 6 {
+        return archive;
+    }
+    archive
+        .session_mut()
+        .record_tool_result(
+            turn,
+            &call,
+            ToolOutcome::Success("actual recorded return".into()),
+            Timestamp::now(),
+        )
+        .unwrap();
+    archive
+}
+
+#[test]
+fn disk_inspection_is_faithful_and_explicit_recovery_closes_once_without_model_or_tool_io() {
+    for phase in 0..=7 {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(directory.path());
+        let change = ArchiveChange::initial(interrupted_archive(phase)).unwrap();
+        let id = change.candidate().session().id().clone();
+        store.create(&change).unwrap();
+        let snapshot_path = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .unwrap();
+        let original = std::fs::read(&snapshot_path).unwrap();
+        let server = Server::new(vec![
+            Provider::OpenAI.answer("new turn after recovery").into(),
+        ]);
+        let io = Rc::new(RefCell::new(Io::default()));
+        let agent = native_service(Provider::OpenAI, &server, directory.path(), io.clone(), 2);
+        for _ in 0..3 {
+            assert_eq!(
+                SessionArchive::decode(&original).unwrap(),
+                *change.candidate()
+            );
+            assert_eq!(agent.inspect(&id).unwrap(), *change.candidate());
+            assert_eq!(
+                agent.list_sessions().unwrap(),
+                vec![change.candidate().clone()]
+            );
+            assert_eq!(std::fs::read(&snapshot_path).unwrap(), original);
         }
-    ));
-    assert_eq!(blocked.progress(), Some(&active));
-    assert_eq!(*f.store.io.borrow(), before);
-    assert_eq!(agent.list_session().unwrap(), vec![active]);
+        let error = agent.chat(&id, user("must require recovery")).unwrap_err();
+        assert!(matches!(error.kind(), AgentErrorKind::RecoveryRequired));
+        assert_eq!(error.durable(), Some(change.candidate()));
+        assert!(error.uncommitted().is_none());
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), original);
+        assert!(server.requests().is_empty());
+        assert!(io.borrow().targets.is_empty());
+        let recovered = agent.recover(&id).unwrap();
+        let archive = recovered.archive();
+        assert_eq!(
+            archive.revision().get(),
+            change.candidate().revision().get() + 1
+        );
+        assert!(!archive.needs_recovery());
+        assert_eq!(
+            archive.session().turns()[0].outcome(),
+            &TurnOutcome::Interrupted(StopReason::ProcessLost)
+        );
+        for generation in archive.generations() {
+            assert!(!matches!(generation.observation(), Observation::Pending));
+        }
+        assert_eq!(
+            archive
+                .generations()
+                .iter()
+                .filter(|generation| matches!(
+                    generation.observation(),
+                    Observation::Abandoned { .. }
+                ))
+                .count(),
+            usize::from(phase == 1 || phase == 3)
+        );
+        if phase >= 2 {
+            let states: Vec<_> = archive.session().turns()[0].steps()[0]
+                .executions()
+                .map(|execution| execution.state())
+                .collect();
+            assert_eq!(states[1], &ExecutionState::Requested);
+            match phase {
+                2 | 3 => assert_eq!(states[0], &ExecutionState::Requested),
+                4 => assert!(matches!(states[0], ExecutionState::Denied(_))),
+                5 => assert!(matches!(states[0], ExecutionState::Approved(_))),
+                6 => assert!(matches!(states[0], ExecutionState::Started { .. })),
+                7 => assert!(
+                    matches!(states[0],ExecutionState::Returned{outcome:ToolOutcome::Success(output),..}if output=="actual recorded return")
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                results(&archive.session().messages()).len(),
+                usize::from(phase == 4 || phase == 7)
+            );
+        }
+        assert!(server.requests().is_empty());
+        assert!(io.borrow().targets.is_empty());
+        let recovered_bytes = std::fs::read(&snapshot_path).unwrap();
+        assert_eq!(agent.recover(&id).unwrap().archive(), archive);
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), recovered_bytes);
+        drop(agent);
+        let cold = native_service(Provider::OpenAI, &server, directory.path(), io.clone(), 2);
+        let completed = cold.chat(&id, user("fresh request")).unwrap();
+        assert_eq!(
+            completed.messages().last(),
+            Some(&Message::Assistant(
+                AssistantMessage::answer("new turn after recovery").unwrap()
+            ))
+        );
+        assert_eq!(server.requests().len(), 1);
+        assert!(io.borrow().targets.is_empty());
+        assert!(native_returns(Provider::OpenAI, &server.request(0).body).is_empty());
+        assert_eq!(store.inspect(&id).unwrap().session().turns().len(), 2);
+    }
 }

@@ -1,5 +1,5 @@
 use super::client::{
-    self, Decoded, Event, OutputKind, Snapshot, WireCall, array, malformed, string, unsupported,
+    self, Decoded, Event, OutputKind, WireCall, array, malformed, string, unsupported,
 };
 use crate::{
     app::{IncompleteReason, ModelError, ModelSettings},
@@ -16,59 +16,49 @@ fn push(messages: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
         messages.push(json!({"role":role,"content":parts}));
     }
 }
-pub(super) fn request(
-    snapshot: &Snapshot,
+pub(super) fn request<'a, O>(
+    plan: &crate::app::ContextPlan<O>,
     settings: &ModelSettings,
     effort: Option<&str>,
     kind: OutputKind,
-    events: Vec<Event<'_>>,
+    events: impl Iterator<Item = &'a Event>,
 ) -> Value {
     let decision = kind == OutputKind::Decision;
     let mut messages = Vec::new();
-    if decision {
-        for text in client::review_history(snapshot) {
-            push(
+    for event in events {
+        match event {
+            Event::User(text) => push(
                 &mut messages,
                 "user",
                 vec![json!({"type":"text","text":text})],
-            );
-        }
-    } else {
-        for event in events {
-            match event {
-                Event::User(text) | Event::Fact(text) => push(
+            ),
+            Event::Answer(text) => push(
+                &mut messages,
+                "assistant",
+                vec![json!({"type":"text","text":text.as_str()})],
+            ),
+            Event::Native(raw) => push(&mut messages, "assistant", raw.to_vec()),
+            Event::Result(result) => {
+                let content = match result.outcome() {
+                    ToolOutcome::Success(text) => text.as_str(),
+                    ToolOutcome::Failure(error) => error.description().as_str(),
+                };
+                push(
                     &mut messages,
                     "user",
-                    vec![json!({"type":"text","text":text})],
-                ),
-                Event::Answer(text) => push(
-                    &mut messages,
-                    "assistant",
-                    vec![json!({"type":"text","text":text.as_str()})],
-                ),
-                Event::Native(raw) => push(&mut messages, "assistant", raw.to_vec()),
-                Event::Result(id, result) => {
-                    let content = match result.outcome() {
-                        ToolOutcome::Success(text) => text.as_str(),
-                        ToolOutcome::Failure(error) => error.description().as_str(),
-                    };
-                    push(
-                        &mut messages,
-                        "user",
-                        vec![json!({
-                            "type": "tool_result",
-                            "tool_use_id": id,
-                            "is_error": matches!(result.outcome(), ToolOutcome::Failure(_)),
-                            "content": content,
-                        })],
-                    );
-                }
+                    vec![json!({
+                        "type": "tool_result",
+                        "tool_use_id": result.call_id().as_str(),
+                        "is_error": matches!(result.outcome(), ToolOutcome::Failure(_)),
+                        "content": content,
+                    })],
+                );
             }
         }
     }
     let mut body = json!({
         "model": settings.model_id.as_str(),
-        "system": client::instructions(snapshot, decision),
+        "system": client::instructions(plan, decision),
         "messages": messages,
         "max_tokens": settings.max_output_tokens.get(),
     });
@@ -80,10 +70,9 @@ pub(super) fn request(
     if decision {
         body["output_config"]["format"] =
             json!({"type":"json_schema","schema":client::decision_schema()});
-    } else if !snapshot.tools.is_empty() {
+    } else if !plan.tools().is_empty() {
         body["tools"] = json!(
-            snapshot
-                .tools
+            plan.tools()
                 .iter()
                 .map(|tool| json!({
                     "name": tool.name().as_str(),
@@ -152,12 +141,14 @@ impl std::fmt::Debug for AnthropicClient {
     }
 }
 impl<O: super::client::Output> crate::app::ModelClient<O> for AnthropicClient {
-    fn generate(
+    fn prepare(
         &self,
-        context: &crate::domain::Context<O>,
+        plan: &crate::app::ContextPlan<O>,
         settings: &ModelSettings,
-        continuation: Option<&crate::app::Continuation<O>>,
-    ) -> Result<crate::app::Generation<O>, ModelError> {
-        self.0.generate(context, settings, continuation)
+    ) -> Result<crate::app::PreparedRequest<O>, ModelError> {
+        self.0.prepare(plan, settings)
+    }
+    fn invoke(&self, request: &crate::app::PreparedRequest<O>) -> crate::app::ObservedReply<O> {
+        self.0.invoke(request)
     }
 }

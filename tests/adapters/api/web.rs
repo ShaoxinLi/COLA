@@ -1,195 +1,4 @@
-use cola::{app::*, domain::*};
-use serde_json::{Value, json};
-use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeMap,
-    io,
-    num::NonZeroU32,
-    rc::Rc,
-};
-
-#[derive(Clone, Default)]
-struct Counts {
-    model: Rc<Cell<usize>>,
-    review: Rc<Cell<usize>>,
-    save: Rc<Cell<usize>>,
-    load: Rc<Cell<usize>>,
-    list: Rc<Cell<usize>>,
-    tool: Rc<Cell<usize>>,
-}
-fn text(s: &str) -> NonEmptyText {
-    NonEmptyText::new(s).unwrap()
-}
-fn definition() -> ToolDefinition {
-    ToolDefinition::new(
-        ToolName::new("echo").unwrap(),
-        text("echo"),
-        InputSchema::new(json!({"type":"object"})).unwrap(),
-    )
-}
-fn call() -> ToolCall {
-    ToolCall::new(
-        ToolCallId::new("call-1").unwrap(),
-        ToolName::new("echo").unwrap(),
-        json!({"n":42}),
-    )
-    .unwrap()
-}
-struct Roles {
-    counts: Counts,
-}
-impl Assistant for Roles {
-    fn context(&self, s: &Session) -> Result<Context<AssistantMessage>, ContextError> {
-        Context::new(text("answer"), s.context_exchanges()?, vec![definition()])
-    }
-}
-impl ToolCallReviewer for Roles {
-    fn context(&self, s: &Session, _: &ToolCall) -> Result<Context<Decision>, ContextError> {
-        self.counts.review.set(self.counts.review.get() + 1);
-        Context::new(text("review"), s.closed_context_exchanges()?, vec![])
-    }
-}
-struct Model {
-    counts: Counts,
-    mode: String,
-}
-impl ModelClient<AssistantMessage> for Model {
-    fn generate(
-        &self,
-        _: &Context<AssistantMessage>,
-        _: &ModelSettings,
-        _: Option<&Continuation<AssistantMessage>>,
-    ) -> Result<Generation<AssistantMessage>, ModelError> {
-        let n = self.counts.model.get() + 1;
-        self.counts.model.set(n);
-        match self.mode.as_str() {
-            "timeout" => return Err(ModelError::new(ModelErrorKind::Timeout)),
-            "model" => return Err(ModelError::new(ModelErrorKind::Transport)),
-            "refused" => {
-                return Ok(Generation::Refused {
-                    reason: Some(text("private refusal")),
-                });
-            }
-            "incomplete" => {
-                return Ok(Generation::Incomplete {
-                    reason: IncompleteReason::OutputLimit,
-                });
-            }
-            _ => {}
-        }
-        let output =
-            if (self.mode == "tools" || self.mode == "review-timeout" || self.mode == "denied")
-                && n == 1
-                || self.mode == "limit"
-            {
-                AssistantMessage::tool_requests(
-                    Some("checking".into()),
-                    ToolCalls::new(vec![call()]).unwrap(),
-                )
-            } else {
-                AssistantMessage::answer(format!("answer-{n}")).unwrap()
-            };
-        Ok(Generation::Complete {
-            output,
-            continuation: None,
-        })
-    }
-}
-impl ModelClient<Decision> for Model {
-    fn generate(
-        &self,
-        _: &Context<Decision>,
-        _: &ModelSettings,
-        _: Option<&Continuation<Decision>>,
-    ) -> Result<Generation<Decision>, ModelError> {
-        if self.mode == "review-timeout" {
-            return Err(ModelError::new(ModelErrorKind::Timeout));
-        }
-        Ok(Generation::Complete {
-            output: Decision::new(self.mode != "denied", Some(text("policy"))),
-            continuation: None,
-        })
-    }
-}
-struct Target(Counts);
-impl Tool for Target {
-    fn execute(&self, args: &serde_json::Map<String, Value>) -> ToolOutcome {
-        assert_eq!(args["n"], 42);
-        self.0.tool.set(self.0.tool.get() + 1);
-        ToolOutcome::Success("result".into())
-    }
-}
-#[derive(Clone, Default)]
-struct Store {
-    counts: Counts,
-    sessions: Rc<RefCell<BTreeMap<SessionId, Session>>>,
-    fail_save: Option<usize>,
-    fail_list: bool,
-}
-impl SessionStore for Store {
-    fn save(&self, s: &Session) -> Result<(), SessionStoreError> {
-        let n = self.counts.save.get() + 1;
-        self.counts.save.set(n);
-        if self.fail_save == Some(n) {
-            return Err(SessionStoreError::new(
-                SessionStoreErrorKind::Storage,
-                io::Error::other("/private/secret storage detail"),
-            ));
-        }
-        self.sessions.borrow_mut().insert(s.id().clone(), s.clone());
-        Ok(())
-    }
-    fn list(&self) -> Result<Vec<Session>, SessionStoreError> {
-        self.counts.list.set(self.counts.list.get() + 1);
-        if self.fail_list {
-            return Err(SessionStoreError::new(
-                SessionStoreErrorKind::Storage,
-                io::Error::other("/private/secret list detail"),
-            ));
-        }
-        Ok(self.sessions.borrow().values().cloned().collect())
-    }
-    fn load(&self, id: &SessionId) -> Result<Session, SessionStoreError> {
-        self.counts.load.set(self.counts.load.get() + 1);
-        self.sessions.borrow().get(id).cloned().ok_or_else(|| {
-            SessionStoreError::new(
-                SessionStoreErrorKind::NotFound,
-                io::Error::other("/private/secret missing"),
-            )
-        })
-    }
-}
-fn service<S: SessionStore>(
-    mode: &str,
-    store: S,
-    counts: Counts,
-) -> AgentService<Model, S, Roles, Roles> {
-    let settings = ModelSettings {
-        model_id: ModelId::new("fake").unwrap(),
-        effort: Effort::Default,
-        max_output_tokens: NonZeroU32::new(100).unwrap(),
-    };
-    AgentService::new(
-        Model {
-            counts: counts.clone(),
-            mode: mode.into(),
-        },
-        store,
-        Roles {
-            counts: counts.clone(),
-        },
-        Roles {
-            counts: counts.clone(),
-        },
-        vec![(definition(), Box::new(Target(counts)))],
-        AgentSettings {
-            assistant_model_settings: settings.clone(),
-            reviewer_model_settings: settings,
-            max_iterations: NonZeroU32::new(if mode == "limit" { 1 } else { 5 }).unwrap(),
-        },
-    )
-    .unwrap()
-}
+use super::support::*;
 use cola::adapters::{api::web::WebApi, stores::JsonlSessionStore};
 use std::{
     fs,
@@ -234,8 +43,23 @@ fn server_child() {
     } else {
         let store = JsonlSessionStore::new(root.join("sessions"));
         store
-            .save(&Session::new(SessionId::new("opaque id:世界").unwrap()))
+            .create(
+                &ArchiveChange::initial(SessionArchive::new(
+                    SessionId::new("opaque id:世界").unwrap(),
+                ))
+                .unwrap(),
+            )
             .unwrap();
+        if mode == "recover" {
+            let mut archive = SessionArchive::new(SessionId::new("recover-me").unwrap());
+            archive
+                .session_mut()
+                .start_turn(UserMessage::new(text("interrupted")))
+                .unwrap();
+            store
+                .create(&ArchiveChange::initial(archive).unwrap())
+                .unwrap();
+        }
         let api = WebApi::new(service(&mode, store, counts));
         fs::write(
             root.join("ready.tmp"),
@@ -390,8 +214,8 @@ fn loopback_persistent_service_and_disk_readback() {
     assert_eq!(s["turns"].as_array().unwrap().len(), 2);
     assert!(s["active"].is_null());
     let store = JsonlSessionStore::new(server.root.path().join("sessions"));
-    let session = store.load(&SessionId::new(id).unwrap()).unwrap();
-    assert_eq!(session.turns().len(), 2);
+    let session = store.inspect(&SessionId::new(id).unwrap()).unwrap();
+    assert_eq!(session.session().turns().len(), 2);
     let bytes: Vec<_> = fs::read_dir(server.root.path().join("sessions"))
         .unwrap()
         .map(|p| fs::read(p.unwrap().path()).unwrap())
@@ -602,26 +426,27 @@ fn oversized_declared_bodies_do_not_kill_the_resident_service() {
         assert_eq!(chat["messages"][1]["text"], format!("answer-{}", index + 1));
     }
     let stored = JsonlSessionStore::new(server.root.path().join("sessions"))
-        .load(&SessionId::new(id).unwrap())
+        .inspect(&SessionId::new(id).unwrap())
         .unwrap();
-    assert_eq!(stored.turns().len(), 6);
+    assert_eq!(stored.session().turns().len(), 6);
 }
 #[test]
-fn create_and_list_failures_keep_safe_progress_and_service_residency() {
+fn create_and_list_failures_keep_committed_views_and_safe_candidates() {
     let server = Server::new("create-failure");
     let (status, _, failure) = server.request("POST", "/sessions", b"", None);
     assert_eq!(status, 500);
     assert_eq!(failure["error"]["code"], "store_failure");
-    assert_eq!(failure["error"]["durability"], "unconfirmed");
-    let progress = &failure["error"]["progress"];
-    let id = progress["id"].as_str().unwrap();
-    assert_eq!(progress["turns"], json!([]));
-    assert!(progress["active"].is_null());
+    assert_eq!(failure["error"]["durability"], "not_published");
+    assert!(failure["error"]["progress"].is_null());
+    let candidate = &failure["error"]["uncommitted"];
+    let id = candidate["id"].as_str().unwrap();
+    assert_eq!(candidate["turns"], json!([]));
+    assert!(candidate["active"].is_null());
     assert!(!failure.to_string().contains("/private/secret"));
     let (status, _, listing) = server.request("GET", "/sessions", b"", None);
     assert_eq!(status, 200);
-    assert_eq!(listing["sessions"], json!([progress]));
-    assert_eq!(server.chat(id).0, 409);
+    assert_eq!(listing["sessions"], json!([]));
+    assert_eq!(server.chat(id).0, 404);
 
     let server = Server::new("list-failure");
     let (status, _, failure) = server.request("GET", "/sessions", b"", None);
@@ -650,7 +475,14 @@ fn http_tool_results_and_failure_progress_are_full_and_safe() {
         let (s, v) = server.chat(&id);
         assert_eq!(s, status, "{mode}");
         assert_eq!(v["error"]["code"], code);
-        assert_eq!(v["error"]["durability"], "unconfirmed");
+        assert_eq!(
+            v["error"]["durability"],
+            if mode == "save-failure" {
+                "not_published"
+            } else {
+                "committed"
+            }
+        );
         if !role.is_empty() {
             assert_eq!(v["error"]["role"], role);
         }
@@ -658,19 +490,17 @@ fn http_tool_results_and_failure_progress_are_full_and_safe() {
         assert!(!v.to_string().contains("private refusal"));
         if mode == "review-timeout" {
             assert_eq!(
-                v["error"]["progress"]["active"]["steps"][0]["executions"][0]["state"]["kind"],
-                "started"
+                v["error"]["progress"]["turns"][0]["steps"][0]["executions"][0]["state"]["kind"],
+                "requested"
             );
+            assert!(v["error"]["progress"]["active"].is_null());
+            assert_eq!(server.chat(&id).0, 200);
+        } else if mode == "save-failure" {
+            assert_eq!(v["error"]["progress"]["active"]["user"], " question ");
+            assert!(v["error"]["uncommitted"]["active"].is_object());
             assert_eq!(server.chat(&id).0, 409);
         } else {
             assert!(v["error"]["progress"]["active"].is_null());
-        }
-        if mode == "save-failure" {
-            assert_eq!(
-                v["error"]["progress"]["turns"][0]["outcome"]["kind"],
-                "completed"
-            );
-            assert_eq!(server.chat(&id).0, 409);
         }
     }
     for mode in ["tools", "denied"] {
@@ -698,7 +528,11 @@ fn http_tool_results_and_failure_progress_are_full_and_safe() {
             .unwrap();
         assert_eq!(
             s["turns"][0]["steps"][0]["executions"][0]["state"]["kind"],
-            "returned"
+            if mode == "denied" {
+                "denied"
+            } else {
+                "returned"
+            }
         );
     }
 }
@@ -727,10 +561,50 @@ fn disconnect_does_not_undo_admitted_chat() {
     let store = JsonlSessionStore::new(server.root.path().join("sessions"));
     assert_eq!(
         store
-            .load(&SessionId::new(id).unwrap())
+            .inspect(&SessionId::new(id).unwrap())
             .unwrap()
+            .session()
             .turns()
             .len(),
         1
     );
+}
+
+#[test]
+fn explicit_recovery_is_strict_idempotent_and_persisted_before_new_chat() {
+    let server = Server::new("recover");
+    let (status, reply) = server.chat("recover-me");
+    assert_eq!(status, 409);
+    assert_eq!(reply["error"]["code"], "recovery_required");
+    let (status, _, _) = server.request(
+        "POST",
+        "/sessions/recover-me/recover",
+        br#"{"extra":1}"#,
+        Some("application/json"),
+    );
+    assert_eq!(status, 400);
+    let (status, _, first) = server.request(
+        "POST",
+        "/sessions/recover-me/recover",
+        b"{}",
+        Some("application/json"),
+    );
+    assert_eq!(status, 200);
+    assert!(first["session"]["active"].is_null());
+    assert_eq!(
+        first["session"]["turns"][0]["outcome"],
+        json!({"kind":"interrupted","reason":"process_lost"})
+    );
+    let (status, _, second) = server.request("POST", "/sessions/recover-me/recover", b"", None);
+    assert_eq!(status, 200);
+    assert_eq!(first, second);
+    let store = JsonlSessionStore::new(server.root.path().join("sessions"));
+    let archive = store
+        .inspect(&SessionId::new("recover-me").unwrap())
+        .unwrap();
+    assert!(archive.session().active_turn().is_none());
+    assert!(archive.generations().is_empty());
+    let (status, reply) = server.chat("recover-me");
+    assert_eq!(status, 200);
+    assert_eq!(reply["messages"][1]["text"], "answer-1");
 }

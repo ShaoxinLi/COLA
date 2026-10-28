@@ -12,14 +12,13 @@ fn anthropic_context_window_stop_never_returns_partial_output() {
     let server = Server::new(vec![response.clone().into(), response.into()]);
     let assistant = p
         .client(&server)
-        .generate(&context(&session()), &p.settings(), None)
+        .request(&context(&session()), &p.settings())
         .unwrap();
     let reviewer = p
         .reviewer(&server)
-        .generate(
+        .request(
             &context::<cola::domain::Decision>(&session()),
             &p.settings(),
-            None,
         )
         .unwrap();
     assert!(matches!(

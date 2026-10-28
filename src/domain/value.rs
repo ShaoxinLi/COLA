@@ -5,6 +5,7 @@ pub enum ValueError {
     BlankText,
     BlankIdentity,
     ZeroTurnId,
+    ZeroGenerationId,
     InvalidToolName,
     EmptyToolCalls,
     DuplicateToolCallId(ToolCallId),
@@ -17,6 +18,7 @@ impl fmt::Display for ValueError {
             Self::BlankText => f.write_str("text must contain a non-whitespace character"),
             Self::BlankIdentity => f.write_str("identity must contain a non-whitespace character"),
             Self::ZeroTurnId => f.write_str("turn IDs start at one"),
+            Self::ZeroGenerationId => f.write_str("generation IDs start at one"),
             Self::InvalidToolName => f.write_str("tool name must match [A-Za-z_][A-Za-z0-9_-]*"),
             Self::EmptyToolCalls => f.write_str("a tool request batch must contain a call"),
             Self::DuplicateToolCallId(id) => write!(f, "duplicate tool call ID {id}"),
@@ -89,6 +91,62 @@ impl TurnId {
     }
     pub fn get(self) -> u64 {
         self.0
+    }
+}
+
+/// A nonzero, session-local model invocation number. Archives allocate them consecutively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GenerationId(u64);
+impl GenerationId {
+    pub fn new(value: u64) -> Result<Self, ValueError> {
+        if value == 0 {
+            return Err(ValueError::ZeroGenerationId);
+        }
+        Ok(Self(value))
+    }
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Milliseconds since the Unix epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp(u64);
+impl Timestamp {
+    pub fn from_unix_millis(value: u64) -> Self {
+        Self(value)
+    }
+    /// A clock before the epoch reads as zero.
+    pub fn now() -> Self {
+        let elapsed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        Self(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+    }
+    pub fn unix_millis(self) -> u64 {
+        self.0
+    }
+}
+
+/// One call occurrence. The call ID is the original model-supplied string; the generation that
+/// requested it scopes the ID, so closed turns may reuse an ID without ambiguity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CallRef {
+    generation: GenerationId,
+    call_id: ToolCallId,
+}
+impl CallRef {
+    pub fn new(generation: GenerationId, call_id: ToolCallId) -> Self {
+        Self {
+            generation,
+            call_id,
+        }
+    }
+    pub fn generation(&self) -> GenerationId {
+        self.generation
+    }
+    pub fn call_id(&self) -> &ToolCallId {
+        &self.call_id
     }
 }
 

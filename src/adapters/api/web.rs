@@ -1,10 +1,7 @@
 use super::inbound;
 use crate::{
     app::{AgentService, ModelClient, SessionStore},
-    domain::{
-        Assistant, AssistantMessage, Decision, NonEmptyText, SessionId, ToolCallReviewer,
-        UserMessage,
-    },
+    domain::{AssistantMessage, Decision, NonEmptyText, SessionId, UserMessage},
 };
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::{
@@ -53,28 +50,27 @@ enum Command {
     New(oneshot::Sender<Reply>),
     List(oneshot::Sender<Reply>),
     Chat(SessionId, UserMessage, oneshot::Sender<Reply>),
+    Recover(SessionId, oneshot::Sender<Reply>),
 }
 
 /// An HTTP adapter that keeps one service on its caller's thread.
 /// A private networking thread reads requests while service operations execute serially.
-pub struct WebApi<M, S, A, R> {
-    service: AgentService<M, S, A, R>,
+pub struct WebApi<M, S> {
+    service: AgentService<M, S>,
 }
-impl<M, S, A, R> WebApi<M, S, A, R>
+impl<M, S> WebApi<M, S>
 where
     M: ModelClient<AssistantMessage> + ModelClient<Decision>,
     S: SessionStore,
-    A: Assistant,
-    R: ToolCallReviewer,
 {
     /// Takes ownership without requiring `Send` or rebuilding collaborators.
-    pub fn new(service: AgentService<M, S, A, R>) -> Self {
+    pub fn new(service: AgentService<M, S>) -> Self {
         Self { service }
     }
     /// Serves indefinitely on an already-bound listener. Fatal networking errors propagate.
     /// Call outside a Tokio runtime because command reception blocks the calling thread.
     /// A disconnected client does not cancel enqueued work. There is no shutdown deadline.
-    pub fn run(mut self, listener: TcpListener) -> io::Result<()> {
+    pub fn run(self, listener: TcpListener) -> io::Result<()> {
         let (sender, mut commands) = mpsc::channel(1);
         let network = thread::Builder::new()
             .name("cola-http".into())
@@ -148,7 +144,7 @@ where
                     (sender, reply)
                 }
                 Command::List(sender) => {
-                    let reply = match self.service.list_session() {
+                    let reply = match self.service.list_sessions() {
                         Ok(sessions) => (
                             200,
                             None,
@@ -160,14 +156,27 @@ where
                     };
                     (sender, reply)
                 }
+                Command::Recover(id, sender) => {
+                    let reply = match self.service.recover(&id) {
+                        Ok(report) => (
+                            200,
+                            None,
+                            encode(&Created {
+                                session: inbound::session_dto(report.archive()),
+                            }),
+                        ),
+                        Err(e) => service_error(&e),
+                    };
+                    (sender, reply)
+                }
                 Command::Chat(id, user, sender) => {
                     let reply = match self.service.chat(&id, user) {
-                        Ok(messages) => (
+                        Ok(turn) => (
                             200,
                             None,
                             encode(&Chatted {
                                 session_id: id.as_str().into(),
-                                messages: inbound::message_dtos(&messages),
+                                messages: inbound::message_dtos(turn.messages()),
                             }),
                         ),
                         Err(e) => service_error(&e),
@@ -229,6 +238,13 @@ async fn command(
             }
             Ok(Command::New(sender))
         }
+        (Route::Recover(id), "POST") => {
+            let bytes = body(request, true).await?;
+            if !bytes.is_empty() {
+                object::<Create>(&bytes)?;
+            }
+            Ok(Command::Recover(id, sender))
+        }
         (Route::Messages(id), "POST") => {
             let bytes = body(request, false).await?;
             let post = object::<PostMessage>(&bytes)?;
@@ -241,7 +257,7 @@ async fn command(
             let mut reply = input_error(405, "method_not_allowed", "Method not allowed");
             reply.1 = Some(match route {
                 Route::Sessions => "GET, POST",
-                Route::Messages(_) => "POST",
+                Route::Messages(_) | Route::Recover(_) => "POST",
                 Route::Unknown => unreachable!(),
             });
             Err(reply)
@@ -265,7 +281,8 @@ fn service_error(error: &crate::app::AgentError) -> Reply {
     let failure = inbound::classify(error);
     let status = match failure.class {
         inbound::FailureClass::NotFound => 404,
-        inbound::FailureClass::Blocked => 409,
+        inbound::FailureClass::Conflict => 409,
+        inbound::FailureClass::Capacity => 422,
         inbound::FailureClass::Refused | inbound::FailureClass::IterationLimit => 422,
         inbound::FailureClass::Incomplete | inbound::FailureClass::Model => 502,
         inbound::FailureClass::Timeout => 504,
@@ -327,6 +344,7 @@ fn object<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Reply> {
 enum Route {
     Sessions,
     Messages(SessionId),
+    Recover(SessionId),
     Unknown,
 }
 fn route(url: &str) -> Result<Route, ()> {
@@ -334,10 +352,14 @@ fn route(url: &str) -> Result<Route, ()> {
     if path == "/sessions" {
         return Ok(Route::Sessions);
     }
-    let Some(id) = path
-        .strip_prefix("/sessions/")
-        .and_then(|p| p.strip_suffix("/messages"))
-    else {
+    let Some(tail) = path.strip_prefix("/sessions/") else {
+        return Ok(Route::Unknown);
+    };
+    let (id, recovery) = if let Some(id) = tail.strip_suffix("/messages") {
+        (id, false)
+    } else if let Some(id) = tail.strip_suffix("/recover") {
+        (id, true)
+    } else {
         return Ok(Route::Unknown);
     };
     if id.contains('/') || id.is_empty() {
@@ -358,5 +380,10 @@ fn route(url: &str) -> Result<Route, ()> {
         return Err(());
     }
     let id = String::from_utf8(decoded).map_err(|_| ())?;
-    Ok(Route::Messages(SessionId::new(id).map_err(|_| ())?))
+    let id = SessionId::new(id).map_err(|_| ())?;
+    Ok(if recovery {
+        Route::Recover(id)
+    } else {
+        Route::Messages(id)
+    })
 }

@@ -271,19 +271,23 @@ fn http(
     response.json().unwrap()
 }
 fn facts(request: &Value) -> Value {
-    let instructions = request["instructions"]
-        .as_str()
-        .or_else(|| request["system"].as_str())
-        .unwrap();
-    let json = instructions
-        .split("Review facts:\n")
-        .nth(1)
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap();
-    serde_json::from_str(json).unwrap()
+    let text = if let Some(input) = request["input"].as_array() {
+        input.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    } else {
+        request["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    serde_json::from_str(text.lines().last().unwrap()).unwrap()
 }
+
 fn exercise(protocol: Protocol, web: bool) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -366,14 +370,17 @@ fn exercise(protocol: Protocol, web: bool) {
     );
     assert!(!root.join("tools/denied.txt").exists());
     let store = JsonlSessionStore::new(root.join("sessions"));
-    let session = store.load(&SessionId::new(&id).unwrap()).unwrap();
-    assert_eq!(session.turns().len(), 2);
+    let archive = store.inspect(&SessionId::new(&id).unwrap()).unwrap();
+    assert_eq!(archive.session().turns().len(), 2);
+    assert_eq!(archive.generations().len(), 7);
     let persisted = fs::read_dir(root.join("sessions"))
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .unwrap();
     let content = fs::read_to_string(persisted).unwrap();
     for line in content.lines() {
         let _: Value = serde_json::from_str(line).unwrap();
@@ -411,10 +418,10 @@ fn exercise(protocol: Protocol, web: bool) {
         );
         assert_eq!(facts["candidate"], calls[index]);
         let executions = step["executions"].as_array().unwrap();
-        assert_eq!(executions[index]["state"]["kind"], "started");
+        assert_eq!(executions[index]["state"]["kind"], "requested");
         assert!(executions[index]["resolution"].is_null());
         for execution in &executions[index + 1..] {
-            assert_eq!(execution["state"]["kind"], "not_started");
+            assert_eq!(execution["state"]["kind"], "requested");
         }
         if index > 0 {
             assert_eq!(
@@ -436,13 +443,13 @@ fn exercise(protocol: Protocol, web: bool) {
     }
     let continued = requests[6].1.to_string();
     for expected in [
-        "native-0",
-        "native-3",
+        "read_file",
+        "write_file",
         "fixture-input",
         "fixture-output",
         "first turn complete",
         "Continue this session.",
-        "denied by review",
+        "denied",
     ] {
         assert!(
             continued.contains(expected),

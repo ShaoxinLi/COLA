@@ -1,43 +1,37 @@
 use super::client::{
-    self, Decoded, Event, OutputKind, Snapshot, WireCall, array, malformed, string, unsupported,
+    self, Decoded, Event, OutputKind, WireCall, array, malformed, string, unsupported,
 };
 use crate::app::{IncompleteReason, ModelError, ModelErrorKind, ModelSettings};
 use serde_json::{Value, json};
 
-pub(super) fn request(
-    snapshot: &Snapshot,
+pub(super) fn request<'a, O>(
+    plan: &crate::app::ContextPlan<O>,
     settings: &ModelSettings,
     effort: Option<&str>,
     kind: OutputKind,
-    events: Vec<Event<'_>>,
+    events: impl Iterator<Item = &'a Event>,
 ) -> Value {
     let decision = kind == OutputKind::Decision;
     let mut input = Vec::new();
-    if decision {
-        for text in client::review_history(snapshot) {
-            input.push(json!({"role":"user","content":text}));
-        }
-    } else {
-        for event in events {
-            match event {
-                Event::User(text) | Event::Fact(text) => {
-                    input.push(json!({"role": "user", "content": text}));
-                }
-                Event::Answer(text) => {
-                    input.push(json!({"role": "assistant", "content": text.as_str()}));
-                }
-                Event::Native(raw) => input.extend(raw.iter().cloned()),
-                Event::Result(id, result) => input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": id,
-                    "output": client::outcome(result.outcome()).to_string(),
-                })),
+    for event in events {
+        match event {
+            Event::User(text) => {
+                input.push(json!({"role": "user", "content": text}));
             }
+            Event::Answer(text) => {
+                input.push(json!({"role": "assistant", "content": text.as_str()}));
+            }
+            Event::Native(raw) => input.extend(raw.iter().cloned()),
+            Event::Result(result) => input.push(json!({
+                "type": "function_call_output",
+                "call_id": result.call_id().as_str(),
+                "output": client::outcome(result.outcome()).to_string(),
+            })),
         }
     }
     let mut body = json!({
         "model": settings.model_id.as_str(),
-        "instructions": client::instructions(snapshot, decision),
+        "instructions": client::instructions(plan, decision),
         "input": input,
         "max_output_tokens": settings.max_output_tokens.get(),
         "store": false,
@@ -51,10 +45,9 @@ pub(super) fn request(
             "type": "json_schema", "name": "decision", "strict": true,
             "schema": client::decision_schema(),
         }});
-    } else if !snapshot.tools.is_empty() {
+    } else if !plan.tools().is_empty() {
         body["tools"] = json!(
-            snapshot
-                .tools
+            plan.tools()
                 .iter()
                 .map(|tool| json!({
                     "type": "function",
@@ -166,12 +159,14 @@ impl std::fmt::Debug for OpenAIClient {
     }
 }
 impl<O: super::client::Output> crate::app::ModelClient<O> for OpenAIClient {
-    fn generate(
+    fn prepare(
         &self,
-        context: &crate::domain::Context<O>,
+        plan: &crate::app::ContextPlan<O>,
         settings: &ModelSettings,
-        continuation: Option<&crate::app::Continuation<O>>,
-    ) -> Result<crate::app::Generation<O>, ModelError> {
-        self.0.generate(context, settings, continuation)
+    ) -> Result<crate::app::PreparedRequest<O>, ModelError> {
+        self.0.prepare(plan, settings)
+    }
+    fn invoke(&self, request: &crate::app::PreparedRequest<O>) -> crate::app::ObservedReply<O> {
+        self.0.invoke(request)
     }
 }

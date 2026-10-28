@@ -243,5 +243,6 @@ mod tools {
 #[path = "adapters/api"]
 mod api {
     mod cli;
+    mod support;
     mod web;
 }

@@ -8,7 +8,7 @@ use std::{
     error::Error,
     io::{Read, Write},
     net::TcpListener,
-    num::{NonZeroU32, NonZeroUsize},
+    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -107,50 +107,195 @@ pub(super) fn user(s: &str) -> UserMessage {
 pub(super) fn tool() -> ToolDefinition {
     ToolDefinition::new(ToolName::new("lookup").unwrap(),text("Look up a value"),InputSchema::new(json!({"type":"object","properties":{"n":{"type":"integer","minimum":0}},"required":["n"],"additionalProperties":false})).unwrap())
 }
-pub(super) fn session() -> Session {
-    let mut s = Session::new(SessionId::new("fixture").unwrap());
-    s.start_turn(user("hello")).unwrap();
-    s
+pub(super) fn session() -> SessionArchive {
+    let mut archive = SessionArchive::new(SessionId::new("fixture").unwrap());
+    archive.session_mut().start_turn(user("hello")).unwrap();
+    archive
 }
-pub(super) fn context<O>(s: &Session) -> Context<O> {
-    Context::new(
-        text("Be useful"),
-        s.context_exchanges().unwrap(),
-        vec![tool()],
-    )
-    .unwrap()
-}
-pub(super) fn complete<O>(generation: Generation<O>) -> (O, Option<Continuation<O>>) {
-    match generation {
-        Generation::Complete {
-            output,
-            continuation,
-        } => (output, continuation),
-        other => panic!(
-            "expected complete, got {}",
-            match other {
-                Generation::Refused { .. } => "refused",
-                Generation::Incomplete { .. } => "incomplete",
-                _ => unreachable!(),
-            }
-        ),
+pub(super) fn limits() -> ContextLimits {
+    ContextLimits {
+        input_tokens: NonZeroU64::new(1_000_000).unwrap(),
+        request_bytes: NonZeroUsize::new(3_000_000).unwrap(),
     }
 }
-pub(super) fn accept(s: &mut Session, output: AssistantMessage) {
-    let turn = s.active_turn().unwrap().id();
-    let calls = output
-        .calls()
-        .map(|c| c.as_slice().to_vec())
-        .unwrap_or_default();
-    s.record_assistant(turn, output).unwrap();
-    for (i, call) in calls.iter().enumerate() {
-        s.start_tool(turn, call.id()).unwrap();
-        let outcome = if i == 0 {
+pub(super) trait FixtureOutput: Sized {
+    fn context(
+        archive: &SessionArchive,
+        instructions: NonEmptyText,
+        tools: Vec<ToolDefinition>,
+        limits: ContextLimits,
+        required: &[TurnId],
+    ) -> ContextPlan<Self>;
+}
+impl FixtureOutput for AssistantMessage {
+    fn context(
+        archive: &SessionArchive,
+        instructions: NonEmptyText,
+        tools: Vec<ToolDefinition>,
+        limits: ContextLimits,
+        required: &[TurnId],
+    ) -> ContextPlan<Self> {
+        ContextPlan::assistant(archive, instructions, tools, limits, required).unwrap()
+    }
+}
+impl FixtureOutput for Decision {
+    fn context(
+        archive: &SessionArchive,
+        instructions: NonEmptyText,
+        tools: Vec<ToolDefinition>,
+        limits: ContextLimits,
+        required: &[TurnId],
+    ) -> ContextPlan<Self> {
+        let mut archive = archive.clone();
+        if archive.session().next_action() == NextAction::AskModel {
+            let call = ToolCall::new(
+                ToolCallId::new("candidate").unwrap(),
+                ToolName::new("lookup").unwrap(),
+                json!({"n":9}),
+            )
+            .unwrap();
+            record_output(
+                &mut archive,
+                AssistantMessage::tool_requests(None, ToolCalls::new(vec![call]).unwrap()),
+            );
+        }
+        let NextAction::Review(call) = archive.session().next_action() else {
+            panic!("expected pending review")
+        };
+        ContextPlan::reviewer(&archive, &call, instructions, tools, limits, required).unwrap()
+    }
+}
+pub(super) fn context<O: FixtureOutput>(archive: &SessionArchive) -> ContextPlan<O> {
+    O::context(archive, text("Be useful"), vec![tool()], limits(), &[])
+}
+pub(super) trait TestRequest<O>: ModelClient<O> {
+    fn request(
+        &self,
+        plan: &ContextPlan<O>,
+        settings: &ModelSettings,
+    ) -> Result<Generation<O>, ModelError> {
+        let prepared = self.prepare(plan, settings)?;
+        self.invoke(&prepared).result
+    }
+}
+impl<O, T: ModelClient<O> + ?Sized> TestRequest<O> for T {}
+pub(super) fn complete<O>(generation: Generation<O>) -> O {
+    match generation {
+        Generation::Complete(output) => output,
+        _ => panic!("expected complete"),
+    }
+}
+pub(super) fn record_output(
+    archive: &mut SessionArchive,
+    output: AssistantMessage,
+) -> GenerationId {
+    let plan = context::<AssistantMessage>(archive);
+    let fitted = plan.fit(|_| json!({"fixture":true})).unwrap();
+    let prepared = PreparedRequest::<AssistantMessage>::new(
+        ModelTarget::new("fixture", "memory"),
+        Provider::OpenAI.settings(),
+        fitted,
+    );
+    let turn = archive.session().active_turn().unwrap().id();
+    let generation = archive
+        .begin_generation(InvocationRole::Assistant { turn }, &prepared)
+        .unwrap();
+    archive
+        .session_mut()
+        .record_assistant(turn, generation, output)
+        .unwrap();
+    archive
+        .record_observation(
+            generation,
+            Timestamp::now(),
+            ResponseReceipt {
+                capture: ResponseCapture::Complete(b"{}".to_vec()),
+                ..ResponseReceipt::default()
+            },
+            Disposition::Accepted,
+        )
+        .unwrap();
+    generation
+}
+pub(super) fn invoke_assistant(
+    p: Provider,
+    client: &dyn ModelClient<AssistantMessage>,
+    archive: &mut SessionArchive,
+) -> AssistantMessage {
+    let prepared = client.prepare(&context(archive), &p.settings()).unwrap();
+    let turn = archive.session().active_turn().unwrap().id();
+    let generation = archive
+        .begin_generation(InvocationRole::Assistant { turn }, &prepared)
+        .unwrap();
+    let observed = client.invoke(&prepared);
+    let output = complete(observed.result.unwrap());
+    archive
+        .session_mut()
+        .record_assistant(turn, generation, output.clone())
+        .unwrap();
+    archive
+        .record_observation(
+            generation,
+            observed.at,
+            observed.receipt,
+            Disposition::Accepted,
+        )
+        .unwrap();
+    output
+}
+pub(super) fn review(archive: &mut SessionArchive, call: &CallRef, allow: bool) {
+    let plan = context::<Decision>(archive);
+    let prepared = PreparedRequest::<Decision>::new(
+        ModelTarget::new("fixture", "memory"),
+        Provider::OpenAI.settings(),
+        plan.fit(|_| json!({"review":true})).unwrap(),
+    );
+    let generation = archive
+        .begin_generation(InvocationRole::Reviewer { call: call.clone() }, &prepared)
+        .unwrap();
+    let turn = archive.session().active_turn().unwrap().id();
+    archive
+        .session_mut()
+        .review_tool(turn, call, generation, &Decision::new(allow, None))
+        .unwrap();
+    archive
+        .record_observation(
+            generation,
+            Timestamp::now(),
+            ResponseReceipt {
+                capture: ResponseCapture::Complete(b"{}".to_vec()),
+                ..ResponseReceipt::default()
+            },
+            Disposition::Accepted,
+        )
+        .unwrap();
+}
+pub(super) fn accept_tools(archive: &mut SessionArchive) {
+    let turn = archive.session().active_turn().unwrap().id();
+    let calls: Vec<_> = archive
+        .session()
+        .active_turn()
+        .unwrap()
+        .steps()
+        .last()
+        .unwrap()
+        .executions()
+        .map(|execution| execution.call_ref())
+        .collect();
+    for (index, call) in calls.iter().enumerate() {
+        review(archive, call, true);
+        archive
+            .session_mut()
+            .start_tool(turn, call, Timestamp::now())
+            .unwrap();
+        let outcome = if index == 0 {
             ToolOutcome::Success(String::new())
         } else {
             ToolOutcome::Failure(ToolError::new(text("tool failed")))
         };
-        s.record_tool_result(turn, ToolResult::new(call.id().clone(), outcome))
+        archive
+            .session_mut()
+            .record_tool_result(turn, call, outcome, Timestamp::now())
             .unwrap();
     }
 }

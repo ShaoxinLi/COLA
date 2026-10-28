@@ -1,6 +1,7 @@
 use super::{
-    AssistantMessage, Message, NonEmptyText, SessionId, ToolCall, ToolCallId, ToolCalls, ToolName,
-    ToolOutcome, ToolResult, TurnId, UserMessage, ValueError,
+    AssistantMessage, CallRef, Decision, GenerationId, Message, NonEmptyText, SessionId, Timestamp,
+    ToolCall, ToolCallId, ToolCalls, ToolError, ToolName, ToolOutcome, ToolResult, TurnId,
+    UserMessage, ValueError,
 };
 use serde_json::Value;
 use std::{error::Error, fmt};
@@ -24,12 +25,75 @@ pub enum TurnOutcome {
     Failed(TurnFailure),
 }
 
-/// `Started` records dispatch intent before I/O. After closure its effect is unknown.
+/// A reviewer generation and its stated reason. The enclosing state says whether it allowed the call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Review {
+    reviewer: GenerationId,
+    reason: Option<NonEmptyText>,
+}
+impl Review {
+    pub fn new(reviewer: GenerationId, reason: Option<NonEmptyText>) -> Self {
+        Self { reviewer, reason }
+    }
+    pub fn reviewer(&self) -> GenerationId {
+        self.reviewer
+    }
+    pub fn reason(&self) -> Option<&NonEmptyText> {
+        self.reason.as_ref()
+    }
+}
+
+/// Review is separate from dispatch. `Started` is recorded immediately before the tool runs,
+/// so a `Started` call without a return has an unknown effect. Earlier states prove the
+/// target was not dispatched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionState {
-    NotStarted,
-    Started,
-    Returned(ToolOutcome),
+    Requested,
+    Denied(Review),
+    Approved(Review),
+    Started {
+        review: Review,
+        at: Timestamp,
+    },
+    Returned {
+        review: Review,
+        started_at: Timestamp,
+        at: Timestamp,
+        outcome: ToolOutcome,
+    },
+}
+impl ExecutionState {
+    pub fn review(&self) -> Option<&Review> {
+        match self {
+            Self::Requested => None,
+            Self::Denied(review)
+            | Self::Approved(review)
+            | Self::Started { review, .. }
+            | Self::Returned { review, .. } => Some(review),
+        }
+    }
+    /// The result reported to the model: the actual return, or the controller's denial.
+    pub fn protocol_outcome(&self) -> Option<ToolOutcome> {
+        match self {
+            Self::Returned { outcome, .. } => Some(outcome.clone()),
+            Self::Denied(review) => {
+                let reason = review
+                    .reason()
+                    .map(NonEmptyText::as_str)
+                    .unwrap_or("Review denied the call without providing a reason.");
+                Some(ToolOutcome::Failure(ToolError::new(
+                    NonEmptyText::new(format!(
+                        "Not executed: tool call denied by review. Reason: {reason}"
+                    ))
+                    .expect("nonblank denial"),
+                )))
+            }
+            _ => None,
+        }
+    }
+    fn settled(&self) -> bool {
+        matches!(self, Self::Denied(_) | Self::Returned { .. })
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectDisposition {
@@ -83,12 +147,16 @@ struct ExecutionRecord {
 /// Read-only access to a call and its separate execution facts.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolExecution<'a> {
+    generation: GenerationId,
     call: &'a ToolCall,
     record: &'a ExecutionRecord,
 }
 impl<'a> ToolExecution<'a> {
     pub fn call(self) -> &'a ToolCall {
         self.call
+    }
+    pub fn call_ref(self) -> CallRef {
+        CallRef::new(self.generation, self.call.id().clone())
     }
     pub fn state(self) -> &'a ExecutionState {
         &self.record.state
@@ -98,27 +166,34 @@ impl<'a> ToolExecution<'a> {
     }
 }
 
+/// Accepted assistant output and the execution facts of its calls. `source_generation`
+/// is the only link between the accepted output and the invocation that produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
+    source: GenerationId,
     assistant: AssistantMessage,
     executions: Vec<ExecutionRecord>,
 }
 impl Step {
-    fn new(assistant: AssistantMessage) -> Self {
+    fn new(source: GenerationId, assistant: AssistantMessage) -> Self {
         let executions = assistant.calls().map_or_else(Vec::new, |calls| {
             calls
                 .as_slice()
                 .iter()
                 .map(|_| ExecutionRecord {
-                    state: ExecutionState::NotStarted,
+                    state: ExecutionState::Requested,
                     resolution: None,
                 })
                 .collect()
         });
         Self {
+            source,
             assistant,
             executions,
         }
+    }
+    pub fn source_generation(&self) -> GenerationId {
+        self.source
     }
     pub fn assistant(&self) -> &AssistantMessage {
         &self.assistant
@@ -127,87 +202,124 @@ impl Step {
         self.calls()
             .iter()
             .zip(&self.executions)
-            .map(|(call, record)| ToolExecution { call, record })
+            .map(|(call, record)| ToolExecution {
+                generation: self.source,
+                call,
+                record,
+            })
     }
     fn calls(&self) -> &[ToolCall] {
         self.assistant.calls().map_or(&[], ToolCalls::as_slice)
     }
-    fn call_index(&self, call_id: &ToolCallId) -> Option<usize> {
-        self.calls().iter().position(|call| call.id() == call_id)
+    fn call_index(&self, call: &CallRef) -> Result<usize, SessionError> {
+        if call.generation() != self.source {
+            return Err(SessionError::UnknownCall);
+        }
+        self.calls()
+            .iter()
+            .position(|c| c.id() == call.call_id())
+            .ok_or(SessionError::UnknownCall)
     }
     fn pending_index(&self) -> Option<usize> {
-        self.executions
-            .iter()
-            .position(|e| !matches!(e.state, ExecutionState::Returned(_)))
+        self.executions.iter().position(|e| !e.state.settled())
     }
     fn next_action(&self) -> NextAction {
-        match self.pending_index() {
-            None => NextAction::AskModel,
-            Some(index) => match self.executions[index].state {
-                ExecutionState::NotStarted => NextAction::Execute(self.calls()[index].id().clone()),
-                ExecutionState::Started => NextAction::AwaitTool,
-                ExecutionState::Returned(_) => unreachable!("pending_index excludes returns"),
-            },
+        let Some(index) = self.pending_index() else {
+            return NextAction::AskModel;
+        };
+        let call = CallRef::new(self.source, self.calls()[index].id().clone());
+        match self.executions[index].state {
+            ExecutionState::Requested => NextAction::Review(call),
+            ExecutionState::Approved(_) => NextAction::Execute(call),
+            _ => NextAction::AwaitTool,
         }
     }
-    fn start_tool(&mut self, call_id: &ToolCallId) -> Result<&ToolCall, SessionError> {
-        let index = self.call_index(call_id).ok_or(SessionError::UnknownCall)?;
-        match self.executions[index].state {
-            ExecutionState::Started => return Err(SessionError::AlreadyStarted),
-            ExecutionState::Returned(_) => return Err(SessionError::AlreadyReturned),
-            ExecutionState::NotStarted => {}
-        }
-        if self.pending_index() != Some(index) {
+    fn next_index(&self, call: &CallRef) -> Result<usize, SessionError> {
+        let index = self.call_index(call)?;
+        if self.pending_index() != Some(index) && !self.executions[index].state.settled() {
             return Err(SessionError::OutOfOrder);
         }
-        self.executions[index].state = ExecutionState::Started;
+        Ok(index)
+    }
+    fn review(&mut self, call: &CallRef, review: Review, allow: bool) -> Result<(), SessionError> {
+        let index = self.next_index(call)?;
+        let state = &mut self.executions[index].state;
+        if *state != ExecutionState::Requested {
+            return Err(SessionError::AlreadyReviewed);
+        }
+        *state = if allow {
+            ExecutionState::Approved(review)
+        } else {
+            ExecutionState::Denied(review)
+        };
+        Ok(())
+    }
+    fn start_tool(&mut self, call: &CallRef, at: Timestamp) -> Result<&ToolCall, SessionError> {
+        let index = self.next_index(call)?;
+        let state = &mut self.executions[index].state;
+        let review = match state {
+            ExecutionState::Approved(review) => review.clone(),
+            ExecutionState::Requested | ExecutionState::Denied(_) => {
+                return Err(SessionError::NotApproved);
+            }
+            ExecutionState::Started { .. } => return Err(SessionError::AlreadyStarted),
+            ExecutionState::Returned { .. } => return Err(SessionError::AlreadyReturned),
+        };
+        *state = ExecutionState::Started { review, at };
         Ok(&self.calls()[index])
     }
-    fn record_tool_result(&mut self, result: ToolResult) -> Result<(), SessionError> {
-        let index = self
-            .call_index(result.call_id())
-            .ok_or(SessionError::UnknownCall)?;
-        match self.executions[index].state {
-            ExecutionState::NotStarted => return Err(SessionError::NotStarted),
-            ExecutionState::Returned(_) => return Err(SessionError::AlreadyReturned),
-            ExecutionState::Started => {}
-        }
-        self.executions[index].state = ExecutionState::Returned(result.outcome().clone());
+    fn record_tool_result(
+        &mut self,
+        call: &CallRef,
+        outcome: ToolOutcome,
+        at: Timestamp,
+    ) -> Result<(), SessionError> {
+        let index = self.call_index(call)?;
+        let state = &mut self.executions[index].state;
+        let (review, started_at) = match state {
+            ExecutionState::Started { review, at } => (review.clone(), *at),
+            ExecutionState::Returned { .. } => return Err(SessionError::AlreadyReturned),
+            _ => return Err(SessionError::NotStarted),
+        };
+        *state = ExecutionState::Returned {
+            review,
+            started_at,
+            at,
+            outcome,
+        };
         Ok(())
     }
     fn resolve_effect(
         &mut self,
-        call_id: &ToolCallId,
+        call: &CallRef,
         resolution: &EffectResolution,
-    ) -> Option<Result<(), SessionError>> {
-        let index = self.call_index(call_id)?;
+    ) -> Result<(), SessionError> {
+        let index = self.call_index(call)?;
         let execution = &mut self.executions[index];
-        if execution.state != ExecutionState::Started {
-            return Some(Err(SessionError::EffectNotUnknown));
+        if !matches!(execution.state, ExecutionState::Started { .. }) {
+            return Err(SessionError::EffectNotUnknown);
         }
         match &execution.resolution {
-            Some(prior) if prior != resolution => {
-                return Some(Err(SessionError::ConflictingResolution));
+            Some(prior) if prior != resolution => Err(SessionError::ConflictingResolution),
+            Some(_) => Ok(()),
+            None => {
+                execution.resolution = Some(resolution.clone());
+                Ok(())
             }
-            Some(_) => {}
-            None => execution.resolution = Some(resolution.clone()),
         }
-        Some(Ok(()))
     }
-    pub(crate) fn messages(&self) -> Vec<Message> {
+    /// The assistant message followed by each call's protocol result, actual or denial.
+    pub fn messages(&self) -> Vec<Message> {
         let mut messages = vec![Message::Assistant(self.assistant.clone())];
         for execution in self.executions() {
-            if let ExecutionState::Returned(outcome) = execution.state() {
+            if let Some(outcome) = execution.state().protocol_outcome() {
                 messages.push(Message::Tool(ToolResult::new(
                     execution.call().id().clone(),
-                    outcome.clone(),
+                    outcome,
                 )));
             }
         }
         messages
-    }
-    pub(crate) fn all_returned(&self) -> bool {
-        self.pending_index().is_none()
     }
 }
 
@@ -264,7 +376,8 @@ impl Turn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NextAction {
     AskModel,
-    Execute(ToolCallId),
+    Review(CallRef),
+    Execute(CallRef),
     AwaitTool,
     AwaitUser,
 }
@@ -279,10 +392,15 @@ pub enum SessionError {
     NotAwaitingModel,
     UnknownCall,
     OutOfOrder,
+    AlreadyReviewed,
+    NotApproved,
     AlreadyStarted,
     NotStarted,
     AlreadyReturned,
     DuplicateCallId(ToolCallId),
+    DuplicateGeneration(GenerationId),
+    InvalidGeneration(GenerationId),
+    DuplicateTool(ToolName),
     EffectNotUnknown,
     ConflictingResolution,
 }
@@ -299,12 +417,21 @@ impl fmt::Display for SessionError {
             Self::UnknownCall => {
                 f.write_str("the call does not belong to the current batch or selected turn")
             }
-            Self::OutOfOrder => f.write_str("calls must execute in declaration order"),
+            Self::OutOfOrder => f.write_str("calls must be reviewed and run in declaration order"),
+            Self::AlreadyReviewed => f.write_str("the call has already been reviewed"),
+            Self::NotApproved => f.write_str("the call has not been approved"),
             Self::AlreadyStarted => f.write_str("the call has already started"),
             Self::NotStarted => f.write_str("the call has not started"),
             Self::AlreadyReturned => f.write_str("the call already has a result"),
             Self::DuplicateCallId(id) => {
-                write!(f, "tool call ID {id} was already used in this session")
+                write!(f, "tool call ID {id} was already used in the active turn")
+            }
+            Self::DuplicateGeneration(id) => {
+                write!(f, "generation {} already produced a step", id.get())
+            }
+            Self::DuplicateTool(name) => write!(f, "duplicate tool definition {name}"),
+            Self::InvalidGeneration(id) => {
+                write!(f, "generation {} is not an accepted source", id.get())
             }
             Self::EffectNotUnknown => {
                 f.write_str("only a closed call with unknown effect can be resolved")
@@ -342,7 +469,6 @@ impl Session {
         self.active.as_ref()
     }
     /// A factual history projection. It can contain unresolved tool requests.
-    /// Use `context_exchanges` when constructing model input.
     pub fn messages(&self) -> Vec<Message> {
         self.records().flat_map(TurnRecord::messages).collect()
     }
@@ -361,6 +487,13 @@ impl Session {
             Some(_) => Err(SessionError::WrongTurn),
             None => Err(SessionError::NoActiveTurn),
         }
+    }
+    fn current_step(&mut self, id: TurnId) -> Result<&mut Step, SessionError> {
+        self.active(id)?
+            .record
+            .steps
+            .last_mut()
+            .ok_or(SessionError::UnknownCall)
     }
     pub fn start_turn(&mut self, user: UserMessage) -> Result<TurnId, SessionError> {
         if self.active.is_some() {
@@ -390,20 +523,27 @@ impl Session {
         };
         step.next_action()
     }
+    /// Call IDs must be new within the active turn, whose calls form one native protocol
+    /// bundle. Closed turns may have used the same IDs.
     pub fn record_assistant(
         &mut self,
         id: TurnId,
+        source: GenerationId,
         message: AssistantMessage,
     ) -> Result<(), SessionError> {
-        self.active(id)?;
-        if self.next_action() != NextAction::AskModel {
+        let active = self.active(id)?;
+        if active
+            .steps()
+            .last()
+            .is_some_and(|step| step.pending_index().is_some())
+        {
             return Err(SessionError::NotAwaitingModel);
         }
         if let Some(calls) = message.calls() {
             for call in calls.as_slice() {
-                if self
-                    .records()
-                    .flat_map(|r| &r.steps)
+                if active
+                    .steps()
+                    .iter()
                     .flat_map(Step::calls)
                     .any(|prior| prior.id() == call.id())
                 {
@@ -411,45 +551,57 @@ impl Session {
                 }
             }
         }
+        if self
+            .records()
+            .flat_map(|record| &record.steps)
+            .any(|step| step.source == source)
+        {
+            return Err(SessionError::DuplicateGeneration(source));
+        }
         let completed = matches!(message, AssistantMessage::Answer(_));
         self.active
             .as_mut()
             .expect("validated active turn")
             .record
             .steps
-            .push(Step::new(message));
+            .push(Step::new(source, message));
         if completed {
             self.close(TurnOutcome::Completed);
         }
         Ok(())
     }
+    /// Records the reviewer's decision. Neither approval nor denial dispatches the target.
+    pub fn review_tool(
+        &mut self,
+        id: TurnId,
+        call: &CallRef,
+        reviewer: GenerationId,
+        decision: &Decision,
+    ) -> Result<(), SessionError> {
+        self.current_step(id)?.review(
+            call,
+            Review::new(reviewer, decision.reason().cloned()),
+            decision.should_allow(),
+        )
+    }
     /// Records dispatch intent before returning call data. No tool is executed here.
-    /// A crash after this transition can leave an unknown effect even before I/O.
+    /// A crash after this transition leaves an unknown effect even before I/O.
     pub fn start_tool(
         &mut self,
         id: TurnId,
-        call_id: &ToolCallId,
+        call: &CallRef,
+        at: Timestamp,
     ) -> Result<&ToolCall, SessionError> {
-        let active = self.active(id)?;
-        let step = active
-            .record
-            .steps
-            .last_mut()
-            .ok_or(SessionError::UnknownCall)?;
-        step.start_tool(call_id)
+        self.current_step(id)?.start_tool(call, at)
     }
     pub fn record_tool_result(
         &mut self,
         id: TurnId,
-        result: ToolResult,
+        call: &CallRef,
+        outcome: ToolOutcome,
+        at: Timestamp,
     ) -> Result<(), SessionError> {
-        let active = self.active(id)?;
-        let step = active
-            .record
-            .steps
-            .last_mut()
-            .ok_or(SessionError::UnknownCall)?;
-        step.record_tool_result(result)
+        self.current_step(id)?.record_tool_result(call, outcome, at)
     }
     pub fn interrupt(&mut self, id: TurnId, reason: StopReason) -> Result<(), SessionError> {
         self.active(id)?;
@@ -473,7 +625,7 @@ impl Session {
     pub fn resolve_effect(
         &mut self,
         id: TurnId,
-        call_id: &ToolCallId,
+        call: &CallRef,
         resolution: EffectResolution,
     ) -> Result<(), SessionError> {
         if self.active.as_ref().is_some_and(|turn| turn.id() == id) {
@@ -487,8 +639,9 @@ impl Session {
         turn.record
             .steps
             .iter_mut()
-            .find_map(|step| step.resolve_effect(call_id, &resolution))
-            .unwrap_or(Err(SessionError::UnknownCall))
+            .find(|step| step.source == call.generation())
+            .ok_or(SessionError::UnknownCall)?
+            .resolve_effect(call, &resolution)
     }
 }
 
@@ -509,6 +662,7 @@ pub struct TurnSnapshot {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StepSnapshot {
+    pub source_generation: u64,
     pub assistant: AssistantSnapshot,
     pub executions: Vec<ExecutionSnapshot>,
 }
@@ -584,7 +738,7 @@ impl Session {
         }
     }
     /// Validates snapshots by replaying the same public state transitions.
-    /// Formerly active work is closed as `Interrupted(ProcessLost)`, never resumed.
+    /// An active turn stays active; only explicit recovery closes it.
     pub fn restore(snapshot: SessionSnapshot) -> Result<Self, RestoreError> {
         let mut session = Self::new(SessionId::new(snapshot.session_id)?);
         for turn in snapshot.turns {
@@ -595,12 +749,8 @@ impl Session {
         }
         Ok(session)
     }
-    fn restore_turn(
-        &mut self,
-        snapshot: TurnSnapshot,
-        formerly_active: bool,
-    ) -> Result<(), RestoreError> {
-        if formerly_active != snapshot.outcome.is_none() {
+    fn restore_turn(&mut self, snapshot: TurnSnapshot, active: bool) -> Result<(), RestoreError> {
+        if active != snapshot.outcome.is_none() {
             return Err(RestoreError::InvalidSnapshot(
                 "closed and active outcome mismatch",
             ));
@@ -614,6 +764,12 @@ impl Session {
         }
         let mut resolutions = vec![];
         for step in snapshot.steps {
+            if self.active.is_none() {
+                return Err(RestoreError::InvalidSnapshot(
+                    "an answer must be the last step",
+                ));
+            }
+            let source = GenerationId::new(step.source_generation)?;
             let message = match step.assistant {
                 AssistantSnapshot::Answer(text) => AssistantMessage::answer(text)?,
                 AssistantSnapshot::ToolRequests { text, calls } => {
@@ -630,64 +786,81 @@ impl Session {
                     AssistantMessage::tool_requests(text, ToolCalls::new(calls)?)
                 }
             };
-            let call_ids: Vec<_> = message
+            let calls: Vec<_> = message
                 .calls()
                 .map_or(&[][..], ToolCalls::as_slice)
                 .iter()
-                .map(|call| call.id().clone())
+                .map(|call| CallRef::new(source, call.id().clone()))
                 .collect();
-            if call_ids.len() != step.executions.len() {
+            if calls.len() != step.executions.len() {
                 return Err(RestoreError::InvalidSnapshot(
                     "call and execution counts differ",
                 ));
             }
-            for (call_id, execution) in call_ids.iter().zip(&step.executions) {
-                if call_id.as_str() != execution.call_id {
+            for (call, execution) in calls.iter().zip(&step.executions) {
+                if call.call_id().as_str() != execution.call_id {
                     return Err(RestoreError::InvalidSnapshot(
                         "call and execution IDs differ",
                     ));
                 }
                 if execution.resolution.is_some()
-                    && (formerly_active || execution.state != ExecutionState::Started)
+                    && (active || !matches!(execution.state, ExecutionState::Started { .. }))
                 {
                     return Err(RestoreError::InvalidSnapshot(
                         "resolution requires a closed unknown effect",
                     ));
                 }
             }
-            self.record_assistant(id, message)?;
-            for (call_id, execution) in call_ids.into_iter().zip(step.executions) {
-                match execution.state {
-                    ExecutionState::NotStarted => {}
-                    ExecutionState::Started => {
-                        self.start_tool(id, &call_id)?;
-                    }
-                    ExecutionState::Returned(outcome) => {
-                        self.start_tool(id, &call_id)?;
-                        self.record_tool_result(id, ToolResult::new(call_id.clone(), outcome))?;
-                    }
-                }
+            self.record_assistant(id, source, message)?;
+            for (call, execution) in calls.into_iter().zip(step.executions) {
+                self.restore_execution(id, &call, execution.state)?;
                 if let Some(resolution) = execution.resolution {
-                    resolutions.push((call_id, resolution));
+                    resolutions.push((call, resolution));
                 }
             }
         }
         match snapshot.outcome {
-            Some(TurnOutcome::Completed) => {
-                if self.active.is_some() {
+            Some(TurnOutcome::Completed) | None => {
+                if self.active.is_some() == snapshot.outcome.is_some() {
                     return Err(RestoreError::InvalidSnapshot(
-                        "completed turn must end with an answer",
+                        "only a completed turn ends with an answer",
                     ));
                 }
             }
             Some(TurnOutcome::Interrupted(reason)) => self.interrupt(id, reason)?,
             Some(TurnOutcome::Failed(failure)) => self.fail(id, failure)?,
-            None => self.interrupt(id, StopReason::ProcessLost)?,
         }
-        for (call_id, resolution) in resolutions {
-            self.resolve_effect(id, &call_id, resolution)?;
+        for (call, resolution) in resolutions {
+            self.resolve_effect(id, &call, resolution)?;
         }
         Ok(())
+    }
+    fn restore_execution(
+        &mut self,
+        id: TurnId,
+        call: &CallRef,
+        state: ExecutionState,
+    ) -> Result<(), SessionError> {
+        let step = self.current_step(id)?;
+        match state {
+            ExecutionState::Requested => Ok(()),
+            ExecutionState::Denied(review) => step.review(call, review, false),
+            ExecutionState::Approved(review) => step.review(call, review, true),
+            ExecutionState::Started { review, at } => {
+                step.review(call, review, true)?;
+                step.start_tool(call, at).map(|_| ())
+            }
+            ExecutionState::Returned {
+                review,
+                started_at,
+                at,
+                outcome,
+            } => {
+                step.review(call, review, true)?;
+                step.start_tool(call, started_at)?;
+                step.record_tool_result(call, outcome, at)
+            }
+        }
     }
 }
 fn snapshot_turn(record: &TurnRecord, outcome: Option<TurnOutcome>) -> TurnSnapshot {
@@ -699,6 +872,7 @@ fn snapshot_turn(record: &TurnRecord, outcome: Option<TurnOutcome>) -> TurnSnaps
             .steps
             .iter()
             .map(|step| StepSnapshot {
+                source_generation: step.source.get(),
                 assistant: match step.assistant() {
                     AssistantMessage::Answer(text) => {
                         AssistantSnapshot::Answer(text.as_str().into())

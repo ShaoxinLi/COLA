@@ -1,65 +1,156 @@
 use crate::{
-    app::{SessionStore, SessionStoreError, SessionStoreErrorKind},
-    domain::{
-        AssistantSnapshot, EffectDisposition, EffectResolution, ExecutionSnapshot, ExecutionState,
-        NonEmptyText, ResolutionSource, Session, SessionId, SessionSnapshot, StepSnapshot,
-        StopReason, ToolCallSnapshot, ToolError, ToolOutcome, TurnFailure, TurnOutcome,
-        TurnSnapshot,
+    app::{
+        ArchiveChange, CommitFault, SessionArchive, SessionStore, SessionStoreError,
+        SessionStoreErrorKind, SessionTransaction,
     },
+    domain::SessionId,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     error::Error,
-    fmt, fs,
+    fmt,
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, Write},
     path::{Path, PathBuf},
 };
 
-/// Complete per-session snapshots published by same-directory replacement.
-/// Concurrent saves use the last rename; there is no stale-write detection.
+/// Atomic snapshots with stable sibling OS locks and checked stale-writer guards.
 #[derive(Clone, Debug)]
 pub struct JsonlSessionStore {
     root: PathBuf,
 }
 impl JsonlSessionStore {
-    /// Chooses the root without accessing the filesystem.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
+    }
+    fn path(&self, id: &SessionId) -> PathBuf {
+        self.root.join(filename(id.as_str()))
+    }
+    fn lock(&self, id: &SessionId) -> Result<File, SessionStoreError> {
+        fs::create_dir_all(&self.root).map_err(storage)?;
+        let path = self
+            .root
+            .join(format!("{:x}.lock", Sha256::digest(id.as_str().as_bytes())));
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(storage)
+            .map_err(|error| context(error, &path))?;
+        lock.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => SessionStoreError::new(
+                SessionStoreErrorKind::Busy,
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "session is owned by another transaction",
+                ),
+            ),
+            TryLockError::Error(error) => storage(error),
+        })?;
+        Ok(lock)
     }
     fn read(
         &self,
         path: &Path,
         requested: Option<&SessionId>,
-    ) -> Result<Session, SessionStoreError> {
+    ) -> Result<SessionArchive, SessionStoreError> {
         let bytes = fs::read(path)
             .map_err(read_error)
-            .map_err(|e| context(e, path.display().to_string()))?;
-        let snapshot = decode(&bytes).map_err(|e| context(e, path.display().to_string()))?;
-        if path.file_name().and_then(|s| s.to_str())
-            != Some(filename(&snapshot.session_id).as_str())
-            || requested.is_some_and(|id| id.as_str() != snapshot.session_id)
+            .map_err(|error| context(error, path))?;
+        let archive = SessionArchive::decode(&bytes).map_err(|error| context(error, path))?;
+        if path.file_name().and_then(|name| name.to_str())
+            != Some(filename(archive.session().id().as_str()).as_str())
+            || requested.is_some_and(|id| id != archive.session().id())
         {
             return Err(context(
                 invalid("session identity does not match its file"),
-                path.display().to_string(),
+                path,
             ));
         }
-        Session::restore(snapshot).map_err(|e| {
-            context(
-                SessionStoreError::new(SessionStoreErrorKind::InvalidData, e),
-                path.display().to_string(),
-            )
-        })
+        Ok(archive)
+    }
+    fn sync(&self, path: &Path) -> Result<(), SessionStoreError> {
+        // A fresh owner cannot treat a predecessor's visible rename as durable without this barrier.
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(storage)
+            .map_err(|error| context(error, path))?;
+        #[cfg(test)]
+        fault(FaultPoint::DirectorySync).map_err(storage)?;
+        File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(storage)
+            .map_err(|error| context(error, &self.root))
+    }
+    fn publish(
+        &self,
+        path: &Path,
+        change: &ArchiveChange,
+        initial: bool,
+    ) -> Result<(), CommitFault> {
+        #[cfg(test)]
+        fault(FaultPoint::BeforeTempfile)
+            .map_err(storage)
+            .map_err(CommitFault::NotPublished)?;
+        let mut staged = tempfile::Builder::new()
+            .prefix(".cola-")
+            .suffix(".tmp")
+            .tempfile_in(&self.root)
+            .map_err(storage)
+            .map_err(CommitFault::NotPublished)?;
+        #[cfg(test)]
+        fault(FaultPoint::BeforeWrite)
+            .map_err(storage)
+            .map_err(CommitFault::NotPublished)?;
+        staged
+            .write_all(change.encoded())
+            .map_err(storage)
+            .map_err(CommitFault::NotPublished)?;
+        #[cfg(test)]
+        fault(FaultPoint::BeforeFileSync)
+            .map_err(storage)
+            .map_err(CommitFault::NotPublished)?;
+        staged
+            .as_file()
+            .sync_all()
+            .map_err(storage)
+            .map_err(CommitFault::NotPublished)?;
+        #[cfg(test)]
+        fault(FaultPoint::BeforeRename)
+            .map_err(storage)
+            .map_err(CommitFault::NotPublished)?;
+        #[cfg(test)]
+        fault(FaultPoint::RenameError)
+            .map_err(storage)
+            .map_err(CommitFault::Uncertain)?;
+        if initial {
+            staged.persist_noclobber(path).map_err(|error| {
+                if error.error.kind() == io::ErrorKind::AlreadyExists {
+                    CommitFault::Conflict
+                } else {
+                    CommitFault::Uncertain(context(storage(error.error), path))
+                }
+            })?;
+        } else {
+            staged
+                .persist(path)
+                .map_err(|error| CommitFault::Uncertain(context(storage(error.error), path)))?;
+        }
+        #[cfg(test)]
+        fault(FaultPoint::AfterRename)
+            .map_err(storage)
+            .map_err(CommitFault::Uncertain)?;
+        self.sync(path).map_err(CommitFault::Uncertain)
     }
 }
 impl SessionStore for JsonlSessionStore {
-    fn list(&self) -> Result<Vec<Session>, SessionStoreError> {
+    fn list(&self) -> Result<Vec<SessionArchive>, SessionStoreError> {
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(storage(e)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(error) => return Err(storage(error)),
         };
         let mut paths = vec![];
         for entry in entries {
@@ -69,39 +160,136 @@ impl SessionStore for JsonlSessionStore {
             }
         }
         paths.sort();
-        let mut sessions = paths
+        let mut archives = paths
             .iter()
-            .map(|p| self.read(p, None))
+            .map(|path| self.read(path, None))
             .collect::<Result<Vec<_>, _>>()?;
-        sessions.sort_by(|a, b| a.id().cmp(b.id()));
-        Ok(sessions)
+        archives.sort_by(|left, right| left.session().id().cmp(right.session().id()));
+        Ok(archives)
     }
-    fn save(&self, session: &Session) -> Result<(), SessionStoreError> {
-        fs::create_dir_all(&self.root).map_err(storage)?;
-        let path = self.root.join(filename(session.id().as_str()));
-        match self.read(&path, Some(session.id())) {
-            Ok(_) => {}
-            Err(e) if e.kind() == SessionStoreErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+    fn inspect(&self, id: &SessionId) -> Result<SessionArchive, SessionStoreError> {
+        self.read(&self.path(id), Some(id))
+    }
+    fn create(&self, initial: &ArchiveChange) -> Result<(), CommitFault> {
+        if initial.base_key().is_some() {
+            return Err(CommitFault::Conflict);
         }
-        let bytes = encode(session.snapshot())?;
-        decode(&bytes)?;
-        let mut staged = tempfile::Builder::new()
-            .prefix(".cola-")
-            .suffix(".tmp")
-            .tempfile_in(&self.root)
-            .map_err(storage)?;
-        staged.write_all(&bytes).map_err(storage)?;
-        staged.as_file().sync_all().map_err(storage)?;
-        staged.persist(&path).map_err(|e| storage(e.error))?;
-        #[cfg(unix)]
-        fs::File::open(&self.root)
-            .and_then(|f| f.sync_all())
-            .map_err(storage)?;
-        Ok(())
+        let id = initial.candidate().session().id();
+        let _lock = self.lock(id).map_err(CommitFault::NotPublished)?;
+        let path = self.path(id);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => return Err(CommitFault::Conflict),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(CommitFault::NotPublished(context(storage(error), &path))),
+        }
+        self.publish(&path, initial, true)
     }
-    fn load(&self, id: &SessionId) -> Result<Session, SessionStoreError> {
-        self.read(&self.root.join(filename(id.as_str())), Some(id))
+    fn acquire(
+        &self,
+        id: &SessionId,
+    ) -> Result<Box<dyn SessionTransaction + '_>, SessionStoreError> {
+        let lock = self.lock(id)?;
+        let path = self.path(id);
+        let confirmed = self.read(&path, Some(id))?;
+        // This resolves an earlier owner's uncertain publication before any effect is admitted.
+        self.sync(&path)?;
+        Ok(Box::new(Transaction {
+            store: self,
+            path,
+            _lock: lock,
+            confirmed,
+            unresolved: None,
+        }))
+    }
+}
+struct Transaction<'a> {
+    store: &'a JsonlSessionStore,
+    path: PathBuf,
+    _lock: File,
+    confirmed: SessionArchive,
+    unresolved: Option<String>,
+}
+impl Transaction<'_> {
+    fn current_digest(&self) -> Result<String, SessionStoreError> {
+        let bytes = fs::read(&self.path)
+            .map_err(read_error)
+            .map_err(|error| context(error, &self.path))?;
+        let archive = SessionArchive::decode(&bytes).map_err(|error| context(error, &self.path))?;
+        if archive.session().id() != self.confirmed.session().id() {
+            return Err(context(
+                invalid("session identity does not match its file"),
+                &self.path,
+            ));
+        }
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+    fn matches_base(&self, change: &ArchiveChange) -> bool {
+        change.candidate().session().id() == self.confirmed.session().id()
+            && change.base_key().is_some_and(|base| {
+                base.revision() == self.confirmed.revision()
+                    && self
+                        .confirmed
+                        .encode()
+                        .is_ok_and(|bytes| base.digest() == format!("{:x}", Sha256::digest(bytes)))
+            })
+    }
+}
+impl SessionTransaction for Transaction<'_> {
+    fn confirmed(&self) -> &SessionArchive {
+        &self.confirmed
+    }
+    fn commit(&mut self, change: &ArchiveChange) -> Result<(), CommitFault> {
+        if self.unresolved.is_some() || !self.matches_base(change) {
+            return Err(CommitFault::Conflict);
+        }
+        let digest = self.current_digest().map_err(CommitFault::NotPublished)?;
+        if !change
+            .base_key()
+            .is_some_and(|base| base.digest() == digest)
+        {
+            return Err(CommitFault::Conflict);
+        }
+        match self.store.publish(&self.path, change, false) {
+            Ok(()) => {
+                self.confirmed = change.candidate().clone();
+                Ok(())
+            }
+            Err(CommitFault::Uncertain(error)) => {
+                self.unresolved = Some(change.key().digest().into());
+                Err(CommitFault::Uncertain(error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn resolve(&mut self, change: &ArchiveChange) -> Result<(), CommitFault> {
+        if !self.matches_base(change)
+            || self
+                .unresolved
+                .as_ref()
+                .is_some_and(|digest| digest != change.key().digest())
+        {
+            return Err(CommitFault::Conflict);
+        }
+        let digest = self.current_digest().map_err(CommitFault::Uncertain)?;
+        if digest == change.key().digest() {
+            self.store
+                .sync(&self.path)
+                .map_err(CommitFault::Uncertain)?;
+            self.confirmed = change.candidate().clone();
+            self.unresolved = None;
+            Ok(())
+        } else if change
+            .base_key()
+            .is_some_and(|base| base.digest() == digest)
+        {
+            self.unresolved = None;
+            Err(CommitFault::NotPublished(SessionStoreError::new(
+                SessionStoreErrorKind::Storage,
+                io::Error::other("candidate is absent; confirmed base remains published"),
+            )))
+        } else {
+            Err(CommitFault::Conflict)
+        }
     }
 }
 fn filename(id: &str) -> String {
@@ -112,20 +300,20 @@ fn recognized(name: &str) -> bool {
         && name.ends_with(".jsonl")
         && name.as_bytes()[..64]
             .iter()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
-fn read_error(e: io::Error) -> SessionStoreError {
+fn read_error(error: io::Error) -> SessionStoreError {
     SessionStoreError::new(
-        if e.kind() == io::ErrorKind::NotFound {
+        if error.kind() == io::ErrorKind::NotFound {
             SessionStoreErrorKind::NotFound
         } else {
             SessionStoreErrorKind::Storage
         },
-        e,
+        error,
     )
 }
-fn storage(e: io::Error) -> SessionStoreError {
-    SessionStoreError::new(SessionStoreErrorKind::Storage, e)
+fn storage(error: io::Error) -> SessionStoreError {
+    SessionStoreError::new(SessionStoreErrorKind::Storage, error)
 }
 fn invalid(message: &'static str) -> SessionStoreError {
     SessionStoreError::new(
@@ -133,406 +321,234 @@ fn invalid(message: &'static str) -> SessionStoreError {
         io::Error::new(io::ErrorKind::InvalidData, message),
     )
 }
-
 #[derive(Debug)]
-struct ReadContext {
-    location: String,
+struct PathError {
+    path: PathBuf,
     source: SessionStoreError,
 }
-impl fmt::Display for ReadContext {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.location, self.source)
+impl fmt::Display for PathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.path.display(), self.source)
     }
 }
-impl Error for ReadContext {
+impl Error for PathError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.source)
     }
 }
-fn context(source: SessionStoreError, location: String) -> SessionStoreError {
-    SessionStoreError::new(source.kind(), ReadContext { location, source })
+fn context(source: SessionStoreError, path: &Path) -> SessionStoreError {
+    SessionStoreError::new(
+        source.kind(),
+        PathError {
+            path: path.into(),
+            source,
+        },
+    )
 }
 
-#[derive(Deserialize)]
-struct VersionProbe {
-    format: String,
-    version: u64,
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultPoint {
+    BeforeTempfile,
+    BeforeWrite,
+    BeforeFileSync,
+    BeforeRename,
+    RenameError,
+    AfterRename,
+    DirectorySync,
 }
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Header {
-    format: String,
-    version: u64,
-    session_id: String,
-    closed_turn_count: usize,
-    active: bool,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "record", rename_all = "snake_case", deny_unknown_fields)]
-enum Record {
-    Closed { turn: Turn },
-    Active { turn: Turn },
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Turn {
-    id: u64,
-    user: String,
-    steps: Vec<Step>,
-    outcome: Option<Outcome>,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Step {
-    assistant: Assistant,
-    executions: Vec<Execution>,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum Assistant {
-    Answer {
-        text: String,
-    },
-    ToolRequests {
-        text: Option<String>,
-        calls: Vec<Call>,
-    },
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Call {
-    id: String,
-    name: String,
-    arguments: Value,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Execution {
-    call_id: String,
-    state: State,
-    resolution: Option<Resolution>,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum State {
-    NotStarted {},
-    Started {},
-    Returned { outcome: ToolReturn },
-}
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ToolReturn {
-    Success { output: String },
-    Failure { description: String },
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Resolution {
-    disposition: Disposition,
-    source: Source,
-    evidence: String,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum Disposition {
-    Completed {},
-    NotPerformed {},
-}
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum Source {
-    Observation {},
-    UserAttestation {},
-    ApplicationAttestation {},
-}
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum Outcome {
-    Completed {},
-    Interrupted { reason: Reason },
-    Failed { failure: Failure },
-}
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum Reason {
-    UserCancelled {},
-    ProcessLost {},
-    ContextCapacity {},
-    IterationLimit {},
-}
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum Failure {
-    ModelFailure { description: String },
-    MalformedResponse { description: String },
+#[cfg(test)]
+thread_local! { static FAULT: std::cell::Cell<Option<FaultPoint>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+fn fault(point: FaultPoint) -> io::Result<()> {
+    if std::env::var("COLA_ARCHIVE_EXIT_POINT").is_ok_and(|value| value == format!("{point:?}")) {
+        std::process::exit(86);
+    }
+    if FAULT.with(|fault| fault.get() == Some(point)) {
+        FAULT.with(|fault| fault.set(None));
+        Err(io::Error::other(format!("injected {point:?}")))
+    } else {
+        Ok(())
+    }
 }
 
-fn data_error(e: impl Error + Send + Sync + 'static) -> SessionStoreError {
-    SessionStoreError::new(SessionStoreErrorKind::InvalidData, e)
-}
-fn encode(snapshot: SessionSnapshot) -> Result<Vec<u8>, SessionStoreError> {
-    let mut bytes = vec![];
-    let header = Header {
-        format: "cola.session".into(),
-        version: 1,
-        session_id: snapshot.session_id,
-        closed_turn_count: snapshot.turns.len(),
-        active: snapshot.active.is_some(),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        app::*,
+        domain::{NonEmptyText, UserMessage},
     };
-    line(&mut bytes, &header)?;
-    for turn in snapshot.turns {
-        line(&mut bytes, &Record::Closed { turn: turn.into() })?;
+    fn initial(store: &JsonlSessionStore) -> ArchiveChange {
+        let change =
+            ArchiveChange::initial(SessionArchive::new(SessionId::new("faults").unwrap())).unwrap();
+        store.create(&change).unwrap();
+        change
     }
-    if let Some(turn) = snapshot.active {
-        line(&mut bytes, &Record::Active { turn: turn.into() })?;
+    fn candidate(base: &SessionArchive) -> ArchiveChange {
+        let mut next = base.clone();
+        next.session_mut()
+            .start_turn(UserMessage::new(NonEmptyText::new("intent").unwrap()))
+            .unwrap();
+        ArchiveChange::next(base, next).unwrap()
     }
-    Ok(bytes)
-}
-fn line(bytes: &mut Vec<u8>, value: &impl Serialize) -> Result<(), SessionStoreError> {
-    serde_json::to_writer(&mut *bytes, value).map_err(data_error)?;
-    bytes.push(b'\n');
-    Ok(())
-}
-fn decode(bytes: &[u8]) -> Result<SessionSnapshot, SessionStoreError> {
-    if !bytes.ends_with(b"\n") {
-        return Err(invalid("missing final LF"));
-    }
-    let mut lines = bytes[..bytes.len() - 1].split(|b| *b == b'\n');
-    let header_bytes = lines.next().ok_or_else(|| invalid("missing header"))?;
-    let header = (|| {
-        let probe: VersionProbe = serde_json::from_slice(header_bytes).map_err(data_error)?;
-        if probe.format != "cola.session" {
-            return Err(invalid("unknown session format"));
+    #[test]
+    fn errors_before_publication_preserve_exact_base_and_allow_new_commit() {
+        for point in [
+            FaultPoint::BeforeTempfile,
+            FaultPoint::BeforeWrite,
+            FaultPoint::BeforeFileSync,
+            FaultPoint::BeforeRename,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let store = JsonlSessionStore::new(root.path());
+            let init = initial(&store);
+            let mut tx = store.acquire(init.candidate().session().id()).unwrap();
+            let change = candidate(tx.confirmed());
+            FAULT.with(|fault| fault.set(Some(point)));
+            assert!(
+                matches!(tx.commit(&change), Err(CommitFault::NotPublished(_))),
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read(store.path(init.candidate().session().id())).unwrap(),
+                init.encoded()
+            );
+            assert_eq!(tx.confirmed(), init.candidate());
+            tx.commit(&change).unwrap();
+            assert_eq!(tx.confirmed(), change.candidate());
         }
-        if probe.version != 1 {
-            return Err(SessionStoreError::new(
-                SessionStoreErrorKind::UnsupportedVersion,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unsupported session version {}", probe.version),
-                ),
+    }
+    #[test]
+    fn ambiguous_publication_blocks_commits_until_exact_candidate_is_synced() {
+        for point in [FaultPoint::AfterRename, FaultPoint::DirectorySync] {
+            let root = tempfile::tempdir().unwrap();
+            let store = JsonlSessionStore::new(root.path());
+            let init = initial(&store);
+            let mut tx = store.acquire(init.candidate().session().id()).unwrap();
+            let change = candidate(tx.confirmed());
+            FAULT.with(|fault| fault.set(Some(point)));
+            assert!(
+                matches!(tx.commit(&change), Err(CommitFault::Uncertain(_))),
+                "{point:?}"
+            );
+            assert_eq!(
+                fs::read(store.path(init.candidate().session().id())).unwrap(),
+                change.encoded()
+            );
+            assert_eq!(tx.confirmed(), init.candidate());
+            assert!(matches!(tx.commit(&change), Err(CommitFault::Conflict)));
+            // Seeing the same bytes cannot repair a failed synchronization barrier.
+            FAULT.with(|fault| fault.set(Some(FaultPoint::DirectorySync)));
+            assert!(matches!(
+                tx.resolve(&change),
+                Err(CommitFault::Uncertain(_))
             ));
-        }
-        serde_json::from_slice::<Header>(header_bytes).map_err(data_error)
-    })()
-    .map_err(|e| context(e, "record 1".into()))?;
-    let mut turns = vec![];
-    let mut active = None;
-    for (index, bytes) in lines.enumerate() {
-        (|| {
-            let record: Record = serde_json::from_slice(bytes).map_err(data_error)?;
-            match record {
-                Record::Closed { turn }
-                    if active.is_none() && turns.len() < header.closed_turn_count =>
-                {
-                    turns.push(turn.try_into()?)
-                }
-                Record::Active { turn }
-                    if active.is_none()
-                        && header.active
-                        && turns.len() == header.closed_turn_count =>
-                {
-                    active = Some(turn.try_into()?)
-                }
-                _ => return Err(invalid("unexpected session record order or count")),
-            }
-            Ok(())
-        })()
-        .map_err(|e| context(e, format!("record {}", index + 2)))?;
-    }
-    if turns.len() != header.closed_turn_count || active.is_some() != header.active {
-        return Err(invalid("session record count mismatch"));
-    }
-    Ok(SessionSnapshot {
-        session_id: header.session_id,
-        turns,
-        active,
-    })
-}
-impl From<TurnSnapshot> for Turn {
-    fn from(t: TurnSnapshot) -> Self {
-        Self {
-            id: t.id,
-            user: t.user,
-            steps: t.steps.into_iter().map(Into::into).collect(),
-            outcome: t.outcome.map(Into::into),
+            assert_eq!(tx.confirmed(), init.candidate());
+            tx.resolve(&change).unwrap();
+            assert_eq!(tx.confirmed(), change.candidate());
         }
     }
-}
-impl TryFrom<Turn> for TurnSnapshot {
-    type Error = SessionStoreError;
-    fn try_from(t: Turn) -> Result<Self, Self::Error> {
-        Ok(Self {
-            id: t.id,
-            user: t.user,
-            steps: t
-                .steps
-                .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<_, _>>()?,
-            outcome: t.outcome.map(TryInto::try_into).transpose()?,
-        })
+    #[test]
+    fn rename_error_resolves_to_absent_candidate_without_overwriting_base() {
+        let root = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(root.path());
+        let init = initial(&store);
+        let mut tx = store.acquire(init.candidate().session().id()).unwrap();
+        let change = candidate(tx.confirmed());
+        FAULT.with(|fault| fault.set(Some(FaultPoint::RenameError)));
+        assert!(matches!(tx.commit(&change), Err(CommitFault::Uncertain(_))));
+        assert!(matches!(
+            tx.resolve(&change),
+            Err(CommitFault::NotPublished(_))
+        ));
+        assert_eq!(tx.confirmed(), init.candidate());
+        tx.commit(&change).unwrap();
     }
-}
-impl From<StepSnapshot> for Step {
-    fn from(s: StepSnapshot) -> Self {
-        Self {
-            assistant: match s.assistant {
-                AssistantSnapshot::Answer(text) => Assistant::Answer { text },
-                AssistantSnapshot::ToolRequests { text, calls } => Assistant::ToolRequests {
-                    text,
-                    calls: calls
-                        .into_iter()
-                        .map(|c| Call {
-                            id: c.id,
-                            name: c.name,
-                            arguments: c.arguments,
-                        })
-                        .collect(),
-                },
-            },
-            executions: s.executions.into_iter().map(Into::into).collect(),
+    #[test]
+    fn fresh_acquire_requires_synchronization_of_predecessor_uncertainty() {
+        let root = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(root.path());
+        let init = initial(&store);
+        let mut tx = store.acquire(init.candidate().session().id()).unwrap();
+        let change = candidate(tx.confirmed());
+        FAULT.with(|fault| fault.set(Some(FaultPoint::AfterRename)));
+        assert!(matches!(tx.commit(&change), Err(CommitFault::Uncertain(_))));
+        drop(tx);
+        FAULT.with(|fault| fault.set(Some(FaultPoint::DirectorySync)));
+        assert!(store.acquire(init.candidate().session().id()).is_err());
+        assert_eq!(
+            store
+                .acquire(init.candidate().session().id())
+                .unwrap()
+                .confirmed(),
+            change.candidate()
+        );
+    }
+    #[test]
+    fn uncertain_creation_requires_fresh_sync_and_cannot_replace_id() {
+        let root = tempfile::tempdir().unwrap();
+        let store = JsonlSessionStore::new(root.path());
+        let change =
+            ArchiveChange::initial(SessionArchive::new(SessionId::new("new").unwrap())).unwrap();
+        FAULT.with(|fault| fault.set(Some(FaultPoint::AfterRename)));
+        assert!(matches!(
+            store.create(&change),
+            Err(CommitFault::Uncertain(_))
+        ));
+        assert!(matches!(store.create(&change), Err(CommitFault::Conflict)));
+        FAULT.with(|fault| fault.set(Some(FaultPoint::DirectorySync)));
+        assert!(store.acquire(change.candidate().session().id()).is_err());
+        assert_eq!(
+            store
+                .acquire(change.candidate().session().id())
+                .unwrap()
+                .confirmed(),
+            change.candidate()
+        );
+    }
+    #[test]
+    fn transaction_child_process_exit_preserves_publication_boundary() {
+        use std::process::{Command, Stdio};
+        const ROOT: &str = "COLA_ARCHIVE_EXIT_ROOT";
+        if let Ok(root) = std::env::var(ROOT) {
+            let store = JsonlSessionStore::new(root);
+            let id = SessionId::new("faults").unwrap();
+            let mut tx = store.acquire(&id).unwrap();
+            let change = candidate(tx.confirmed());
+            tx.commit(&change).unwrap();
+            panic!("child missed crash point");
         }
-    }
-}
-impl TryFrom<Step> for StepSnapshot {
-    type Error = SessionStoreError;
-    fn try_from(s: Step) -> Result<Self, Self::Error> {
-        Ok(Self {
-            assistant: match s.assistant {
-                Assistant::Answer { text } => AssistantSnapshot::Answer(text),
-                Assistant::ToolRequests { text, calls } => AssistantSnapshot::ToolRequests {
-                    text,
-                    calls: calls
-                        .into_iter()
-                        .map(|c| ToolCallSnapshot {
-                            id: c.id,
-                            name: c.name,
-                            arguments: c.arguments,
-                        })
-                        .collect(),
-                },
-            },
-            executions: s
-                .executions
-                .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<_, _>>()?,
-        })
-    }
-}
-impl From<ExecutionSnapshot> for Execution {
-    fn from(e: ExecutionSnapshot) -> Self {
-        Self {
-            call_id: e.call_id,
-            state: match e.state {
-                ExecutionState::NotStarted => State::NotStarted {},
-                ExecutionState::Started => State::Started {},
-                ExecutionState::Returned(outcome) => State::Returned {
-                    outcome: match outcome {
-                        ToolOutcome::Success(output) => ToolReturn::Success { output },
-                        ToolOutcome::Failure(e) => ToolReturn::Failure {
-                            description: e.description().as_str().into(),
-                        },
-                    },
-                },
-            },
-            resolution: e.resolution.map(|r| Resolution {
-                disposition: match r.disposition() {
-                    EffectDisposition::Completed => Disposition::Completed {},
-                    EffectDisposition::NotPerformed => Disposition::NotPerformed {},
-                },
-                source: match r.source() {
-                    ResolutionSource::Observation => Source::Observation {},
-                    ResolutionSource::UserAttestation => Source::UserAttestation {},
-                    ResolutionSource::ApplicationAttestation => Source::ApplicationAttestation {},
-                },
-                evidence: r.evidence().as_str().into(),
-            }),
+        for point in ["BeforeRename", "AfterRename"] {
+            let root = tempfile::tempdir().unwrap();
+            let store = JsonlSessionStore::new(root.path());
+            let init = initial(&store);
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "transaction_child_process_exit_preserves_publication_boundary",
+                    "--nocapture",
+                ])
+                .env(ROOT, root.path())
+                .env("COLA_ARCHIVE_EXIT_POINT", point)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(86));
+            let visible = store.inspect(init.candidate().session().id()).unwrap();
+            assert_eq!(
+                visible.revision().get(),
+                if point == "BeforeRename" { 1 } else { 2 }
+            );
+            assert_eq!(visible.needs_recovery(), point == "AfterRename");
+            assert_eq!(store.list().unwrap(), vec![visible.clone()]);
+            assert_eq!(
+                store
+                    .acquire(init.candidate().session().id())
+                    .unwrap()
+                    .confirmed(),
+                &visible
+            );
         }
-    }
-}
-impl TryFrom<Execution> for ExecutionSnapshot {
-    type Error = SessionStoreError;
-    fn try_from(e: Execution) -> Result<Self, Self::Error> {
-        Ok(Self {
-            call_id: e.call_id,
-            state: match e.state {
-                State::NotStarted {} => ExecutionState::NotStarted,
-                State::Started {} => ExecutionState::Started,
-                State::Returned { outcome } => ExecutionState::Returned(match outcome {
-                    ToolReturn::Success { output } => ToolOutcome::Success(output),
-                    ToolReturn::Failure { description } => ToolOutcome::Failure(ToolError::new(
-                        NonEmptyText::new(description).map_err(data_error)?,
-                    )),
-                }),
-            },
-            resolution: e
-                .resolution
-                .map(|r| {
-                    Ok(EffectResolution::new(
-                        match r.disposition {
-                            Disposition::Completed {} => EffectDisposition::Completed,
-                            Disposition::NotPerformed {} => EffectDisposition::NotPerformed,
-                        },
-                        match r.source {
-                            Source::Observation {} => ResolutionSource::Observation,
-                            Source::UserAttestation {} => ResolutionSource::UserAttestation,
-                            Source::ApplicationAttestation {} => {
-                                ResolutionSource::ApplicationAttestation
-                            }
-                        },
-                        NonEmptyText::new(r.evidence).map_err(data_error)?,
-                    ))
-                })
-                .transpose()?,
-        })
-    }
-}
-impl From<TurnOutcome> for Outcome {
-    fn from(o: TurnOutcome) -> Self {
-        match o {
-            TurnOutcome::Completed => Self::Completed {},
-            TurnOutcome::Interrupted(r) => Self::Interrupted {
-                reason: match r {
-                    StopReason::UserCancelled => Reason::UserCancelled {},
-                    StopReason::ProcessLost => Reason::ProcessLost {},
-                    StopReason::ContextCapacity => Reason::ContextCapacity {},
-                    StopReason::IterationLimit => Reason::IterationLimit {},
-                },
-            },
-            TurnOutcome::Failed(f) => Self::Failed {
-                failure: match f {
-                    TurnFailure::ModelFailure(t) => Failure::ModelFailure {
-                        description: t.as_str().into(),
-                    },
-                    TurnFailure::MalformedResponse(t) => Failure::MalformedResponse {
-                        description: t.as_str().into(),
-                    },
-                },
-            },
-        }
-    }
-}
-impl TryFrom<Outcome> for TurnOutcome {
-    type Error = SessionStoreError;
-    fn try_from(o: Outcome) -> Result<Self, Self::Error> {
-        Ok(match o {
-            Outcome::Completed {} => Self::Completed,
-            Outcome::Interrupted { reason } => Self::Interrupted(match reason {
-                Reason::UserCancelled {} => StopReason::UserCancelled,
-                Reason::ProcessLost {} => StopReason::ProcessLost,
-                Reason::ContextCapacity {} => StopReason::ContextCapacity,
-                Reason::IterationLimit {} => StopReason::IterationLimit,
-            }),
-            Outcome::Failed { failure } => Self::Failed(match failure {
-                Failure::ModelFailure { description } => {
-                    TurnFailure::ModelFailure(NonEmptyText::new(description).map_err(data_error)?)
-                }
-                Failure::MalformedResponse { description } => TurnFailure::MalformedResponse(
-                    NonEmptyText::new(description).map_err(data_error)?,
-                ),
-            }),
-        })
     }
 }
