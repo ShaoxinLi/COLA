@@ -451,9 +451,9 @@ fn exercise(protocol: Protocol, web: bool) {
     }
     drop(server);
     let restarted = cli(root, &path, &format!("/use {id}\nAfter restart\n/exit\n"));
-    assert_code(&restarted, 1);
-    assert_eq!(lines(&restarted)[1]["error"]["code"], "model_failure");
-    assert_eq!(provider.requests().len(), 7);
+    assert_code(&restarted, 0);
+    assert_eq!(lines(&restarted)[1]["kind"], "chatted");
+    assert_eq!(provider.requests().len(), 8);
 }
 
 #[test]
