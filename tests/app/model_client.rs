@@ -1,18 +1,3 @@
-use cola::app::{ModelErrorKind, ModelId};
-
-#[test]
-fn model_ids_preserve_nonblank_values_and_redact_diagnostics() {
-    let id = ModelId::new("  MODEL_SENTINEL  ").unwrap();
-    assert_eq!(id.as_str(), "  MODEL_SENTINEL  ");
-    assert!(!format!("{id:?}").contains("SENTINEL"));
-    for value in ["", " ", "\n\t"] {
-        assert_eq!(
-            ModelId::new(value).unwrap_err().kind(),
-            ModelErrorKind::InvalidSettings
-        );
-    }
-}
-
 #[test]
 fn public_custom_client_can_prepare_commit_invoke_and_archive_without_opaque_state() {
     use cola::{app::*, domain::*};
@@ -108,7 +93,7 @@ fn public_custom_client_can_prepare_commit_invoke_and_archive_without_opaque_sta
         )
         .unwrap();
     let initial = ArchiveChange::initial(archive).unwrap();
-    let decoded = SessionArchive::decode(initial.encoded()).unwrap();
+    let decoded = SessionArchive::restore(initial.candidate().snapshot()).unwrap();
     assert_eq!(
         decoded.session().turns()[0].steps()[0].source_generation(),
         generation

@@ -76,6 +76,6 @@ validates values, ordering, call/execution alignment, source identities and lega
 It preserves active work faithfully. Reading a snapshot does not declare a process lost.
 
 Explicit application recovery acquires ownership and commits interruption and abandoned
-invocation facts. The [session archive](session-store.md) validates the relationship between
+invocation facts. The [session archive](sessions.md) validates the relationship between
 domain steps, reviewer decisions and invocation evidence. Structural validation does not
 authenticate an external effect.

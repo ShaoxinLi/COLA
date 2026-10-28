@@ -1,20 +1,11 @@
-mod codec;
-
 use super::{
-    BudgetMeasurement, Effort, IncompleteReason, ModelError, ModelErrorKind, ModelId,
-    ModelSettings, ModelTarget, PreparedRequest, ResponseCapture, ResponseReceipt,
-    SelectionManifest, SessionStoreError, SessionStoreErrorKind, Usage,
+    BudgetMeasurement, CallRef, ExecutionState, GenerationId, IncompleteReason, ModelError,
+    ModelSettings, ModelTarget, NonEmptyText, PreparedRequest, ResponseCapture, ResponseReceipt,
+    RestoreError, SelectionManifest, Session, SessionId, SessionSnapshot, StepSnapshot, Timestamp,
+    ToolCallId, TurnId, ValueError,
 };
-use crate::domain::{
-    AssistantSnapshot, CallRef, EffectDisposition, EffectResolution, ExecutionSnapshot,
-    ExecutionState, GenerationId, NonEmptyText, ResolutionSource, Review, Session, SessionId,
-    SessionSnapshot, StepSnapshot, StopReason, Timestamp, ToolCallId, ToolCallSnapshot, ToolError,
-    ToolOutcome, TurnFailure, TurnId, TurnOutcome, TurnSnapshot,
-};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, error::Error, fmt, io, num::NonZeroU32};
+use std::{collections::BTreeSet, error::Error, fmt};
 
 /// Committed snapshot sequence. Zero is reserved for a new, unpublished draft.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -139,7 +130,7 @@ impl SessionArchive {
     pub fn needs_recovery(&self) -> bool {
         self.session.active_turn().is_some()
     }
-    pub fn next_generation_id(&self) -> Result<GenerationId, SessionStoreError> {
+    pub fn next_generation_id(&self) -> Result<GenerationId, ArchiveError> {
         let id = self
             .generations
             .last()
@@ -151,7 +142,7 @@ impl SessionArchive {
         &mut self,
         role: InvocationRole,
         request: &PreparedRequest<O>,
-    ) -> Result<GenerationId, SessionStoreError> {
+    ) -> Result<GenerationId, ArchiveError> {
         if request.selection().revision() != self.revision {
             return Err(invalid("prepared request has a stale source revision"));
         }
@@ -202,7 +193,7 @@ impl SessionArchive {
         at: Timestamp,
         receipt: ResponseReceipt,
         disposition: Disposition,
-    ) -> Result<(), SessionStoreError> {
+    ) -> Result<(), ArchiveError> {
         validate_capture(&receipt)?;
         let record = self
             .generations
@@ -230,8 +221,8 @@ impl SessionArchive {
             }
         }
     }
-    /// Encodes validated committed facts. It never closes an active turn.
-    pub fn encode(&self) -> Result<Vec<u8>, SessionStoreError> {
+    /// Checks facts admitted by a committed archive, including invocation source revisions.
+    pub fn validate_committed(&self) -> Result<(), ArchiveError> {
         validate(self)?;
         if self.revision.0 == 0
             || self
@@ -243,37 +234,18 @@ impl SessionArchive {
                 "archive revision does not follow invocation source revision",
             ));
         }
-        codec::encode(self)
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self, SessionStoreError> {
-        codec::decode(bytes)
+        Ok(())
     }
 }
 
-/// Exact bytes and revision of one publication. Digests are SHA-256 lowercase hex.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommitKey {
-    revision: Revision,
-    digest: String,
-}
-impl CommitKey {
-    pub fn revision(&self) -> Revision {
-        self.revision
-    }
-    pub fn digest(&self) -> &str {
-        &self.digest
-    }
-}
 /// Validated immutable base-to-candidate transition, usable by independent stores.
 #[derive(Clone, Debug)]
 pub struct ArchiveChange {
-    base: Option<CommitKey>,
+    base: Option<SessionArchive>,
     candidate: SessionArchive,
-    encoded: Vec<u8>,
-    key: CommitKey,
 }
 impl ArchiveChange {
-    pub fn initial(mut candidate: SessionArchive) -> Result<Self, SessionStoreError> {
+    pub fn initial(mut candidate: SessionArchive) -> Result<Self, ArchiveError> {
         if candidate.revision != Revision(0) {
             return Err(invalid("initial snapshot is already committed"));
         }
@@ -283,63 +255,36 @@ impl ArchiveChange {
     pub fn next(
         base: &SessionArchive,
         mut candidate: SessionArchive,
-    ) -> Result<Self, SessionStoreError> {
+    ) -> Result<Self, ArchiveError> {
         if base.revision.0 == 0 || candidate.revision != base.revision {
             return Err(invalid("candidate source revision mismatch"));
         }
+        base.validate_committed()?;
         validate_extension(base, &candidate)?;
-        let key = archive_key(base)?;
         candidate.revision = Revision(
             base.revision
                 .0
                 .checked_add(1)
                 .ok_or_else(|| invalid("revision exhausted"))?,
         );
-        Self::checked(Some(key), candidate)
+        Self::checked(Some(base.clone()), candidate)
     }
     fn checked(
-        base: Option<CommitKey>,
+        base: Option<SessionArchive>,
         candidate: SessionArchive,
-    ) -> Result<Self, SessionStoreError> {
-        let encoded = candidate.encode()?;
-        if SessionArchive::decode(&encoded)? != candidate {
-            return Err(invalid("archive cannot roundtrip"));
-        }
-        let key = CommitKey {
-            revision: candidate.revision,
-            digest: digest(&encoded),
-        };
-        Ok(Self {
-            base,
-            candidate,
-            encoded,
-            key,
-        })
+    ) -> Result<Self, ArchiveError> {
+        candidate.validate_committed()?;
+        Ok(Self { base, candidate })
+    }
+    pub fn base(&self) -> Option<&SessionArchive> {
+        self.base.as_ref()
     }
     pub fn candidate(&self) -> &SessionArchive {
         &self.candidate
     }
-    pub fn encoded(&self) -> &[u8] {
-        &self.encoded
-    }
-    pub fn key(&self) -> &CommitKey {
-        &self.key
-    }
-    pub fn base_key(&self) -> Option<&CommitKey> {
-        self.base.as_ref()
-    }
-}
-fn archive_key(archive: &SessionArchive) -> Result<CommitKey, SessionStoreError> {
-    Ok(CommitKey {
-        revision: archive.revision,
-        digest: digest(&archive.encode()?),
-    })
-}
-fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
-fn validate_capture(receipt: &ResponseReceipt) -> Result<(), SessionStoreError> {
+fn validate_capture(receipt: &ResponseReceipt) -> Result<(), ArchiveError> {
     if receipt
         .http_status
         .is_some_and(|status| !(100..=599).contains(&status))
@@ -354,7 +299,7 @@ fn validate_capture(receipt: &ResponseReceipt) -> Result<(), SessionStoreError> 
     Ok(())
 }
 
-fn validate(archive: &SessionArchive) -> Result<(), SessionStoreError> {
+fn validate(archive: &SessionArchive) -> Result<(), ArchiveError> {
     Session::restore(archive.session.snapshot()).map_err(data_error)?;
     let snapshot = archive.session.snapshot();
     let mut links = BTreeSet::new();
@@ -475,11 +420,22 @@ fn validate(archive: &SessionArchive) -> Result<(), SessionStoreError> {
                     return Err(invalid("abandonment predates invocation"));
                 }
             }
-            Observation::Observed { at, receipt, .. } => {
+            Observation::Observed {
+                at,
+                receipt,
+                disposition,
+            } => {
                 if *at < record.intent.at {
                     return Err(invalid("observation predates invocation"));
                 }
                 validate_capture(receipt)?;
+                if let Disposition::Failed(error) = disposition
+                    && error
+                        .http_status()
+                        .is_some_and(|status| !(100..=599).contains(&status))
+                {
+                    return Err(invalid("invalid failure status"));
+                }
                 if is_accepted(record) && !matches!(receipt.capture, ResponseCapture::Complete(_)) {
                     return Err(invalid(
                         "accepted output requires complete response evidence",
@@ -505,7 +461,7 @@ fn is_accepted(record: &GenerationRecord) -> bool {
         }
     )
 }
-fn role_turn(snapshot: &SessionSnapshot, role: &InvocationRole) -> Result<u64, SessionStoreError> {
+fn role_turn(snapshot: &SessionSnapshot, role: &InvocationRole) -> Result<u64, ArchiveError> {
     match role {
         InvocationRole::Assistant { turn } => {
             if snapshot
@@ -542,7 +498,7 @@ fn role_turn(snapshot: &SessionSnapshot, role: &InvocationRole) -> Result<u64, S
 fn validate_extension(
     base: &SessionArchive,
     candidate: &SessionArchive,
-) -> Result<(), SessionStoreError> {
+) -> Result<(), ArchiveError> {
     validate(base)?;
     if base.session.id() != candidate.session.id()
         || candidate.generations.len() < base.generations.len()
@@ -595,7 +551,7 @@ fn validate_step_extension(
     old: &StepSnapshot,
     new: &StepSnapshot,
     closed: bool,
-) -> Result<(), SessionStoreError> {
+) -> Result<(), ArchiveError> {
     if old.source_generation != new.source_generation
         || old.assistant != new.assistant
         || old.executions.len() != new.executions.len()
@@ -638,30 +594,182 @@ fn validate_step_extension(
     Ok(())
 }
 
-fn invalid(message: &'static str) -> SessionStoreError {
-    SessionStoreError::new(
-        SessionStoreErrorKind::InvalidData,
-        io::Error::new(io::ErrorKind::InvalidData, message),
-    )
-}
-fn data_error(error: impl Error + Send + Sync + 'static) -> SessionStoreError {
-    SessionStoreError::new(SessionStoreErrorKind::InvalidData, error)
-}
+/// An archive violates semantic conversation or invocation invariants.
 #[derive(Debug)]
-struct RecordError {
-    index: usize,
-    source: SessionStoreError,
+pub enum ArchiveError {
+    Invalid(&'static str),
+    InvalidValue(ValueError),
+    InvalidConversation(RestoreError),
+    InvalidRequest(serde_json::Error),
 }
-impl fmt::Display for RecordError {
+impl fmt::Display for ArchiveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "record {}: {}", self.index, self.source)
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::InvalidValue(error) => error.fmt(f),
+            Self::InvalidConversation(error) => error.fmt(f),
+            Self::InvalidRequest(error) => error.fmt(f),
+        }
     }
 }
-impl Error for RecordError {
+impl Error for ArchiveError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.source)
+        match self {
+            Self::Invalid(_) => None,
+            Self::InvalidValue(error) => Some(error),
+            Self::InvalidConversation(error) => Some(error),
+            Self::InvalidRequest(error) => Some(error),
+        }
     }
 }
-fn at_record(index: usize, source: SessionStoreError) -> SessionStoreError {
-    SessionStoreError::new(source.kind(), RecordError { index, source })
+impl From<ValueError> for ArchiveError {
+    fn from(error: ValueError) -> Self {
+        Self::InvalidValue(error)
+    }
+}
+impl From<RestoreError> for ArchiveError {
+    fn from(error: RestoreError) -> Self {
+        Self::InvalidConversation(error)
+    }
+}
+impl From<serde_json::Error> for ArchiveError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::InvalidRequest(error)
+    }
+}
+fn invalid(message: &'static str) -> ArchiveError {
+    ArchiveError::Invalid(message)
+}
+fn data_error(error: impl Into<ArchiveError>) -> ArchiveError {
+    error.into()
+}
+
+/// Format-neutral committed facts for independently implemented stores.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveSnapshot {
+    pub revision: u64,
+    pub session: SessionSnapshot,
+    pub generations: Vec<GenerationSnapshot>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationSnapshot {
+    pub id: u64,
+    pub role: InvocationRole,
+    pub target: ModelTarget,
+    pub settings: ModelSettings,
+    pub at: Timestamp,
+    pub request: Value,
+    pub selection: SelectionSnapshot,
+    pub budget: BudgetSnapshot,
+    pub observation: Observation,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionSnapshot {
+    pub revision: u64,
+    pub policy: String,
+    pub required: Vec<u64>,
+    pub included: Vec<u64>,
+    pub omitted: Vec<u64>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BudgetSnapshot {
+    pub request_bytes: usize,
+    pub max_request_bytes: usize,
+    pub estimated_input_tokens: u64,
+    pub input_token_budget: u64,
+    pub method: String,
+}
+impl SessionArchive {
+    pub fn snapshot(&self) -> ArchiveSnapshot {
+        ArchiveSnapshot {
+            revision: self.revision.get(),
+            session: self.session.snapshot(),
+            generations: self
+                .generations
+                .iter()
+                .map(|record| {
+                    let intent = &record.intent;
+                    GenerationSnapshot {
+                        id: record.id.get(),
+                        role: intent.role.clone(),
+                        target: intent.target.clone(),
+                        settings: intent.settings.clone(),
+                        at: intent.at,
+                        request: intent.request.clone(),
+                        selection: SelectionSnapshot {
+                            revision: intent.selection.revision.get(),
+                            policy: intent.selection.policy.clone(),
+                            required: intent
+                                .selection
+                                .required
+                                .iter()
+                                .map(|id| id.get())
+                                .collect(),
+                            included: intent
+                                .selection
+                                .included
+                                .iter()
+                                .map(|id| id.get())
+                                .collect(),
+                            omitted: intent.selection.omitted.iter().map(|id| id.get()).collect(),
+                        },
+                        budget: BudgetSnapshot {
+                            request_bytes: intent.budget.request_bytes,
+                            max_request_bytes: intent.budget.max_request_bytes,
+                            estimated_input_tokens: intent.budget.estimated_input_tokens,
+                            input_token_budget: intent.budget.input_token_budget,
+                            method: intent.budget.method.clone(),
+                        },
+                        observation: record.observation.clone(),
+                    }
+                })
+                .collect(),
+        }
+    }
+    pub fn restore(snapshot: ArchiveSnapshot) -> Result<Self, ArchiveError> {
+        let ids = |values: Vec<u64>| {
+            values
+                .into_iter()
+                .map(TurnId::new)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(data_error)
+        };
+        let archive = Self {
+            revision: Revision(snapshot.revision),
+            session: Session::restore(snapshot.session).map_err(data_error)?,
+            generations: snapshot
+                .generations
+                .into_iter()
+                .map(|record| {
+                    Ok(GenerationRecord {
+                        id: GenerationId::new(record.id).map_err(data_error)?,
+                        intent: InvocationIntent {
+                            role: record.role,
+                            target: record.target,
+                            settings: record.settings,
+                            at: record.at,
+                            request: record.request,
+                            selection: SelectionManifest {
+                                revision: Revision(record.selection.revision),
+                                policy: record.selection.policy,
+                                required: ids(record.selection.required)?,
+                                included: ids(record.selection.included)?,
+                                omitted: ids(record.selection.omitted)?,
+                            },
+                            budget: BudgetMeasurement {
+                                request_bytes: record.budget.request_bytes,
+                                max_request_bytes: record.budget.max_request_bytes,
+                                estimated_input_tokens: record.budget.estimated_input_tokens,
+                                input_token_budget: record.budget.input_token_budget,
+                                method: record.budget.method,
+                            },
+                        },
+                        observation: record.observation,
+                    })
+                })
+                .collect::<Result<_, ArchiveError>>()?,
+        };
+        archive.validate_committed()?;
+        Ok(archive)
+    }
 }

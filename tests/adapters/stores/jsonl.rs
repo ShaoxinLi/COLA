@@ -1,3 +1,4 @@
+use cola::adapters::stores::JsonlArchiveCodec;
 use cola::{adapters::stores::JsonlSessionStore, app::*, domain::*};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -233,13 +234,14 @@ fn closed_roundtrips_every_fact_and_variant() {
     );
     assert_eq!(store.list().unwrap(), vec![change.candidate().clone()]);
     assert_eq!(
-        SessionArchive::decode(change.encoded())
-            .unwrap()
-            .encode()
-            .unwrap(),
-        change.encoded()
+        JsonlArchiveCodec::encode(
+            &JsonlArchiveCodec::decode(&JsonlArchiveCodec::encode(change.candidate()).unwrap())
+                .unwrap()
+        )
+        .unwrap(),
+        JsonlArchiveCodec::encode(change.candidate()).unwrap()
     );
-    let header = &lines(change.encoded())[0];
+    let header = &lines(&JsonlArchiveCodec::encode(change.candidate()).unwrap())[0];
     assert_eq!(header["record"], "session");
     assert!(header.get("version").is_none());
     assert!(header.get("format").is_none());
@@ -473,10 +475,14 @@ fn unreadable_encoding_is_refused_before_publication() {
             AssistantMessage::tool_requests(None, ToolCalls::new(vec![call]).unwrap()),
         )
         .unwrap();
-    assert_eq!(
-        ArchiveChange::initial(a).unwrap_err().kind(),
-        SessionStoreErrorKind::InvalidData
+    let change = ArchiveChange::initial(a).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("uncreated");
+    let store = JsonlSessionStore::new(&root);
+    assert!(
+        matches!(store.create(&change), Err(CommitFault::NotPublished(error)) if error.kind() == SessionStoreErrorKind::InvalidData)
     );
+    assert!(!root.exists());
 }
 
 #[test]
@@ -526,18 +532,26 @@ fn reconcile_syncs_exact_candidate_preserves_base_and_rejects_unexpected_publica
         Err(CommitFault::NotPublished(_))
     ));
     assert_eq!(tx.confirmed(), &base);
-    fs::write(path(dir.path(), "repair"), change.encoded()).unwrap();
+    fs::write(
+        path(dir.path(), "repair"),
+        JsonlArchiveCodec::encode(change.candidate()).unwrap(),
+    )
+    .unwrap();
     tx.resolve(&change).unwrap();
     assert_eq!(tx.confirmed(), change.candidate());
     drop(tx);
     let mut tx = store.acquire(init.candidate().session().id()).unwrap();
     let next = ArchiveChange::next(tx.confirmed(), tx.confirmed().clone()).unwrap();
-    fs::write(path(dir.path(), "repair"), init.encoded()).unwrap();
+    fs::write(
+        path(dir.path(), "repair"),
+        JsonlArchiveCodec::encode(init.candidate()).unwrap(),
+    )
+    .unwrap();
     assert!(matches!(tx.resolve(&next), Err(CommitFault::Conflict)));
     assert!(matches!(tx.commit(&next), Err(CommitFault::Conflict)));
     assert_eq!(
         fs::read(path(dir.path(), "repair")).unwrap(),
-        init.encoded()
+        JsonlArchiveCodec::encode(init.candidate()).unwrap()
     );
 }
 
@@ -655,5 +669,29 @@ fn killed_owner_releases_os_lock_for_fresh_acquire() {
             .unwrap()
             .confirmed(),
         change.candidate()
+    );
+}
+
+#[test]
+fn noncanonical_jsonl_is_rejected_instead_of_silently_changing_its_digest() {
+    let base = ArchiveChange::initial(archive("canonical")).unwrap();
+    let bytes = JsonlArchiveCodec::encode(base.candidate()).unwrap();
+    let mut noncanonical = vec![b' '];
+    noncanonical.extend(bytes);
+    assert_eq!(
+        JsonlArchiveCodec::decode(&noncanonical).unwrap_err().kind(),
+        SessionStoreErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn public_codec_checks_committed_facts_even_after_mutating_an_existing_archive() {
+    let base = ArchiveChange::initial(archive("draft")).unwrap();
+    let mut draft = base.candidate().clone();
+    let turn = start(&mut draft);
+    begin(&mut draft, turn);
+    assert_eq!(
+        JsonlArchiveCodec::encode(&draft).unwrap_err().kind(),
+        SessionStoreErrorKind::InvalidData
     );
 }

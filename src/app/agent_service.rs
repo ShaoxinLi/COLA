@@ -1,7 +1,10 @@
 use super::{
-    ArchiveChange, CommitFault, ContextLimits, ContextPlan, Disposition, Generation,
-    IncompleteReason, InvocationRole, ModelClient, ModelError, ModelErrorKind, ModelSettings,
-    ObservedReply, SessionArchive, SessionStore, SessionStoreError, SessionTransaction,
+    CommitFault, Generation, ModelClient, ObservedReply, SessionStore, SessionStoreError,
+    SessionTransaction,
+};
+use crate::domain::{
+    ArchiveChange, ContextLimits, ContextPlan, Disposition, IncompleteReason, InvocationRole,
+    ModelError, ModelErrorKind, ModelSettings, SessionArchive,
 };
 use crate::domain::{
     AssistantMessage, Decision, Message, NextAction, NonEmptyText, SessionError, SessionId,
@@ -471,7 +474,8 @@ impl AgentError {
             uncommitted: None,
         }
     }
-    fn store(source: SessionStoreError) -> Self {
+    fn store(source: impl Into<SessionStoreError>) -> Self {
+        let source = source.into();
         Self::bare(AgentErrorKind::Store(source))
     }
 }

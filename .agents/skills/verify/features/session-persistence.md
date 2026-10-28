@@ -1,9 +1,10 @@
 # Session persistence
 
-`SessionArchive` combines conversation facts and invocation evidence. Public
-codecs expose checked canonical JSONL bytes without a format-version field.
-`ArchiveChange::initial` and `next` validate immutable facts and establish the
-candidate revision and digest.
+`SessionArchive` combines conversation facts and invocation evidence in the domain.
+Its snapshot and checked restore API are format independent. `ArchiveChange::initial`
+and `next` validate immutable facts and establish the candidate revision.
+The adapter owns `JsonlArchiveCodec`, canonical bytes and publication digests.
+The JSONL archive has no format-version field.
 
 ## Public entry points
 

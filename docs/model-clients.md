@@ -1,7 +1,9 @@
 # Model clients
 
 The application separates request preparation from model I/O. OpenAI Responses and
-Anthropic Messages implement the same typed, object-safe `ModelClient<O>` port.
+Anthropic Messages implement the same typed, object-safe application `ModelClient<O>` port.
+Pure model settings, prepared requests, response evidence and safe failure values belong
+to the domain; the application port owns invocation.
 
 ## Application contract
 
@@ -92,10 +94,8 @@ Raw evidence is available through the durable archive rather than public error m
 ## Verification
 
 Local HTTP fixtures check actual rendering, decoding, statuses, limits and native fidelity.
-They do not establish live provider acceptance. The separate
-[DeepSeek verification script](../scripts/verify-deepseek.py) drives the actual executable,
-real model/reviewer calls, file reads and cold CLI/Web restarts using a private local config.
-It records evidence without saving that credential-bearing config.
+They do not establish live provider acceptance. Use a separate private configuration
+when checking a live provider, and keep credentials and run artifacts outside the repository.
 
 `ResponseCapture::Interrupted` preserves the received prefix when a body read
 fails. It differs from a configured size-limit truncation and from receiving no

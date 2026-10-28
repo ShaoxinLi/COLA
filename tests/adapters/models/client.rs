@@ -1,4 +1,5 @@
 use super::support::*;
+use cola::adapters::stores::JsonlArchiveCodec;
 use cola::{
     adapters::{
         models::{ClientConfig, OpenAIClient},
@@ -733,7 +734,11 @@ fn active_native_bundles_survive_archive_roundtrip_then_closed_turns_become_port
         store.create(&change).unwrap();
         let id = change.candidate().session().id().clone();
         let mut archive = store.inspect(&id).unwrap();
-        assert_eq!(&SessionArchive::decode(change.encoded()).unwrap(), &archive);
+        assert_eq!(
+            &JsonlArchiveCodec::decode(&JsonlArchiveCodec::encode(change.candidate()).unwrap())
+                .unwrap(),
+            &archive
+        );
         let before = archive.clone();
         invoke_assistant(p, p.client(&server).as_ref(), &mut archive);
         assert_eq!(
@@ -742,9 +747,9 @@ fn active_native_bundles_survive_archive_roundtrip_then_closed_turns_become_port
         );
         accept_tools(&mut archive);
         let change = ArchiveChange::next(&before, archive).unwrap();
-        let encoded = change.candidate().encode().unwrap();
+        let encoded = JsonlArchiveCodec::encode(change.candidate()).unwrap();
         assert_eq!(
-            SessionArchive::decode(&encoded).unwrap(),
+            JsonlArchiveCodec::decode(&encoded).unwrap(),
             *change.candidate()
         );
         let mut transaction = store.acquire(&id).unwrap();
@@ -781,7 +786,9 @@ fn active_native_bundles_survive_archive_roundtrip_then_closed_turns_become_port
             .start_turn(user("new user turn"))
             .unwrap();
         let change = ArchiveChange::next(&before, archive).unwrap();
-        let archive = SessionArchive::decode(change.encoded()).unwrap();
+        let archive =
+            JsonlArchiveCodec::decode(&JsonlArchiveCodec::encode(change.candidate()).unwrap())
+                .unwrap();
         p.client(&server)
             .request(&context(&archive), &p.settings())
             .unwrap();
@@ -1631,7 +1638,9 @@ fn every_closed_stop_remains_portable_after_tool_facts_and_output_free_failures(
                 .start_turn(user("continue with known facts"))
                 .unwrap();
             let initial = ArchiveChange::initial(archive).unwrap();
-            let archive = SessionArchive::decode(initial.encoded()).unwrap();
+            let archive =
+                JsonlArchiveCodec::decode(&JsonlArchiveCodec::encode(initial.candidate()).unwrap())
+                    .unwrap();
             let reply = client.request(&context(&archive), &p.settings()).unwrap();
             assert_eq!(
                 complete(reply),
@@ -1764,7 +1773,10 @@ fn truncated_escaped_credentials_keep_capture_length_and_can_be_committed() {
                 .unwrap();
             let committed = ArchiveChange::initial(archive).unwrap();
             assert_eq!(
-                SessionArchive::decode(committed.encoded()).unwrap(),
+                JsonlArchiveCodec::decode(
+                    &JsonlArchiveCodec::encode(committed.candidate()).unwrap()
+                )
+                .unwrap(),
                 *committed.candidate()
             );
         }
@@ -1865,7 +1877,8 @@ fn nested_escaped_receipt_metadata_is_scrubbed_in_all_copies() {
             .unwrap();
         let change = ArchiveChange::initial(archive).unwrap();
         assert_eq!(
-            SessionArchive::decode(change.encoded()).unwrap(),
+            JsonlArchiveCodec::decode(&JsonlArchiveCodec::encode(change.candidate()).unwrap())
+                .unwrap(),
             *change.candidate()
         );
         for value in [
@@ -1933,7 +1946,8 @@ fn stopped_text_fragments_cannot_reconstruct_credentials_from_durable_captures()
             .unwrap();
         let change = ArchiveChange::initial(archive).unwrap();
         assert_eq!(
-            SessionArchive::decode(change.encoded()).unwrap(),
+            JsonlArchiveCodec::decode(&JsonlArchiveCodec::encode(change.candidate()).unwrap())
+                .unwrap(),
             *change.candidate()
         );
         assert!(

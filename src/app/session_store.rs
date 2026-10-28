@@ -1,5 +1,5 @@
-use super::{ArchiveChange, SessionArchive};
 use crate::domain::SessionId;
+use crate::domain::{ArchiveChange, SessionArchive};
 use std::{error::Error, fmt};
 
 /// Read-only inspection and exclusive transactional ownership of durable sessions.
@@ -77,5 +77,11 @@ impl fmt::Display for SessionStoreError {
 impl Error for SessionStoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(self.source.as_ref())
+    }
+}
+
+impl From<crate::domain::ArchiveError> for SessionStoreError {
+    fn from(error: crate::domain::ArchiveError) -> Self {
+        Self::new(SessionStoreErrorKind::InvalidData, error)
     }
 }

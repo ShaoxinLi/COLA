@@ -136,9 +136,8 @@ external crate consumers of `cola`, so public session transitions are user
 operations. Most service cases substitute collaborators through production
 traits. The native provider service cases combine the real JSONL store and HTTP
 adapters with local provider fixtures and a tool double. Adapter tests separately
-verify real disk, subprocess, and HTTP effects. These integration journeys use local provider fixtures. The opt-in DeepSeek
-harness documented in README separately combines a live model with host-file
-reads and CLI/Web process restarts.
+verify real disk, subprocess, and HTTP effects. These integration journeys use local provider fixtures. Separate live verification can combine a configured model with host-file reads
+and CLI/Web process restarts; it is not part of this fixture recipe.
 
 ## Evidence
 

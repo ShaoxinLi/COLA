@@ -1,8 +1,6 @@
 use super::support::*;
-use cola::{
-    app::{Generation, IncompleteReason, ModelErrorKind},
-    domain::AssistantMessage,
-};
+use cola::domain::{IncompleteReason, ModelErrorKind};
+use cola::{app::Generation, domain::AssistantMessage};
 use serde_json::json;
 
 #[test]

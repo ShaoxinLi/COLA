@@ -1,4 +1,4 @@
-use cola::{app::*, domain::*};
+use cola::domain::*;
 use serde_json::{Value, json};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
@@ -484,8 +484,8 @@ fn active_bundle_is_indivisible_and_preserves_original_evidence_and_results() {
     let source = accept(&mut archive, calls(&["original / Unicode 调用"]));
     let call = CallRef::new(source, ToolCallId::new("original / Unicode 调用").unwrap());
     review(&mut archive, &call, false);
-    let bytes = archive.encode().unwrap();
-    let cold = SessionArchive::decode(&bytes).unwrap();
+    let snapshot = archive.snapshot();
+    let cold = SessionArchive::restore(snapshot.clone()).unwrap();
     let context = plan(&cold, 1_000_000, 1_000_000, &[]);
     let Mandatory::Assistant { user, steps } = context.mandatory() else {
         panic!("assistant plan")
@@ -517,7 +517,7 @@ fn active_bundle_is_indivisible_and_preserves_original_evidence_and_results() {
             .kind(),
         ModelErrorKind::ContextCapacity
     );
-    assert_eq!(cold.encode().unwrap(), bytes);
+    assert_eq!(cold.snapshot(), snapshot);
 }
 
 #[test]

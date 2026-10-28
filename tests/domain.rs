@@ -1,9 +1,15 @@
+#[path = "domain/context.rs"]
+mod context;
 #[path = "domain/conversation.rs"]
 mod conversation;
 #[path = "domain/message.rs"]
 mod message;
+#[path = "domain/model.rs"]
+mod model;
 #[path = "domain/roles.rs"]
 mod roles;
+#[path = "domain/session.rs"]
+mod session;
 #[path = "domain/tool.rs"]
 mod tool;
 #[path = "domain/value.rs"]

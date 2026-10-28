@@ -5,6 +5,3 @@ mod session_store;
 
 #[path = "app/agent_service.rs"]
 mod agent_service;
-
-#[path = "app/context.rs"]
-mod context;

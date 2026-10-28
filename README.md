@@ -47,9 +47,9 @@ traits. Adapters implement those contracts and own external I/O.
 
 | Layer | Responsibility | Reference |
 | --- | --- | --- |
-| `src/domain` | Checked values, conversation transitions, tools, review, and recovery. | [Domain contracts](docs/domain.md) |
-| `src/app` | Agent orchestration, model generation, and session persistence ports. | [Agent service](docs/agent-service.md), [model clients](docs/model-clients.md), [session persistence](docs/session-store.md) |
-| `src/adapters` | Web and CLI APIs, OpenAI and Anthropic clients, JSONL storage, Bash, and file tools. | [Inbound APIs](#inbound-apis), [model clients](docs/model-clients.md), [session persistence](docs/session-store.md), [tool adapters](docs/tools.md) |
+| `src/domain` | Checked values, conversation and invocation facts, context rules, tools and recovery. | [Domain contracts](docs/domain.md) |
+| `src/app` | Agent orchestration, model generation, and session persistence ports. | [Agent service](docs/agent-service.md), [model clients](docs/model-clients.md), [session persistence](docs/sessions.md) |
+| `src/adapters` | Web and CLI APIs, OpenAI and Anthropic clients, JSONL storage, Bash, and file tools. | [Inbound APIs](#inbound-apis), [model clients](docs/model-clients.md), [session persistence](docs/sessions.md), [tool adapters](docs/tools.md) |
 | `src/main.rs` | JSON configuration, context policies, component assembly, and process startup. | [Run COLA](#run-cola), [startup configuration](docs/api.md#executable-configuration) |
 
 `Session` validates and records facts without external I/O. `SessionArchive` adds invocation provenance and native evidence. Context plans select factual history separately from the complete archive. `AgentService` coordinates model requests, review, execution and commits. Callers supply its client, store, role settings and tools.
@@ -137,15 +137,3 @@ Model tests use local HTTP fixtures, while storage and tool tests use temporary
 files and real processes. Automated tests do not require live provider keys.
 
 Generate API reference documentation with `cargo doc --no-deps`.
-
-To verify the actual executable against real DeepSeek models with a private local configuration:
-
-```sh
-cargo build --locked
-python3 scripts/verify-deepseek.py --binary target/debug/cola --config config.json --evidence .scratch/deepseek-proof
-```
-
-The script uses the configured `api.deepseek.com` endpoint and model/reviewer, performs actual
-file reads, deletes the temporary fixtures, and checks that fresh CLI and Web processes answer
-from recorded history. It also checks durable request records and excludes credentials from evidence.
-The evidence directory must not already exist.

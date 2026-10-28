@@ -24,9 +24,10 @@ covers scoped IDs, approval/denial, ordered dispatch, actual outcomes, atomic
 rejection, faithful restoration and resolution evidence. Invalid snapshots are
 rejected without fabricating results.
 
-Context construction is an application concern. The old domain `Context`,
-`Assistant` and `ToolCallReviewer` traits have been removed. Run the full
-application group from the agent-chat map for `ContextPlan` and custom model ports.
+`ContextPlan` is domain policy. `tests/domain/context.rs` covers whole-turn selection,
+required history, metadata omission, active native evidence and exact rendered byte admission.
+Archive snapshot and immutable extension cases also belong to the domain group.
+Custom `ModelClient` and `SessionStore` implementations remain application-port tests.
 
 ## Limits
 

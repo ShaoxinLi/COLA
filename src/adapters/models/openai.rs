@@ -1,11 +1,11 @@
 use super::client::{
     self, Decoded, Event, OutputKind, WireCall, array, malformed, string, unsupported,
 };
-use crate::app::{IncompleteReason, ModelError, ModelErrorKind, ModelSettings};
+use crate::domain::{IncompleteReason, ModelError, ModelErrorKind, ModelSettings};
 use serde_json::{Value, json};
 
 pub(super) fn request<'a, O>(
-    plan: &crate::app::ContextPlan<O>,
+    plan: &crate::domain::ContextPlan<O>,
     settings: &ModelSettings,
     effort: Option<&str>,
     kind: OutputKind,
@@ -161,12 +161,12 @@ impl std::fmt::Debug for OpenAIClient {
 impl<O: super::client::Output> crate::app::ModelClient<O> for OpenAIClient {
     fn prepare(
         &self,
-        plan: &crate::app::ContextPlan<O>,
+        plan: &crate::domain::ContextPlan<O>,
         settings: &ModelSettings,
-    ) -> Result<crate::app::PreparedRequest<O>, ModelError> {
+    ) -> Result<crate::domain::PreparedRequest<O>, ModelError> {
         self.0.prepare(plan, settings)
     }
-    fn invoke(&self, request: &crate::app::PreparedRequest<O>) -> crate::app::ObservedReply<O> {
+    fn invoke(&self, request: &crate::domain::PreparedRequest<O>) -> crate::app::ObservedReply<O> {
         self.0.invoke(request)
     }
 }

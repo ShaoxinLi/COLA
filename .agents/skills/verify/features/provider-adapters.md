@@ -31,6 +31,5 @@ nested JSON echoes, including truncated captures that remain committable.
 ## Limits
 
 Fixtures bind loopback with dummy credentials. They do not establish live auth,
-quotas, availability or current vendor schemas. The opt-in DeepSeek executable
-harness in README provides a separate live journey, including host-file reads
-and process restart. It does not verify live Anthropic service compatibility.
+quotas, availability or current vendor schemas. Live model acceptance requires a separate configured journey.
+A DeepSeek run does not establish live Anthropic service compatibility.

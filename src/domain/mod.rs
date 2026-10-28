@@ -1,6 +1,9 @@
+mod context;
 mod conversation;
 mod message;
+mod model;
 mod roles;
+mod session;
 mod tool;
 mod value;
 
@@ -18,4 +21,18 @@ pub use tool::{
 pub use value::{
     CallRef, GenerationId, NonEmptyText, SessionId, Timestamp, ToolCallId, ToolName, TurnId,
     ValueError,
+};
+
+pub use context::{
+    BudgetMeasurement, ContextLimits, ContextPlan, Fitted, HistoryGroup, Mandatory, NativeArtifact,
+    NativeStep, SELECTION_POLICY, Selection, SelectionManifest, TOKEN_ESTIMATE_METHOD,
+};
+pub use model::{
+    Effort, IncompleteReason, ModelError, ModelErrorKind, ModelId, ModelSettings, ModelTarget,
+    PreparedRequest, ResponseCapture, ResponseReceipt, Usage,
+};
+pub use session::{
+    ArchiveChange, ArchiveError, ArchiveSnapshot, BudgetSnapshot, Disposition, GenerationRecord,
+    GenerationSnapshot, InvocationIntent, InvocationRole, Observation, Revision, SelectionSnapshot,
+    SessionArchive,
 };

@@ -73,7 +73,7 @@ A transaction holds an exclusive per-session lock. A conflicting writer receives
 error. Expected commit identity prevents stale snapshots from overwriting newer data.
 After uncertain publication, the service stops external dispatch. Resolution compares the
 exact proposed bytes and synchronizes them under ownership; merely seeing bytes on a read
-is not proof of durability. See [session persistence](session-store.md).
+is not proof of durability. See [session persistence](sessions.md).
 
 `max_iterations` counts assistant generations, not reviews. Every call in an accepted batch
 is handled before checking the next assistant-generation budget. Exhaustion commits an

@@ -1,5 +1,6 @@
 use super::support::*;
-use cola::app::{Generation, IncompleteReason};
+use cola::app::Generation;
+use cola::domain::IncompleteReason;
 use serde_json::json;
 
 #[test]

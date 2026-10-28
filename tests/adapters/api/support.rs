@@ -161,10 +161,7 @@ impl SessionTransaction for Transaction {
         &self.current
     }
     fn commit(&mut self, change: &ArchiveChange) -> Result<(), CommitFault> {
-        if change
-            .base_key()
-            .is_none_or(|key| key.revision() != self.current.revision())
-        {
+        if change.base() != Some(&self.current) {
             return Err(CommitFault::Conflict);
         }
         self.store.publish(change)?;

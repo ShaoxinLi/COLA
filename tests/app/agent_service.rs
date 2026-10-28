@@ -1,3 +1,4 @@
+use cola::adapters::stores::JsonlArchiveCodec;
 use cola::{adapters::stores::JsonlSessionStore, app::*, domain::*};
 use serde_json::{Map, Value, json};
 use std::{
@@ -129,7 +130,7 @@ impl Store {
         ) {
             state.bytes.insert(
                 change.candidate().session().id().clone(),
-                change.encoded().to_vec(),
+                JsonlArchiveCodec::encode(change.candidate()).unwrap(),
             );
         }
         match fault {
@@ -153,14 +154,14 @@ impl SessionStore for Store {
         state
             .bytes
             .values()
-            .map(|bytes| SessionArchive::decode(bytes))
+            .map(|bytes| JsonlArchiveCodec::decode(bytes))
             .collect()
     }
     fn inspect(&self, id: &SessionId) -> Result<SessionArchive, SessionStoreError> {
-        SessionArchive::decode(self.0.borrow().bytes.get(id).ok_or_else(missing_error)?)
+        JsonlArchiveCodec::decode(self.0.borrow().bytes.get(id).ok_or_else(missing_error)?)
     }
     fn create(&self, change: &ArchiveChange) -> Result<(), CommitFault> {
-        if change.base_key().is_some()
+        if change.base().is_some()
             || self
                 .0
                 .borrow()
@@ -208,31 +209,35 @@ impl SessionTransaction for Transaction {
     }
     fn commit(&mut self, change: &ArchiveChange) -> Result<(), CommitFault> {
         let current = self.store.bytes(self.confirmed.session().id());
-        if current != self.confirmed.encode().map_err(CommitFault::NotPublished)?
-            || change.base_key().map(|key| key.revision()) != Some(self.confirmed.revision())
+        if current
+            != JsonlArchiveCodec::encode(&self.confirmed).map_err(CommitFault::NotPublished)?
+            || change.base() != Some(&self.confirmed)
         {
             return Err(CommitFault::Conflict);
         }
         self.store.publication(change)?;
         self.confirmed =
-            SessionArchive::decode(change.encoded()).map_err(CommitFault::NotPublished)?;
+            JsonlArchiveCodec::decode(&JsonlArchiveCodec::encode(change.candidate()).unwrap())
+                .map_err(CommitFault::NotPublished)?;
         Ok(())
     }
     fn resolve(&mut self, change: &ArchiveChange) -> Result<(), CommitFault> {
         self.store.0.borrow_mut().resolves += 1;
         let current = self.store.bytes(self.confirmed.session().id());
-        if current == change.encoded() {
+        if current == JsonlArchiveCodec::encode(change.candidate()).unwrap() {
             if matches!(
                 self.store.0.borrow().fault,
                 Some((_, Fault::RepairablePublished))
             ) {
                 self.confirmed =
-                    SessionArchive::decode(&current).map_err(CommitFault::NotPublished)?;
+                    JsonlArchiveCodec::decode(&current).map_err(CommitFault::NotPublished)?;
                 Ok(())
             } else {
                 Err(CommitFault::Uncertain(storage_error()))
             }
-        } else if current == self.confirmed.encode().map_err(CommitFault::NotPublished)? {
+        } else if current
+            == JsonlArchiveCodec::encode(&self.confirmed).map_err(CommitFault::NotPublished)?
+        {
             Err(CommitFault::NotPublished(storage_error()))
         } else {
             Err(CommitFault::Conflict)
@@ -974,7 +979,7 @@ fn complete_invocation_provenance_is_monotonic_and_roundtrips_public_store_codec
     let agent = f.basic(2);
     let id = agent.new_session().unwrap().session().id().clone();
     let completed = agent.chat(&id, user("request exact whitespace  ")).unwrap();
-    let archive = SessionArchive::decode(&f.store.bytes(&id)).unwrap();
+    let archive = JsonlArchiveCodec::decode(&f.store.bytes(&id)).unwrap();
     assert_eq!(&archive, completed.archive());
     assert_eq!(
         archive
@@ -1720,7 +1725,7 @@ fn disk_inspection_is_faithful_and_explicit_recovery_closes_once_without_model_o
         let agent = native_service(Provider::OpenAI, &server, directory.path(), io.clone(), 2);
         for _ in 0..3 {
             assert_eq!(
-                SessionArchive::decode(&original).unwrap(),
+                JsonlArchiveCodec::decode(&original).unwrap(),
                 *change.candidate()
             );
             assert_eq!(agent.inspect(&id).unwrap(), *change.candidate());

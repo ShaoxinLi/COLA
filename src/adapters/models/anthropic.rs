@@ -1,10 +1,8 @@
 use super::client::{
     self, Decoded, Event, OutputKind, WireCall, array, malformed, string, unsupported,
 };
-use crate::{
-    app::{IncompleteReason, ModelError, ModelSettings},
-    domain::ToolOutcome,
-};
+use crate::domain::ToolOutcome;
+use crate::domain::{IncompleteReason, ModelError, ModelSettings};
 use serde_json::{Value, json};
 fn push(messages: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
     if let Some(last) = messages.last_mut().filter(|last| last["role"] == role) {
@@ -17,7 +15,7 @@ fn push(messages: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
     }
 }
 pub(super) fn request<'a, O>(
-    plan: &crate::app::ContextPlan<O>,
+    plan: &crate::domain::ContextPlan<O>,
     settings: &ModelSettings,
     effort: Option<&str>,
     kind: OutputKind,
@@ -62,7 +60,7 @@ pub(super) fn request<'a, O>(
         "messages": messages,
         "max_tokens": settings.max_output_tokens.get(),
     });
-    if settings.effort == crate::app::Effort::Off {
+    if settings.effort == crate::domain::Effort::Off {
         body["thinking"] = json!({"type":"disabled"});
     } else if let Some(effort) = effort {
         body["output_config"] = json!({"effort":effort});
@@ -143,12 +141,12 @@ impl std::fmt::Debug for AnthropicClient {
 impl<O: super::client::Output> crate::app::ModelClient<O> for AnthropicClient {
     fn prepare(
         &self,
-        plan: &crate::app::ContextPlan<O>,
+        plan: &crate::domain::ContextPlan<O>,
         settings: &ModelSettings,
-    ) -> Result<crate::app::PreparedRequest<O>, ModelError> {
+    ) -> Result<crate::domain::PreparedRequest<O>, ModelError> {
         self.0.prepare(plan, settings)
     }
-    fn invoke(&self, request: &crate::app::PreparedRequest<O>) -> crate::app::ObservedReply<O> {
+    fn invoke(&self, request: &crate::domain::PreparedRequest<O>) -> crate::app::ObservedReply<O> {
         self.0.invoke(request)
     }
 }
