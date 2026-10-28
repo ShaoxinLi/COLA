@@ -17,6 +17,7 @@ target/
 
 # Local conversations
 .cola/
+/config.json
 
 # Automation dependencies, compiled output and local runtime state
 __pycache__/
