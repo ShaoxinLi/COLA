@@ -142,6 +142,31 @@ fn reviewer_failure_is_durable_and_acknowledgement_is_idempotent_without_tool_io
             panic!("{error:?}")
         };
         let invocation = *invocation;
+        let before_retry = svc.inspect_session(&id).unwrap();
+        assert!(matches!(
+            svc.chat(&id, user("retry live service"))
+                .unwrap_err()
+                .kind(),
+            AgentErrorKind::ReviewBlocked { .. }
+        ));
+        let address = before_retry
+            .session()
+            .call_address(ToolCallId::new("native-1").unwrap())
+            .unwrap();
+        assert!(matches!(
+            svc.resolve_effect(
+                address,
+                EffectResolution::new(
+                    EffectDisposition::NotPerformed,
+                    ResolutionSource::UserAttestation,
+                    text("not executed")
+                )
+            )
+            .unwrap_err()
+            .kind(),
+            AgentErrorKind::RejectedOutput(SessionError::EffectNotUnknown)
+        ));
+        assert_eq!(svc.inspect_session(&id).unwrap(), before_retry);
         drop(svc);
         let mut reopened = service(provider, &server, root.path());
         assert!(matches!(
@@ -149,6 +174,7 @@ fn reviewer_failure_is_durable_and_acknowledgement_is_idempotent_without_tool_io
             AgentErrorKind::ReviewBlocked { .. }
         ));
         assert_eq!(server.requests().len(), 2);
+        assert_eq!(reopened.inspect_session(&id).unwrap(), before_retry);
         reopened
             .acknowledge_review_failure(
                 &id,
@@ -162,7 +188,9 @@ fn reviewer_failure_is_durable_and_acknowledgement_is_idempotent_without_tool_io
         assert_eq!(doc.review_block(), None);
         assert_eq!(
             doc.session().turns()[0].outcome(),
-            &TurnOutcome::Interrupted(StopReason::ProcessLost)
+            &TurnOutcome::Failed(TurnFailure::ModelFailure(text(
+                "Model request failed (ProviderFailure)"
+            )))
         );
         assert_eq!(
             doc.session().turns()[0].steps()[0]
@@ -556,4 +584,122 @@ fn same_turn_instruction_edits_fail_before_next_network_request() {
         matches!(error.kind(),AgentErrorKind::Model{source,..} if source.kind()==ModelErrorKind::NativeHistoryIncompatible)
     );
     assert_eq!(server.requests().len(), 2);
+}
+
+#[test]
+fn archive_rejects_a_successful_return_after_a_denied_review() {
+    let p = Provider::OpenAI;
+    let server = Server::new(vec![
+        p.tool(1).into(),
+        decision(p, true).into(),
+        p.answer("done").into(),
+    ]);
+    let root = tempfile::tempdir().unwrap();
+    let mut svc = service(p, &server, root.path());
+    let id = svc.new_session().unwrap().id().clone();
+    svc.chat(&id, user("ask")).unwrap();
+    drop(svc);
+    let path = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .unwrap();
+    let archive = std::fs::read_to_string(&path).unwrap();
+    let (header, turns) = archive.split_once('\n').unwrap();
+    let mut header: serde_json::Value = serde_json::from_str(header).unwrap();
+    assert_eq!(
+        header["invocations"][1]["state"]["Finished"]["outcome"]["Review"]["allow"],
+        true
+    );
+    header["invocations"][1]["state"]["Finished"]["outcome"]["Review"]["allow"] =
+        serde_json::json!(false);
+    let corrupted = format!("{header}\n{turns}");
+    std::fs::write(&path, &corrupted).unwrap();
+    let store = JsonlSessionStore::new(root.path());
+    assert_eq!(
+        store.inspect(&id).unwrap_err().kind(),
+        SessionStoreErrorKind::InvalidData
+    );
+    assert_eq!(
+        store.acquire(&id).err().unwrap().kind(),
+        SessionStoreErrorKind::InvalidData
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupted);
+}
+
+struct BrokenContext {
+    review_only: bool,
+}
+impl Assistant for BrokenContext {
+    fn context(&self, session: &Session) -> Result<Context<AssistantMessage>, ContextError> {
+        if self.review_only {
+            Assistant::context(&Roles, session)
+        } else {
+            Err(ContextError::MissingUser)
+        }
+    }
+}
+impl ToolCallReviewer for BrokenContext {
+    fn context(&self, _: &Session, _: &ToolCall) -> Result<Context<Decision>, ContextError> {
+        Err(ContextError::UnresolvedToolBatch)
+    }
+}
+#[test]
+fn role_context_errors_retain_their_domain_source_and_review_block() {
+    for review_only in [false, true] {
+        let p = Provider::OpenAI;
+        let server = Server::new(vec![p.tool(1).into()]);
+        let root = tempfile::tempdir().unwrap();
+        let mut svc = AgentService::new(
+            Pair {
+                assistant: p.client(&server),
+                reviewer: p.reviewer(&server),
+            },
+            JsonlSessionStore::new(root.path()),
+            BrokenContext { review_only },
+            BrokenContext { review_only },
+            vec![(tool(), Box::new(Target(Arc::new(AtomicUsize::new(0)))))],
+            AgentSettings {
+                assistant_model_settings: p.settings(),
+                reviewer_model_settings: p.settings(),
+                max_iterations: std::num::NonZeroU32::new(8).unwrap(),
+            },
+        )
+        .unwrap();
+        let id = svc.new_session().unwrap().id().clone();
+        let error = svc.chat(&id, user("ask")).unwrap_err();
+        let kind = if review_only {
+            let AgentErrorKind::ReviewFailure {
+                invocation: 2,
+                source,
+            } = error.kind()
+            else {
+                panic!("{error:?}")
+            };
+            assert_eq!(svc.inspect_session(&id).unwrap().review_block(), Some(2));
+            source.as_ref()
+        } else {
+            error.kind()
+        };
+        let AgentErrorKind::Context { role, source } = kind else {
+            panic!("{kind:?}")
+        };
+        assert_eq!(
+            *role,
+            if review_only {
+                ModelRole::Reviewer
+            } else {
+                ModelRole::Assistant
+            }
+        );
+        assert_eq!(
+            *source,
+            if review_only {
+                ContextError::UnresolvedToolBatch
+            } else {
+                ContextError::MissingUser
+            }
+        );
+        assert_eq!(server.requests().len(), usize::from(review_only));
+    }
 }

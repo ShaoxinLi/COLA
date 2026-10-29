@@ -94,8 +94,9 @@ impl SessionStore for JsonlSessionStore {
         }))
     }
     fn acquire(&self, id: &SessionId) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
-        let lock = self.lock(id)?;
         let path = self.root.join(filename(id.as_str()));
+        fs::metadata(&path).map_err(read_error)?;
+        let lock = self.lock(id)?;
         fs::File::open(&path)
             .map_err(read_error)?
             .sync_all()

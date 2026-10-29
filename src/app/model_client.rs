@@ -1,7 +1,7 @@
 use super::{
     ContextSelection, ModelArtifact, RequestEvidence, ResponseEvidence, SessionStoreError, TurnView,
 };
-use crate::domain::{Context, NonEmptyText};
+use crate::domain::{ActiveTurn, CallAddress, Context, NonEmptyText, ToolCall};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt, num::NonZeroU32};
 
@@ -74,6 +74,14 @@ pub struct ModelInput<'a, O> {
     pub selection: &'a ContextSelection,
     pub view: Option<&'a TurnView>,
     pub native: &'a [NativeStep],
+    pub review_subject: Option<&'a ReviewSubject>,
+}
+/// Exact mandatory facts gathered by the application for one candidate review.
+#[derive(Clone, Debug)]
+pub struct ReviewSubject {
+    pub turn: ActiveTurn,
+    pub address: CallAddress,
+    pub candidate: ToolCall,
 }
 #[derive(Clone, Debug)]
 pub struct NativeStep {
@@ -83,8 +91,21 @@ pub struct NativeStep {
 pub trait BeforeModelSend {
     fn persist(&mut self, prepared: PreparedInvocation) -> Result<SendPermit, SessionStoreError>;
 }
+/// Authorization to send the exact request whose preparation was committed.
+///
+/// ```compile_fail
+/// use cola::app::{ModelArtifact, SendPermit};
+/// let permit = SendPermit { body: ModelArtifact {
+///     format: "forged".into(), version: 1, bytes: vec![],
+/// }};
+/// ```
 pub struct SendPermit {
-    pub(crate) _revision: u64,
+    pub(super) body: ModelArtifact,
+}
+impl SendPermit {
+    pub fn into_body(self) -> ModelArtifact {
+        self.body
+    }
 }
 #[derive(Clone, Debug)]
 pub struct PreparedInvocation {
@@ -126,6 +147,7 @@ pub enum ModelErrorKind {
     NativeIdCollision,
     ContextSelectionTooLarge,
     InvalidSelection,
+    InvalidToolCatalog,
     Transport,
     Timeout,
     Http,

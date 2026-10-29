@@ -24,7 +24,9 @@ Tool names are unique. Advertised definitions must match the registered catalog.
 `Assistant` and `ToolCallReviewer` remain caller-defined context hooks. They may
 select historical exchanges but cannot alter their facts. Assistant context must
 preserve the exact current exchange. The application supplies the reviewer with
-mandatory current-turn facts, the exact candidate, and its complete address.
+mandatory current-turn facts, the exact candidate, and its complete address as a
+typed `ReviewSubject`. Adapters render this subject as labelled user-role data,
+separate from policy instructions.
 Model audit metadata never enters these semantic facts.
 
 ## Commit and I/O ordering
@@ -35,6 +37,7 @@ Each command reads the latest document under that lock.
 1. Commit the user message and a planned invocation.
 2. The model adapter compiles the request. The application recorder commits its
    exact nonsecret bytes and the initial frozen view before permitting HTTP.
+   The returned `SendPermit` owns those bytes and is consumed by transport.
 3. Commit the response evidence and accepted assistant step together. Rejected
    output is audited without creating an executable step.
 4. Record tool dispatch intent, plan and prepare its review, then commit the
@@ -56,7 +59,9 @@ revision after an uncertain publication.
 Inspection preserves active facts. The next writer explicitly commits recovery,
 closing an abandoned active turn as `Interrupted(ProcessLost)`. It never resumes
 that turn or retries its tools. Planned invocations become not sent. Prepared
-invocations without a committed response become response unknown.
+invocations without a committed response become response unknown. A completed
+reviewer failure remains active until acknowledgement closes it with its known
+cause. Repeated chat and effect-resolution attempts preserve that cause.
 
 Review refusal, incompleteness, malformed output, transport failure, preparation
 failure, and unknown prepared responses block later chats. The initial failure

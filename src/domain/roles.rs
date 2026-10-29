@@ -28,7 +28,9 @@ impl Decision {
 }
 
 /// Synchronous review context assembly implemented outside the domain library.
-/// Implementations select history and render active-turn facts and the explicit call.
+/// Implementations choose policy instructions and optional closed history.
+/// The application supplies the exact mandatory active-turn subject and candidate
+/// separately from those instructions.
 /// This contract does not check call membership or invoke models or tools.
 pub trait ToolCallReviewer {
     fn context(

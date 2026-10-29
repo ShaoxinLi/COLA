@@ -110,8 +110,9 @@ facts. `ToolCallReviewer::context` also receives the exact call and builds
 `Context<Decision>`. Neither trait invokes a model or tool.
 
 The reviewer selects history and policy instructions. The application adds the
-exact candidate address and complete active-turn facts to each review. `closed_context_exchanges` remains available during a
-pending batch.
+exact candidate address and complete active-turn facts as a typed review subject.
+The adapter renders it as user-role data separate from policy instructions.
+`closed_context_exchanges` remains available during a pending batch.
 `Decision` records allowance and an optional nonblank reason. It does not itself
 authorize execution, establish freshness, or verify call membership.
 
@@ -126,7 +127,9 @@ turn numbering, batch-local call uniqueness, execution alignment and order, outc
 resolution eligibility. Failures return `RestoreError`.
 
 Restore preserves active work exactly. The application commits explicit
-`Interrupted(ProcessLost)` recovery under its write lock without executing calls.
+`Interrupted(ProcessLost)` recovery for abandoned work under its write lock
+without executing calls. A known completed reviewer failure instead remains
+active until acknowledgement closes it with its original cause.
 Closed turns retain partial batches and resolution evidence. Validation checks
 structural consistency but does not authenticate recorded effects.
 

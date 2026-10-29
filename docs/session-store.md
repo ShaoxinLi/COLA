@@ -28,7 +28,9 @@ Domain snapshots are validated separately through normal domain transitions.
 uses a SHA-256-derived filename ending in `.jsonl`. A stable sibling `.lock` file
 is held with the operating system's exclusive file lock for the whole command.
 It is never deleted to release ownership. A competing process receives `Busy`.
-The OS releases ownership when the writer drops or its process exits.
+The OS releases ownership when the writer drops or its process exits. Acquiring
+a missing session creates no directory or lock file. An existing authoritative
+JSONL archive can recreate its missing lock file.
 
 The first JSON line contains `format: "cola.session"`, `version: 2`, session ID,
 record counts, revision, invocation audit, views, and acknowledgements. Subsequent
@@ -58,8 +60,9 @@ commits conservative recovery. There is no second authority or uncertainty file.
 Read-only inspection does not declare a live writer lost. Recovery is an explicit
 application transaction under the lock. It closes abandoned active work as
 `ProcessLost`, classifies planned calls as not sent and prepared calls as response
-unknown, and preserves dispatch/effect evidence. It never retries a tool or
-manufactures a tool result.
+unknown, and preserves dispatch/effect evidence. Completed reviewer failures
+retain their active turn and known cause until acknowledgement. Recovery never
+retries a tool or manufactures a tool result.
 
 The local filesystem tests cover real process locks, stale revisions, corruption,
 atomic checkpoint ordering, and injected failures on both sides of publication.

@@ -13,16 +13,10 @@ pub(super) fn request(
 ) -> Value {
     let decision = kind == OutputKind::Decision;
     let mut input = Vec::new();
-    if decision {
-        for text in client::review_history(snapshot) {
-            input.push(json!({"role":"user","content":text}));
-        }
-    } else {
-        for event in events {
-            match event {
-                Event::User(text) | Event::Fact(text) => {
-                    input.push(json!({"role": "user", "content": text}));
-                }
+    for event in events {
+        match event {
+            Event::User(text) | Event::Fact(text) => {
+                input.push(json!({"role": "user", "content": text}));
             }
         }
     }

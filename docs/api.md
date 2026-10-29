@@ -250,8 +250,8 @@ that the last save succeeded. An error does not imply that a tool had no effect.
 | `413` | `body_too_large` |
 | `415` | `unsupported_media_type` |
 | `422` | `generation_refused`, `iteration_limit`, `context_selection_too_large` |
-| `500` | `store_failure`, `invalid_document`, `invalid_context_selection`, `rejected_output`, `unexpected_state`, `duplicate_tool`, `internal_failure` |
-| `502` | `generation_incomplete`, `model_failure` |
+| `500` | `store_failure`, `invalid_document`, `invalid_context_selection`, `invalid_context`, `catalog_mismatch`, `rejected_output`, `unexpected_state`, `duplicate_tool`, `internal_failure` |
+| `502` | `generation_incomplete`, `model_failure`, `output_rejected` |
 | `504` | `model_timeout` |
 
 CLI input failures use `invalid_input`. Service failures use the corresponding

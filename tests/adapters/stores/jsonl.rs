@@ -113,3 +113,58 @@ fn old_version_corruption_and_identity_mismatch_are_preserved_and_refused() {
         SessionStoreErrorKind::InvalidData
     );
 }
+
+#[test]
+fn missing_ids_do_not_create_store_or_lock_files() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("absent-store");
+    let store = JsonlSessionStore::new(&path);
+    let missing = SessionId::new("missing-web-id").unwrap();
+    assert_eq!(
+        store.acquire(&missing).err().unwrap().kind(),
+        SessionStoreErrorKind::NotFound
+    );
+    assert!(!path.exists());
+    fs::create_dir(&path).unwrap();
+    assert_eq!(
+        store.acquire(&missing).err().unwrap().kind(),
+        SessionStoreErrorKind::NotFound
+    );
+    assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+}
+#[test]
+fn copied_authoritative_archive_recreates_a_stable_lock() {
+    let source = tempfile::tempdir().unwrap();
+    let store = JsonlSessionStore::new(source.path());
+    let writer = store.create().unwrap();
+    let document = writer.committed().clone();
+    drop(writer);
+    let archive = fs::read_dir(source.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    fs::copy(
+        &archive,
+        destination.path().join(archive.file_name().unwrap()),
+    )
+    .unwrap();
+    let copied = JsonlSessionStore::new(destination.path());
+    let writer = copied.acquire(document.session().id()).unwrap();
+    assert_eq!(writer.committed(), &document);
+    assert_eq!(
+        copied
+            .acquire(document.session().id())
+            .err()
+            .unwrap()
+            .kind(),
+        SessionStoreErrorKind::Busy
+    );
+    drop(writer);
+    assert_eq!(fs::read_dir(destination.path()).unwrap().count(), 2);
+    assert_eq!(
+        copied.acquire(document.session().id()).unwrap().committed(),
+        &document
+    );
+}

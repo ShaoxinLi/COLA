@@ -369,6 +369,13 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
                     "Context selection does not preserve required facts",
                     Some(*role),
                 )
+            } else if source.kind() == ModelErrorKind::InvalidToolCatalog {
+                (
+                    FailureClass::Internal,
+                    "catalog_mismatch",
+                    "Advertised tools do not match the registered catalog",
+                    Some(*role),
+                )
             } else if source.kind() == ModelErrorKind::Timeout {
                 (
                     FailureClass::Timeout,
@@ -385,6 +392,18 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
                 )
             }
         }
+        AgentErrorKind::Context { role, .. } => (
+            FailureClass::Internal,
+            "invalid_context",
+            "Role context could not be assembled",
+            Some(*role),
+        ),
+        AgentErrorKind::OutputRejected { .. } => (
+            FailureClass::Model,
+            "output_rejected",
+            "Model output violates the advertised catalog or session transition",
+            Some(ModelRole::Assistant),
+        ),
         AgentErrorKind::IterationLimit => (
             FailureClass::IterationLimit,
             "iteration_limit",

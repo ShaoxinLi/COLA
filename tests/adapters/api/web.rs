@@ -38,15 +38,31 @@ fn call() -> ToolCall {
 }
 struct Roles {
     counts: Counts,
+    mode: String,
 }
 impl Assistant for Roles {
     fn context(&self, s: &Session) -> Result<Context<AssistantMessage>, ContextError> {
-        Context::new(text("answer"), s.context_exchanges()?, vec![definition()])
+        if self.mode == "context-error" {
+            return Err(ContextError::MissingUser);
+        }
+        let tool = if self.mode == "catalog-mismatch" {
+            ToolDefinition::new(
+                ToolName::new("echo").unwrap(),
+                text("changed description"),
+                InputSchema::new(json!({"type":"object"})).unwrap(),
+            )
+        } else {
+            definition()
+        };
+        Context::new(text("answer"), s.context_exchanges()?, vec![tool])
     }
 }
 impl ToolCallReviewer for Roles {
     fn context(&self, s: &Session, _: &ToolCall) -> Result<Context<Decision>, ContextError> {
         self.counts.review.set(self.counts.review.get() + 1);
+        if self.mode == "review-context-error" {
+            return Err(ContextError::MissingUser);
+        }
         Context::new(text("review"), s.closed_context_exchanges()?, vec![])
     }
 }
@@ -65,6 +81,22 @@ impl Model {
         match self.mode.as_str() {
             "timeout" => return Err(ModelError::new(ModelErrorKind::Timeout)),
             "model" => return Err(ModelError::new(ModelErrorKind::Transport)),
+            "output-rejected" => {
+                return Ok(Generation::Complete {
+                    output: AssistantMessage::tool_requests(
+                        None,
+                        ToolCalls::new(vec![
+                            ToolCall::new(
+                                ToolCallId::new("unknown-call").unwrap(),
+                                ToolName::new("unknown").unwrap(),
+                                json!({}),
+                            )
+                            .unwrap(),
+                        ])
+                        .unwrap(),
+                    ),
+                });
+            }
             "refused" => {
                 return Ok(Generation::Refused {
                     reason: Some(text("private refusal")),
@@ -77,18 +109,20 @@ impl Model {
             }
             _ => {}
         }
-        let output =
-            if (self.mode == "tools" || self.mode == "review-timeout" || self.mode == "denied")
-                && n == 1
-                || self.mode == "limit"
-            {
-                AssistantMessage::tool_requests(
-                    Some("checking".into()),
-                    ToolCalls::new(vec![call()]).unwrap(),
-                )
-            } else {
-                AssistantMessage::answer(format!("answer-{n}")).unwrap()
-            };
+        let output = if (self.mode == "tools"
+            || self.mode == "review-timeout"
+            || self.mode == "review-context-error"
+            || self.mode == "denied")
+            && n == 1
+            || self.mode == "limit"
+        {
+            AssistantMessage::tool_requests(
+                Some("checking".into()),
+                ToolCalls::new(vec![call()]).unwrap(),
+            )
+        } else {
+            AssistantMessage::answer(format!("answer-{n}")).unwrap()
+        };
         Ok(Generation::Complete { output })
     }
 }
@@ -238,9 +272,11 @@ fn service<S: SessionStore>(
         store,
         Roles {
             counts: counts.clone(),
+            mode: mode.into(),
         },
         Roles {
             counts: counts.clone(),
+            mode: mode.into(),
         },
         vec![(definition(), Box::new(Target(counts)))],
         AgentSettings {
@@ -713,6 +749,10 @@ fn http_tool_results_and_failure_progress_are_full_and_safe() {
         ("refused", 422, "generation_refused", "assistant"),
         ("incomplete", 502, "generation_incomplete", "assistant"),
         ("model", 502, "model_failure", "assistant"),
+        ("catalog-mismatch", 500, "catalog_mismatch", "assistant"),
+        ("context-error", 500, "invalid_context", "assistant"),
+        ("review-context-error", 500, "invalid_context", "reviewer"),
+        ("output-rejected", 502, "output_rejected", "assistant"),
         ("limit", 422, "iteration_limit", ""),
         ("save-failure", 500, "store_failure", ""),
     ] {
@@ -727,7 +767,7 @@ fn http_tool_results_and_failure_progress_are_full_and_safe() {
         }
         assert!(!v.to_string().contains("/private/secret"));
         assert!(!v.to_string().contains("private refusal"));
-        if mode == "review-timeout" {
+        if mode == "review-timeout" || mode == "review-context-error" {
             assert_eq!(
                 v["error"]["progress"]["active"]["steps"][0]["executions"][0]["state"]["kind"],
                 "started"

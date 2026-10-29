@@ -44,15 +44,14 @@ struct Recorder<'a> {
 }
 impl BeforeModelSend for Recorder<'_> {
     fn persist(&mut self, prepared: PreparedInvocation) -> Result<SendPermit, SessionStoreError> {
+        let body = prepared.request.body.clone();
         let next = self
             .writer
             .committed()
             .prepared(self.invocation, prepared)
             .map_err(|e| SessionStoreError::new(SessionStoreErrorKind::InvalidData, e))?;
-        let revision = self.writer.commit(next)?;
-        Ok(SendPermit {
-            _revision: revision,
-        })
+        self.writer.commit(next)?;
+        Ok(SendPermit { body })
     }
 }
 impl<M, S, A, R> AgentService<M, S, A, R>
@@ -237,6 +236,7 @@ where
                     commit(&mut *writer, next, Checkpoint::PlannedInvocation)?;
                     let invocation = writer.committed().invocations().last().unwrap().id;
                     let context = self.assistant.context(writer.committed().session());
+                    let context_error = context.as_ref().err().cloned();
                     let mut advertised = vec![];
                     let observed = match context {
                         Err(_) => {
@@ -260,7 +260,7 @@ where
                                     .is_none_or(|(registered, _)| registered != t)
                             }) {
                                 Observation::failed(ModelError::new(
-                                    ModelErrorKind::UnsupportedInput,
+                                    ModelErrorKind::InvalidToolCatalog,
                                 ))
                             } else {
                                 let selection = selection_for(
@@ -287,6 +287,7 @@ where
                                             selection: &selection,
                                             view: view.as_ref(),
                                             native: &native,
+                                            review_subject: None,
                                         };
                                         ModelClient::<AssistantMessage>::invoke(
                                             &self.model_client,
@@ -317,20 +318,25 @@ where
                         .accept_assistant(invocation, &observed, &advertised)
                         .map_err(|e| document_error(writer.committed(), e))?;
                     commit(&mut *writer, next, Checkpoint::AcceptedAssistant)?;
-                    if let Some(kind) = generation_error(&observed.generation, ModelRole::Assistant)
+                    if let Some(kind) = context_error
+                        .map(|source| AgentErrorKind::Context {
+                            role: ModelRole::Assistant,
+                            source,
+                        })
+                        .or_else(|| generation_error(&observed.generation, ModelRole::Assistant))
                     {
                         return Err(error(Some(writer.committed()), kind));
                     }
-                    if matches!(
-                        writer.committed().invocations().last().unwrap().state,
-                        InvocationState::Finished {
-                            outcome: RecordedOutcome::OutputRejected { .. },
-                            ..
-                        }
-                    ) {
+                    if let InvocationState::Finished {
+                        outcome: RecordedOutcome::OutputRejected { reason },
+                        ..
+                    } = &writer.committed().invocations().last().unwrap().state
+                    {
                         return Err(error(
                             Some(writer.committed()),
-                            AgentErrorKind::UnexpectedState,
+                            AgentErrorKind::OutputRejected {
+                                reason: reason.clone(),
+                            },
                         ));
                     }
                 }
@@ -370,26 +376,17 @@ where
                     commit(&mut *writer, next, Checkpoint::PlannedInvocation)?;
                     let invocation = writer.committed().invocations().last().unwrap().id;
                     let context = self.reviewer.context(writer.committed().session(), &call);
+                    let context_error = context.as_ref().err().cloned();
                     let observed = match context {
                         Err(_) => {
                             Observation::failed(ModelError::new(ModelErrorKind::InvalidSelection))
                         }
                         Ok(context) => {
-                            let facts = format!(
-                                "{}{}",
-                                context.instructions(),
-                                super::context_policy::review_facts(
-                                    writer.committed().session(),
-                                    &call,
-                                    &address
-                                )
-                            );
-                            let context = Context::new(
-                                NonEmptyText::new(facts).unwrap(),
-                                context.exchanges().to_vec(),
-                                context.tools().to_vec(),
-                            )
-                            .unwrap();
+                            let subject = ReviewSubject {
+                                turn: writer.committed().session().active_turn().unwrap().clone(),
+                                address: address.clone(),
+                                candidate: call.clone(),
+                            };
                             match selection_for(
                                 &*self.context_policy,
                                 writer.committed().session(),
@@ -404,6 +401,7 @@ where
                                         selection: &selection,
                                         view: None,
                                         native: &[],
+                                        review_subject: Some(&subject),
                                     },
                                     &mut Recorder {
                                         writer: &mut *writer,
@@ -433,7 +431,17 @@ where
                             AgentErrorKind::ReviewFailure {
                                 invocation,
                                 source: Box::new(
-                                    generation_error(&observed.generation, ModelRole::Reviewer)
+                                    context_error
+                                        .map(|source| AgentErrorKind::Context {
+                                            role: ModelRole::Reviewer,
+                                            source,
+                                        })
+                                        .or_else(|| {
+                                            generation_error(
+                                                &observed.generation,
+                                                ModelRole::Reviewer,
+                                            )
+                                        })
                                         .expect("nondecision generation"),
                                 ),
                             },
@@ -598,6 +606,13 @@ pub enum AgentErrorKind {
         source: Box<AgentErrorKind>,
     },
     DuplicateTool(ToolName),
+    Context {
+        role: ModelRole,
+        source: ContextError,
+    },
+    OutputRejected {
+        reason: String,
+    },
     Store {
         at: Checkpoint,
         source: SessionStoreError,
@@ -633,6 +648,8 @@ impl fmt::Display for AgentErrorKind {
             Self::DuplicateTool(name) => write!(f, "duplicate tool {name}"),
             Self::Store { at, source } => write!(f, "agent save/load at {at:?}: {source}"),
             Self::Model { role, source } => write!(f, "{role:?}: {source}"),
+            Self::Context { role, source } => write!(f, "{role:?} context: {source}"),
+            Self::OutputRejected { reason } => write!(f, "model output rejected: {reason}"),
             Self::Refused { role, .. } => write!(f, "{role:?} refused generation"),
             Self::Incomplete { role, reason } => {
                 write!(f, "{role:?} incomplete generation ({reason:?})")
@@ -649,6 +666,7 @@ impl Error for AgentErrorKind {
             Self::ReviewFailure { source, .. } => Some(source),
             Self::Store { source, .. } => Some(source),
             Self::Model { source, .. } => Some(source),
+            Self::Context { source, .. } => Some(source),
             Self::RejectedOutput(source) => Some(source),
             _ => None,
         }

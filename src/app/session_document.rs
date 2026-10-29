@@ -89,6 +89,7 @@ pub enum CaptureCompleteness {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEvidence {
     pub reported_model: Option<String>,
+    /// The provider response body ID, not an HTTP request header ID.
     pub provider_request_id: Option<String>,
     pub http_status: Option<u16>,
     pub usage: Option<ModelArtifact>,
@@ -403,14 +404,20 @@ impl SessionDocument {
         self.finish(id, observation, outcome)
     }
     pub(crate) fn recover(&self) -> Result<Option<Self>, DocumentError> {
-        if self.session.active_turn().is_none()
-            && !self.invocations.iter().any(|i| {
-                matches!(
-                    i.state,
-                    InvocationState::Planned | InvocationState::Prepared(_)
-                )
+        let pending = self.invocations.iter().any(|i| {
+            matches!(
+                i.state,
+                InvocationState::Planned | InvocationState::Prepared(_)
+            )
+        });
+        let known_review_failure = self.session.active_turn().is_some_and(|turn| {
+            self.invocations.iter().any(|i| {
+                i.target.turn() == turn.id().get()
+                    && i.blocks_review()
+                    && matches!(i.state, InvocationState::Finished { .. })
             })
-        {
+        });
+        if !pending && (self.session.active_turn().is_none() || known_review_failure) {
             return Ok(None);
         }
         let mut next = self.next();
@@ -692,7 +699,26 @@ impl SessionDocument {
         for turn in &records {
             for (index, step) in turn.steps.iter().enumerate() {
                 for execution in &step.executions {
-                    if matches!(execution.state, ExecutionState::Returned(_)) && !self.invocations.iter().any(|i| matches!(&i.target, InvocationTarget::Reviewer { call } if call.turn == turn.id && call.step == index as u64+1 && call.native == execution.call_id) && matches!(i.state, InvocationState::Finished { outcome: RecordedOutcome::Review { .. }, .. })) { return Err(DocumentError::InvalidEvidence); }
+                    if let ExecutionState::Returned(result) = &execution.state {
+                        let review = self.invocations.iter().find(|i| {
+                            matches!(&i.target, InvocationTarget::Reviewer { call }
+                                if call.turn == turn.id && call.step == index as u64 + 1 && call.native == execution.call_id)
+                        });
+                        let Some(Invocation {
+                            state:
+                                InvocationState::Finished {
+                                    outcome: RecordedOutcome::Review { allow, .. },
+                                    ..
+                                },
+                            ..
+                        }) = review
+                        else {
+                            return Err(DocumentError::InvalidEvidence);
+                        };
+                        if !allow && matches!(result, ToolOutcome::Success(_)) {
+                            return Err(DocumentError::InvalidEvidence);
+                        }
+                    }
                 }
             }
         }

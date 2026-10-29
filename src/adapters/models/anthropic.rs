@@ -22,23 +22,13 @@ pub(super) fn request(
 ) -> Value {
     let decision = kind == OutputKind::Decision;
     let mut messages = Vec::new();
-    if decision {
-        for text in client::review_history(snapshot) {
-            push(
+    for event in events {
+        match event {
+            Event::User(text) | Event::Fact(text) => push(
                 &mut messages,
                 "user",
                 vec![json!({"type":"text","text":text})],
-            );
-        }
-    } else {
-        for event in events {
-            match event {
-                Event::User(text) | Event::Fact(text) => push(
-                    &mut messages,
-                    "user",
-                    vec![json!({"type":"text","text":text})],
-                ),
-            }
+            ),
         }
     }
     let mut body = json!({

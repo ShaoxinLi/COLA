@@ -14,11 +14,15 @@ obtain the application-owned recorder and durable workflow.
 `ModelInput<O>` carries checked semantic context, model settings, selection
 policy, an optional frozen turn view, and accepted native steps read from the
 document. Each native step includes its archived response and actual results.
+Reviewer inputs carry a mandatory `ReviewSubject` with the full active turn,
+candidate call, and exact address. They contain no assistant native steps.
 
 Before network I/O, a client must call `BeforeModelSend::persist` with the exact
 request bytes and, for the first assistant invocation, its new `TurnView`.
-Only a successful commit returns `SendPermit`. Persistence errors escape the
-invocation immediately. They are not model failures and must not trigger HTTP.
+Only a successful commit returns `SendPermit`, which owns the committed request
+artifact. Transport consumes the permit and sends its bytes. Persistence errors
+escape the invocation immediately. They are not model failures and must not
+trigger HTTP.
 
 `Observation<O>` contains `Generation<O>` and independent `ResponseEvidence`.
 Generation is complete, refused, incomplete, or failed. Preparation failures
@@ -47,7 +51,9 @@ a kind and optional HTTP status without raw provider bodies, URLs, or credential
 Requests preserve arbitrary nonblank model IDs and explicit effort/output limits.
 Native tool schemas retain the caller's JSON Schema fields. Review requests use
 a strict decision schema with `should_allow` and nullable nonblank `reason`.
-They contain descriptive tool catalogs, not callable tools.
+They contain descriptive tool catalogs, not callable tools. Adapters render the
+mandatory subject and optional history as labelled user-role data. Current user
+text and tool results never enter system instructions.
 
 Unknown native item types, malformed calls, invalid decisions, and incomplete
 responses fail closed. Raw evidence remains in the archive. A refusal or partial

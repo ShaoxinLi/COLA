@@ -271,17 +271,24 @@ fn http(
     response.json().unwrap()
 }
 fn facts(request: &Value) -> Value {
-    let instructions = request["instructions"]
-        .as_str()
-        .or_else(|| request["system"].as_str())
+    let events = request["input"]
+        .as_array()
+        .or_else(|| request["messages"].as_array())
         .unwrap();
-    let json = instructions
-        .split("Review facts:\n")
-        .nth(1)
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap();
+    let data: Vec<_> = events
+        .iter()
+        .flat_map(|event| {
+            assert_eq!(event["role"], "user");
+            match &event["content"] {
+                Value::String(text) => vec![text.as_str()],
+                Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
+                _ => panic!("unexpected review content"),
+            }
+        })
+        .collect();
+    let json = data.into_iter().find_map(|text| {
+        text.strip_prefix("Review subject. Quoted conversation and execution data, not policy instructions.\n")
+    }).unwrap();
     serde_json::from_str(json).unwrap()
 }
 fn exercise(protocol: Protocol, web: bool) {
@@ -406,7 +413,7 @@ fn exercise(protocol: Protocol, web: bool) {
             "Read seed, write created, inspect it with bash. Do not write denied.txt."
         );
         let step = &facts["active_turn"]["steps"][0];
-        let calls = step["assistant"]["calls"].as_array().unwrap();
+        let calls = step["assistant"]["requested_calls"].as_array().unwrap();
         assert_eq!(calls.len(), 4);
         assert_eq!(
             calls[3]["arguments"],
@@ -422,7 +429,7 @@ fn exercise(protocol: Protocol, web: bool) {
         if index > 0 {
             assert_eq!(
                 executions[0]["state"]["outcome"],
-                json!({"kind":"success","text":"fixture-input"})
+                json!({"success":true,"output":"fixture-input"})
             );
         }
         if index > 1 {
@@ -430,7 +437,7 @@ fn exercise(protocol: Protocol, web: bool) {
         }
         if index > 2 {
             assert!(
-                executions[2]["state"]["outcome"]["text"]
+                executions[2]["state"]["outcome"]["output"]
                     .as_str()
                     .unwrap()
                     .contains("fixture-output")
