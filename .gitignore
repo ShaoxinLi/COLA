@@ -25,3 +25,4 @@ __pycache__/
 
 # Local implementation notes and verification artifacts
 .scratch/
+.worktreeinclude
