@@ -1,0 +1,265 @@
+{
+  "code_revision": "6d862410298fa5eee98ee8b96f7458e008b8cbf2",
+  "binary": {
+    "sha256": "12f1745bd0f3eb698ade67e9ebf954add8f4671f1eb0ca34676e33c024f71004"
+  },
+  "verifier_sha256": "a40ce02c5eb5cf11cd38e20ef8b0e96bcb74f4940e9d034eb99e3723175ad47a",
+  "session_id": "05e3557a-c7d7-48e0-ab52-59eef71a4bab",
+  "turns": [
+    {
+      "turn": 1,
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "pid": 77403,
+      "read_current_fixture": true,
+      "verified_codes": 1,
+      "upstream_requests": 3
+    },
+    {
+      "turn": 2,
+      "provider": "bailian",
+      "model": "qwen3.8-max",
+      "pid": 77501,
+      "read_current_fixture": true,
+      "verified_codes": 2,
+      "upstream_requests": 3
+    },
+    {
+      "turn": 3,
+      "provider": "bailian",
+      "model": "qwen3.8-flash",
+      "pid": 77542,
+      "read_current_fixture": true,
+      "verified_codes": 3,
+      "upstream_requests": 3
+    },
+    {
+      "turn": 4,
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "pid": 77558,
+      "read_current_fixture": false,
+      "verified_codes": 3,
+      "upstream_requests": 1
+    },
+    {
+      "turn": 5,
+      "provider": "bailian",
+      "model": "qwen3.8-max",
+      "pid": 77563,
+      "read_current_fixture": false,
+      "verified_codes": 3,
+      "upstream_requests": 1
+    },
+    {
+      "turn": 6,
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "pid": 77572,
+      "read_current_fixture": true,
+      "verified_codes": 4,
+      "upstream_requests": 3
+    },
+    {
+      "turn": 7,
+      "provider": "bailian",
+      "model": "qwen3.8-max",
+      "pid": 77575,
+      "read_current_fixture": false,
+      "verified_codes": 4,
+      "upstream_requests": 1
+    }
+  ],
+  "requests": [
+    {
+      "index": 0,
+      "provider": "deepseek",
+      "turn": "turn-1",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "deepseek-flash",
+      "reported_model": "deepseek-flash",
+      "reviewer": false,
+      "request_sha256": "9e5a3e2b59829ebef152a9d52d42c0a26fc0b7a6613fede8cbe04bc425d534ec"
+    },
+    {
+      "index": 1,
+      "provider": "deepseek",
+      "turn": "turn-1",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "deepseek-flash",
+      "reported_model": "deepseek-flash",
+      "reviewer": true,
+      "request_sha256": "4f5c469b82073e725d7447e3efd7383645d5fa5a8b8d669501fb29f7a6521b84"
+    },
+    {
+      "index": 2,
+      "provider": "deepseek",
+      "turn": "turn-1",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "deepseek-flash",
+      "reported_model": "deepseek-flash",
+      "reviewer": false,
+      "request_sha256": "7954748c72a3d2399e59eb1c144e830c6b0f6f1395c2bb2f20af5ba9bb7de4fc"
+    },
+    {
+      "index": 3,
+      "provider": "bailian",
+      "turn": "turn-2",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "qwen3.8-max",
+      "reported_model": "qwen3.8-max",
+      "reviewer": false,
+      "request_sha256": "6ffd9405f9f6ea0ac615218085905ff0d0bcc888913575fa504d422800e99b94"
+    },
+    {
+      "index": 4,
+      "provider": "bailian",
+      "turn": "turn-2",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "qwen3.8-max",
+      "reported_model": "qwen3.8-max",
+      "reviewer": true,
+      "request_sha256": "9d9a73bcc6cfd02c832810f1236c9f630bc35a9b0e3d56e685181a726d25fd1b"
+    },
+    {
+      "index": 5,
+      "provider": "bailian",
+      "turn": "turn-2",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "qwen3.8-max",
+      "reported_model": "qwen3.8-max",
+      "reviewer": false,
+      "request_sha256": "99810c6e07aecc0f5cf5e5cf04c2450c46064fd79ebc2aa620ffe8f6450122b1"
+    },
+    {
+      "index": 6,
+      "provider": "bailian",
+      "turn": "turn-3",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "qwen3.8-flash",
+      "reported_model": "qwen3.8-flash",
+      "reviewer": false,
+      "request_sha256": "7458234fb90dd3ac9b94b3ca2a60e8674262705336c349b2546bea41bd8a776f"
+    },
+    {
+      "index": 7,
+      "provider": "bailian",
+      "turn": "turn-3",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "qwen3.8-flash",
+      "reported_model": "qwen3.8-flash",
+      "reviewer": true,
+      "request_sha256": "d7baf825f8a26fb3f67bd560b38a90e48790a361204fdf52d5d25b30bfd23ecd"
+    },
+    {
+      "index": 8,
+      "provider": "bailian",
+      "turn": "turn-3",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "qwen3.8-flash",
+      "reported_model": "qwen3.8-flash",
+      "reviewer": false,
+      "request_sha256": "e9824f177eafa6f851fedf337db53f6df86274f6593a3e0e1896fae1c6e0576d"
+    },
+    {
+      "index": 9,
+      "provider": "deepseek",
+      "turn": "turn-4",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "deepseek-flash",
+      "reported_model": "deepseek-flash",
+      "reviewer": false,
+      "request_sha256": "eea48165773042120bb2571561f328ad7a368365c0786004bdab3b2fb11b0ec5"
+    },
+    {
+      "index": 10,
+      "provider": "bailian",
+      "turn": "turn-5",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "qwen3.8-max",
+      "reported_model": "qwen3.8-max",
+      "reviewer": false,
+      "request_sha256": "dcff23ee1b730e2aef325f1fc194e420ac6d30deb9ffadad1b83f8d2279fe695"
+    },
+    {
+      "index": 11,
+      "provider": "deepseek",
+      "turn": "turn-6",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "deepseek-flash",
+      "reported_model": "deepseek-flash",
+      "reviewer": false,
+      "request_sha256": "dca150b3f84846fca2a76e23c576084bd73975bfb6ede051ba989cdc3fd97adf"
+    },
+    {
+      "index": 12,
+      "provider": "deepseek",
+      "turn": "turn-6",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "deepseek-flash",
+      "reported_model": "deepseek-flash",
+      "reviewer": true,
+      "request_sha256": "2ce5480502de4a4fb103f103a40d6afd20b034dda6f20bcfdc654f3930a40d00"
+    },
+    {
+      "index": 13,
+      "provider": "deepseek",
+      "turn": "turn-6",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "deepseek-flash",
+      "reported_model": "deepseek-flash",
+      "reviewer": false,
+      "request_sha256": "2f24d90afdff0d0e45d03a0aec61d83463927e6d17611114b5016af43dd0529b"
+    },
+    {
+      "index": 14,
+      "provider": "bailian",
+      "turn": "turn-7",
+      "status": 200,
+      "generation_status": "completed",
+      "requested_model": "qwen3.8-max",
+      "reported_model": "qwen3.8-max",
+      "reviewer": false,
+      "request_sha256": "366be10c4ecc4b78ff7df0fd0547801abce14992592cd881f6d158b946d8a0f2"
+    }
+  ],
+  "archive_checks": {
+    "invocations": 15,
+    "closed_turns": 7,
+    "native_calls": 4,
+    "exact_request_bytes_match": true,
+    "response_evidence_matches": true,
+    "historic_model_audit_omitted": true,
+    "old_native_items_omitted_at_turn_start": true
+  },
+  "review_subject_checked_as_user_data": true,
+  "local_tests": {
+    "adapters": 61,
+    "application": 16,
+    "domain": 24,
+    "executable": 10,
+    "doctests": 4,
+    "fresh_jsonl_driver": 6
+  },
+  "quality_gates": [
+    "cargo test --locked --all-targets",
+    "cargo test --locked --doc",
+    "cargo fmt --all -- --check",
+    "cargo clippy --locked --all-targets -- -D warnings",
+    "cargo doc --locked --no-deps"
+  ]
+}

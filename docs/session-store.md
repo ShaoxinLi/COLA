@@ -35,8 +35,9 @@ JSONL archive can recreate its missing lock file.
 The first JSON line contains `format: "cola.session"`, `version: 2`, session ID,
 record counts, revision, invocation audit, views, and acknowledgements. Subsequent
 lines hold ordered closed turns followed by an optional active turn. The file
-ends with a newline. Unknown fields, invalid counts, invalid associations, and
-filename/identity mismatches are rejected. Version 1 is intentionally unsupported;
+ends with a newline. Header and turn-record schemas reject unknown fields;
+nested application audit objects accept additional fields. Invalid counts,
+invalid associations, and filename/identity mismatches are rejected. Version 1 is intentionally unsupported;
 there is no compatibility conversion or automatic deletion of old archives.
 
 Provider payloads are opaque versioned `ModelArtifact` byte envelopes. The JSONL

@@ -35,7 +35,8 @@ The executable registers Bash, file-read, and file-write tools using `tool_cwd`.
 Every proposed call is reviewed by the configured reviewer model before local
 execution. These tools use the host user's privileges; the working directory
 does not confine their access. The process keeps one service alive for its
-selected API mode. Use a separate session-store root for each running process.
+selected API mode. Processes can share a session-store root. Each session permits
+one writing command at a time; another writer receives `session_busy`.
 
 See [startup configuration](docs/api.md#executable-configuration) for fields,
 defaults, exits, and durable restart behavior.
