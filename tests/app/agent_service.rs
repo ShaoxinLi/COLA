@@ -365,6 +365,109 @@ fn replacement_policy_cannot_unpin_unknown_effects() {
             .is_none()
     );
 }
+struct SelectTurn(TurnId);
+impl ContextPolicy for SelectTurn {
+    fn select(&self, _: &Session) -> ContextSelection {
+        ContextSelection {
+            closed_turns: vec![self.0],
+            mandatory_turns: vec![],
+            max_request_bytes: 65536,
+        }
+    }
+}
+#[test]
+fn policy_rejects_current_future_and_unknown_turns_before_network_io() {
+    for p in PROVIDERS {
+        for invalid_id in [2, 3, u64::MAX] {
+            let server = Server::new(vec![
+                p.answer("closed").into(),
+                p.answer("unexpected").into(),
+            ]);
+            let root = tempfile::tempdir().unwrap();
+            let mut svc = service(p, &server, root.path());
+            let id = svc.new_session().unwrap().id().clone();
+            svc.chat(&id, user("first")).unwrap();
+            let mut svc = svc.with_context_policy(SelectTurn(TurnId::new(invalid_id).unwrap()));
+            let error = svc.chat(&id, user("invalid selection")).unwrap_err();
+            assert!(
+                matches!(error.kind(), AgentErrorKind::Model { source, .. }
+                    if source.kind() == ModelErrorKind::InvalidSelection),
+                "policy turn {invalid_id}: {error:?}"
+            );
+            assert_eq!(server.requests().len(), 1);
+            drop(svc);
+            let doc = JsonlSessionStore::new(root.path()).inspect(&id).unwrap();
+            assert!(matches!(
+                last_outcome(&doc),
+                RecordedOutcome::PreparationFailed(error)
+                    if error.kind() == ModelErrorKind::InvalidSelection
+            ));
+            assert!(doc.session().active_turn().is_none());
+            assert!(matches!(
+                doc.session().turns()[1].outcome(),
+                TurnOutcome::Failed(_)
+            ));
+        }
+    }
+}
+struct CurrentTurnOnly;
+impl Assistant for CurrentTurnOnly {
+    fn context(&self, s: &Session) -> Result<Context<AssistantMessage>, ContextError> {
+        Context::new(
+            text("Be useful"),
+            s.context_exchanges()?
+                .into_iter()
+                .filter(|e| e.outcome().is_none())
+                .collect(),
+            vec![],
+        )
+    }
+}
+#[test]
+fn role_may_omit_known_optional_turns_selected_by_policy() {
+    for p in PROVIDERS {
+        let server = Server::new(vec![
+            p.answer("first answer").into(),
+            p.answer("second answer").into(),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let mut svc = AgentService::new(
+            Pair {
+                assistant: p.client(&server),
+                reviewer: p.reviewer(&server),
+            },
+            JsonlSessionStore::new(root.path()),
+            CurrentTurnOnly,
+            Roles,
+            vec![],
+            AgentSettings {
+                assistant_model_settings: p.settings(),
+                reviewer_model_settings: p.settings(),
+                max_iterations: std::num::NonZeroU32::new(8).unwrap(),
+            },
+        )
+        .unwrap();
+        let id = svc.new_session().unwrap().id().clone();
+        svc.chat(&id, user("optional history")).unwrap();
+        let mut svc = svc.with_context_policy(SelectTurn(TurnId::new(1).unwrap()));
+        svc.chat(&id, user("current request")).unwrap();
+        assert_eq!(server.requests().len(), 2);
+        assert!(
+            !server
+                .request(1)
+                .body
+                .to_string()
+                .contains("optional history")
+        );
+        assert!(!server.request(1).body.to_string().contains("first answer"));
+        let doc = svc.inspect_session(&id).unwrap();
+        assert!(doc.session().active_turn().is_none());
+        assert!(matches!(
+            doc.session().turns()[1].outcome(),
+            TurnOutcome::Completed
+        ));
+    }
+}
 struct LargeOutput;
 impl Tool for LargeOutput {
     fn execute(&self, _: &serde_json::Map<String, serde_json::Value>) -> ToolOutcome {

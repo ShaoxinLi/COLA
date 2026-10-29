@@ -515,10 +515,14 @@ fn selection_for<O>(
     let closed = session
         .closed_context_exchanges()
         .map_err(|_| ModelError::new(ModelErrorKind::InvalidSelection))?;
-    if context
-        .exchanges()
+    if selection
+        .closed_turns
         .iter()
-        .any(|e| e.outcome().is_some() && !closed.contains(e))
+        .any(|id| !closed.iter().any(|e| e.turn_id() == *id))
+        || context
+            .exchanges()
+            .iter()
+            .any(|e| e.outcome().is_some() && !closed.contains(e))
     {
         return Err(ModelError::new(ModelErrorKind::InvalidSelection));
     }
