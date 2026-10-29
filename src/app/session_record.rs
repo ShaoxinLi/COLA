@@ -163,7 +163,7 @@ pub struct ReviewFailureAcknowledgement {
     pub actor: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionDocument {
+pub struct SessionRecord {
     revision: u64,
     session: Session,
     invocations: Vec<Invocation>,
@@ -171,19 +171,19 @@ pub struct SessionDocument {
     acknowledgements: Vec<ReviewFailureAcknowledgement>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DocumentError {
+pub enum RecordError {
     InvalidState,
     InvalidEvidence,
     ConflictingAcknowledgement,
     NoReviewFailure,
 }
-impl std::fmt::Display for DocumentError {
+impl std::fmt::Display for RecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "document {self:?}")
     }
 }
-impl std::error::Error for DocumentError {}
-impl SessionDocument {
+impl std::error::Error for RecordError {}
+impl SessionRecord {
     pub fn new(id: SessionId) -> Self {
         Self {
             revision: 0,
@@ -233,7 +233,7 @@ impl SessionDocument {
         &self,
         target: InvocationTarget,
         requested: RequestedModel,
-    ) -> Result<Self, DocumentError> {
+    ) -> Result<Self, RecordError> {
         if self
             .session
             .active_turn()
@@ -245,18 +245,18 @@ impl SessionDocument {
                 )
             })
         {
-            return Err(DocumentError::InvalidState);
+            return Err(RecordError::InvalidState);
         }
         let active = self
             .session
             .active_turn()
-            .ok_or(DocumentError::InvalidState)?;
+            .ok_or(RecordError::InvalidState)?;
         match &target {
             InvocationTarget::Assistant { step, .. }
                 if *step == active.steps().len() as u64 + 1
                     && self.session.next_action() == NextAction::AskModel => {}
             InvocationTarget::Reviewer { call } => {
-                let address = call.address().map_err(|_| DocumentError::InvalidEvidence)?;
+                let address = call.address().map_err(|_| RecordError::InvalidEvidence)?;
                 if address.session != *self.session.id()
                     || address.step != active.steps().len() as u64
                     || address.step == 0
@@ -268,10 +268,10 @@ impl SessionDocument {
                     })
                     || self.invocations.iter().any(|i| i.target == target)
                 {
-                    return Err(DocumentError::InvalidState);
+                    return Err(RecordError::InvalidState);
                 }
             }
-            _ => return Err(DocumentError::InvalidState),
+            _ => return Err(RecordError::InvalidState),
         }
         let mut next = self.next();
         next.invocations.push(Invocation {
@@ -286,13 +286,13 @@ impl SessionDocument {
         &self,
         id: u64,
         prepared: PreparedInvocation,
-    ) -> Result<Self, DocumentError> {
+    ) -> Result<Self, RecordError> {
         let mut next = self.next();
         let invocation = next
             .invocations
             .last_mut()
             .filter(|i| i.id == id && matches!(i.state, InvocationState::Planned))
-            .ok_or(DocumentError::InvalidState)?;
+            .ok_or(RecordError::InvalidState)?;
         if let Some(view) = prepared.view {
             if invocation.target.is_reviewer()
                 || view.turn != invocation.target.turn()
@@ -300,7 +300,7 @@ impl SessionDocument {
                 || view.selection != prepared.request.selection
                 || next.views.iter().any(|v| v.turn == view.turn)
             {
-                return Err(DocumentError::InvalidEvidence);
+                return Err(RecordError::InvalidEvidence);
             }
             next.views.push(view);
         } else if !invocation.target.is_reviewer()
@@ -309,7 +309,7 @@ impl SessionDocument {
                 .iter()
                 .any(|v| v.turn == invocation.target.turn())
         {
-            return Err(DocumentError::InvalidEvidence);
+            return Err(RecordError::InvalidEvidence);
         }
         invocation.state = InvocationState::Prepared(prepared.request);
         Ok(next)
@@ -319,20 +319,20 @@ impl SessionDocument {
         id: u64,
         observation: &Observation<O>,
         outcome: RecordedOutcome,
-    ) -> Result<Self, DocumentError> {
+    ) -> Result<Self, RecordError> {
         let mut next = self.next();
         let invocation = next
             .invocations
             .last_mut()
             .filter(|i| i.id == id)
-            .ok_or(DocumentError::InvalidState)?;
+            .ok_or(RecordError::InvalidState)?;
         let request = match &invocation.state {
             InvocationState::Planned => None,
             InvocationState::Prepared(r) => Some(r.clone()),
-            _ => return Err(DocumentError::InvalidState),
+            _ => return Err(RecordError::InvalidState),
         };
         if request.is_none() && !matches!(observation.generation, Generation::Failed(_)) {
-            return Err(DocumentError::InvalidEvidence);
+            return Err(RecordError::InvalidEvidence);
         }
         invocation.state = InvocationState::Finished {
             request,
@@ -346,14 +346,13 @@ impl SessionDocument {
         id: u64,
         observation: &Observation<AssistantMessage>,
         advertised: &[ToolDefinition],
-    ) -> Result<Self, DocumentError> {
+    ) -> Result<Self, RecordError> {
         let invocation = self
             .invocations
             .last()
             .filter(|i| i.id == id && !i.target.is_reviewer())
-            .ok_or(DocumentError::InvalidState)?;
-        let turn =
-            TurnId::new(invocation.target.turn()).map_err(|_| DocumentError::InvalidState)?;
+            .ok_or(RecordError::InvalidState)?;
+        let turn = TurnId::new(invocation.target.turn()).map_err(|_| RecordError::InvalidState)?;
         let mut session = self.session.clone();
         let outcome = match &observation.generation {
             Generation::Complete { output } => {
@@ -378,7 +377,7 @@ impl SessionDocument {
         if !matches!(outcome, RecordedOutcome::AssistantAccepted) {
             session
                 .fail(turn, failure(&outcome))
-                .map_err(|_| DocumentError::InvalidState)?;
+                .map_err(|_| RecordError::InvalidState)?;
         }
         let mut next = self.finish(id, observation, outcome)?;
         next.session = session;
@@ -388,12 +387,12 @@ impl SessionDocument {
         &self,
         id: u64,
         observation: &Observation<Decision>,
-    ) -> Result<Self, DocumentError> {
+    ) -> Result<Self, RecordError> {
         let invocation = self
             .invocations
             .last()
             .filter(|i| i.id == id && i.target.is_reviewer())
-            .ok_or(DocumentError::InvalidState)?;
+            .ok_or(RecordError::InvalidState)?;
         let outcome = match &observation.generation {
             Generation::Complete { output } => RecordedOutcome::Review {
                 allow: output.should_allow(),
@@ -403,7 +402,7 @@ impl SessionDocument {
         };
         self.finish(id, observation, outcome)
     }
-    pub(crate) fn recover(&self) -> Result<Option<Self>, DocumentError> {
+    pub(crate) fn recover(&self) -> Result<Option<Self>, RecordError> {
         let pending = self.invocations.iter().any(|i| {
             matches!(
                 i.state,
@@ -437,7 +436,7 @@ impl SessionDocument {
         if let Some(turn) = next.session.active_turn() {
             next.session
                 .interrupt(turn.id(), StopReason::ProcessLost)
-                .map_err(|_| DocumentError::InvalidState)?;
+                .map_err(|_| RecordError::InvalidState)?;
         }
         Ok(Some(next))
     }
@@ -446,20 +445,20 @@ impl SessionDocument {
         id: u64,
         evidence: NonEmptyText,
         actor: Option<NonEmptyText>,
-    ) -> Result<Option<Self>, DocumentError> {
+    ) -> Result<Option<Self>, RecordError> {
         let actor = actor.map(|a| a.as_str().to_owned());
         if let Some(prior) = self.acknowledgements.iter().find(|a| a.invocation == id) {
             return if prior.evidence == evidence.as_str() && prior.actor == actor {
                 Ok(None)
             } else {
-                Err(DocumentError::ConflictingAcknowledgement)
+                Err(RecordError::ConflictingAcknowledgement)
             };
         }
         let invocation = self
             .invocations
             .iter()
             .find(|i| i.id == id && i.blocks_review())
-            .ok_or(DocumentError::NoReviewFailure)?;
+            .ok_or(RecordError::NoReviewFailure)?;
         let mut next = self.next();
         if let Some(turn) = next
             .session
@@ -474,7 +473,7 @@ impl SessionDocument {
             };
             next.session
                 .fail(turn.id(), cause)
-                .map_err(|_| DocumentError::InvalidState)?;
+                .map_err(|_| RecordError::InvalidState)?;
         }
         next.acknowledgements.push(ReviewFailureAcknowledgement {
             invocation: id,
@@ -484,12 +483,12 @@ impl SessionDocument {
         });
         Ok(Some(next))
     }
-    pub(crate) fn native_steps(&self, turn: TurnId) -> Result<Vec<NativeStep>, DocumentError> {
+    pub(crate) fn native_steps(&self, turn: TurnId) -> Result<Vec<NativeStep>, RecordError> {
         let active = self
             .session
             .active_turn()
             .filter(|t| t.id() == turn)
-            .ok_or(DocumentError::InvalidState)?;
+            .ok_or(RecordError::InvalidState)?;
         active
             .steps()
             .iter()
@@ -511,7 +510,7 @@ impl SessionDocument {
                         }
                         _ => None,
                     })
-                    .ok_or(DocumentError::InvalidEvidence)?;
+                    .ok_or(RecordError::InvalidEvidence)?;
                 let results = step
                     .executions()
                     .filter_map(|e| match e.state() {
@@ -531,23 +530,23 @@ impl SessionDocument {
         invocations: Vec<Invocation>,
         views: Vec<TurnView>,
         acknowledgements: Vec<ReviewFailureAcknowledgement>,
-    ) -> Result<Self, DocumentError> {
-        let doc = Self {
+    ) -> Result<Self, RecordError> {
+        let record = Self {
             revision,
             session,
             invocations,
             views,
             acknowledgements,
         };
-        doc.validate()?;
-        Ok(doc)
+        record.validate()?;
+        Ok(record)
     }
     pub fn validates_successor(&self, next: &Self) -> bool {
         next.session.id() == self.session.id()
             && self.revision.checked_add(1) == Some(next.revision)
             && next.validate().is_ok()
     }
-    fn validate(&self) -> Result<(), DocumentError> {
+    fn validate(&self) -> Result<(), RecordError> {
         let snapshot = self.session.snapshot();
         let records: Vec<_> = snapshot
             .turns
@@ -565,12 +564,12 @@ impl SessionDocument {
                 || i.requested.route.trim().is_empty()
                 || i.requested.settings.model_id.as_str().trim().is_empty()
             {
-                return Err(DocumentError::InvalidEvidence);
+                return Err(RecordError::InvalidEvidence);
             }
             let turn = records
                 .iter()
                 .find(|t| t.id == i.target.turn())
-                .ok_or(DocumentError::InvalidEvidence)?;
+                .ok_or(RecordError::InvalidEvidence)?;
             let (request, successful) = match &i.state {
                 InvocationState::Planned => (None, false),
                 InvocationState::Prepared(r) => (Some(r), false),
@@ -579,7 +578,7 @@ impl SessionDocument {
                     response_unknown,
                 } => {
                     if request.is_some() != *response_unknown {
-                        return Err(DocumentError::InvalidEvidence);
+                        return Err(RecordError::InvalidEvidence);
                     }
                     (request.as_ref(), false)
                 }
@@ -590,7 +589,7 @@ impl SessionDocument {
                 } => {
                     if matches!(outcome, RecordedOutcome::PreparationFailed(_)) != request.is_none()
                     {
-                        return Err(DocumentError::InvalidEvidence);
+                        return Err(RecordError::InvalidEvidence);
                     }
                     let successful = matches!(
                         outcome,
@@ -600,17 +599,17 @@ impl SessionDocument {
                         && (response.response.is_none()
                             || response.capture != CaptureCompleteness::Complete)
                     {
-                        return Err(DocumentError::InvalidEvidence);
+                        return Err(RecordError::InvalidEvidence);
                     }
                     if i.target.is_reviewer() != matches!(outcome, RecordedOutcome::Review { .. })
                         && successful
                     {
-                        return Err(DocumentError::InvalidEvidence);
+                        return Err(RecordError::InvalidEvidence);
                     }
                     if matches!(&response.capture, CaptureCompleteness::NotReturned)
                         && response.response.is_some()
                     {
-                        return Err(DocumentError::InvalidEvidence);
+                        return Err(RecordError::InvalidEvidence);
                     }
                     (request.as_ref(), successful)
                 }
@@ -624,7 +623,7 @@ impl SessionDocument {
                     .active_turn()
                     .is_none_or(|t| t.id().get() != i.target.turn()))
             {
-                return Err(DocumentError::InvalidEvidence);
+                return Err(RecordError::InvalidEvidence);
             }
             if let Some(r) = request
                 && (r.body.format.trim().is_empty()
@@ -635,19 +634,19 @@ impl SessionDocument {
                         .iter()
                         .any(|id| *id == 0 || *id >= i.target.turn()))
             {
-                return Err(DocumentError::InvalidEvidence);
+                return Err(RecordError::InvalidEvidence);
             }
             match &i.target {
                 InvocationTarget::Assistant { turn, step } => {
                     let count = counts.entry(*turn).or_default();
                     if *step != *count + 1 {
-                        return Err(DocumentError::InvalidEvidence);
+                        return Err(RecordError::InvalidEvidence);
                     }
                     if successful {
                         if *step > records[*turn as usize - 1].steps.len() as u64
                             || accepted.insert((*turn, *step), i.id).is_some()
                         {
-                            return Err(DocumentError::InvalidEvidence);
+                            return Err(RecordError::InvalidEvidence);
                         }
                         *count += 1;
                     }
@@ -656,17 +655,17 @@ impl SessionDocument {
                             .views
                             .iter()
                             .find(|v| v.turn == *turn)
-                            .ok_or(DocumentError::InvalidEvidence)?;
+                            .ok_or(RecordError::InvalidEvidence)?;
                         if view.requested != i.requested
                             || r.selection != view.selection
                             || (*step == 1 && view.frozen_prefix != r.body)
                         {
-                            return Err(DocumentError::InvalidEvidence);
+                            return Err(RecordError::InvalidEvidence);
                         }
                     }
                 }
                 InvocationTarget::Reviewer { call } => {
-                    let address = call.address().map_err(|_| DocumentError::InvalidEvidence)?;
+                    let address = call.address().map_err(|_| RecordError::InvalidEvidence)?;
                     if call.session != self.session.id().as_str()
                         || call.step == 0
                         || !reviews.insert(address)
@@ -675,7 +674,7 @@ impl SessionDocument {
                             .steps
                             .get(
                                 usize::try_from(call.step - 1)
-                                    .map_err(|_| DocumentError::InvalidEvidence)?,
+                                    .map_err(|_| RecordError::InvalidEvidence)?,
                             )
                             .is_none_or(|s| {
                                 !s.executions.iter().any(|e| {
@@ -684,7 +683,7 @@ impl SessionDocument {
                                 })
                             })
                     {
-                        return Err(DocumentError::InvalidEvidence);
+                        return Err(RecordError::InvalidEvidence);
                     }
                 }
             }
@@ -692,7 +691,7 @@ impl SessionDocument {
         for turn in &records {
             for step in 1..=turn.steps.len() as u64 {
                 if !accepted.contains_key(&(turn.id, step)) {
-                    return Err(DocumentError::InvalidEvidence);
+                    return Err(RecordError::InvalidEvidence);
                 }
             }
         }
@@ -713,10 +712,10 @@ impl SessionDocument {
                             ..
                         }) = review
                         else {
-                            return Err(DocumentError::InvalidEvidence);
+                            return Err(RecordError::InvalidEvidence);
                         };
                         if !allow && matches!(result, ToolOutcome::Success(_)) {
-                            return Err(DocumentError::InvalidEvidence);
+                            return Err(RecordError::InvalidEvidence);
                         }
                     }
                 }
@@ -739,7 +738,7 @@ impl SessionDocument {
                         )
                 })
             {
-                return Err(DocumentError::InvalidEvidence);
+                return Err(RecordError::InvalidEvidence);
             }
         }
         let mut ids = std::collections::BTreeSet::new();
@@ -752,7 +751,7 @@ impl SessionDocument {
                     .iter()
                     .any(|i| i.id == a.invocation && i.blocks_review())
             {
-                return Err(DocumentError::InvalidEvidence);
+                return Err(RecordError::InvalidEvidence);
             }
         }
         Ok(())

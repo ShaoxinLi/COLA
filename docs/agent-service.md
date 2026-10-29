@@ -1,7 +1,7 @@
 # Agent service
 
 [`AgentService`](../src/app/agent_service.rs) runs reviewed tool workflows from a
-committed [`SessionDocument`](../src/app/session_document.rs). A new service or
+committed [`SessionRecord`](../src/app/session_record.rs). A new service or
 process can continue any closed session using the same store and explicit
 configuration. There is no resident session cache or continuation token.
 

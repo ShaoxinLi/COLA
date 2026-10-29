@@ -5,11 +5,11 @@ pub trait SessionStore {
     fn list(&self) -> Result<Vec<SessionId>, SessionStoreError>;
     fn create(&self) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError>;
     fn acquire(&self, id: &SessionId) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError>;
-    fn inspect(&self, id: &SessionId) -> Result<super::SessionDocument, SessionStoreError>;
+    fn inspect(&self, id: &SessionId) -> Result<super::SessionRecord, SessionStoreError>;
 }
 pub trait SessionWriter {
-    fn committed(&self) -> &super::SessionDocument;
-    fn commit(&mut self, next: super::SessionDocument) -> Result<u64, SessionStoreError>;
+    fn committed(&self) -> &super::SessionRecord;
+    fn commit(&mut self, next: super::SessionRecord) -> Result<u64, SessionStoreError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -354,7 +354,7 @@ pub(super) fn service_with_store<S: SessionStore>(
 pub(super) fn decision(provider: Provider, allow: bool) -> Value {
     provider.answer(&json!({"should_allow":allow,"reason":null}).to_string())
 }
-pub(super) fn last_outcome(doc: &SessionDocument) -> &RecordedOutcome {
+pub(super) fn last_outcome(doc: &SessionRecord) -> &RecordedOutcome {
     match &doc.invocations().last().unwrap().state {
         InvocationState::Finished { outcome, .. } => outcome,
         state => panic!("unexpected {state:?}"),

@@ -1,6 +1,6 @@
 use crate::{
     app::{
-        Invocation, ReviewFailureAcknowledgement, SessionDocument, SessionStore, SessionStoreError,
+        Invocation, ReviewFailureAcknowledgement, SessionRecord, SessionStore, SessionStoreError,
         SessionStoreErrorKind, SessionWriter, TurnView,
     },
     domain::{
@@ -32,16 +32,16 @@ impl JsonlSessionStore {
         &self,
         path: &Path,
         requested: Option<&SessionId>,
-    ) -> Result<SessionDocument, SessionStoreError> {
+    ) -> Result<SessionRecord, SessionStoreError> {
         let bytes = fs::read(path).map_err(read_error)?;
-        let doc = decode(&bytes)?;
+        let record = decode(&bytes)?;
         if path.file_name().and_then(|s| s.to_str())
-            != Some(filename(doc.session().id().as_str()).as_str())
-            || requested.is_some_and(|id| id != doc.session().id())
+            != Some(filename(record.session().id().as_str()).as_str())
+            || requested.is_some_and(|id| id != record.session().id())
         {
             return Err(invalid("session identity does not match file"));
         }
-        Ok(doc)
+        Ok(record)
     }
     fn lock(&self, id: &SessionId) -> Result<SessionLock, SessionStoreError> {
         fs::create_dir_all(&self.root).map_err(storage)?;
@@ -82,14 +82,14 @@ impl SessionStore for JsonlSessionStore {
     fn create(&self) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
         let id = SessionId::new(uuid::Uuid::new_v4().to_string()).unwrap();
         let lock = self.lock(&id)?;
-        let doc = SessionDocument::new(id);
-        let path = self.root.join(filename(doc.session().id().as_str()));
-        publish(&self.root, &path, &doc)?;
+        let record = SessionRecord::new(id);
+        let path = self.root.join(filename(record.session().id().as_str()));
+        publish(&self.root, &path, &record)?;
         Ok(Box::new(Writer {
             root: self.root.clone(),
             path,
             _lock: lock,
-            committed: doc,
+            committed: record,
             valid: true,
         }))
     }
@@ -104,16 +104,16 @@ impl SessionStore for JsonlSessionStore {
         fs::File::open(&self.root)
             .and_then(|f| f.sync_all())
             .map_err(storage)?;
-        let doc = self.read(&path, Some(id))?;
+        let record = self.read(&path, Some(id))?;
         Ok(Box::new(Writer {
             root: self.root.clone(),
             path,
             _lock: lock,
-            committed: doc,
+            committed: record,
             valid: true,
         }))
     }
-    fn inspect(&self, id: &SessionId) -> Result<SessionDocument, SessionStoreError> {
+    fn inspect(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
         self.read(&self.root.join(filename(id.as_str())), Some(id))
     }
 }
@@ -121,7 +121,7 @@ struct Writer {
     root: PathBuf,
     path: PathBuf,
     _lock: SessionLock,
-    committed: SessionDocument,
+    committed: SessionRecord,
     valid: bool,
 }
 struct SessionLock(fs::File);
@@ -132,10 +132,10 @@ impl Drop for SessionLock {
     }
 }
 impl SessionWriter for Writer {
-    fn committed(&self) -> &SessionDocument {
+    fn committed(&self) -> &SessionRecord {
         &self.committed
     }
-    fn commit(&mut self, next: SessionDocument) -> Result<u64, SessionStoreError> {
+    fn commit(&mut self, next: SessionRecord) -> Result<u64, SessionStoreError> {
         if !self.valid {
             return Err(SessionStoreError::new(
                 SessionStoreErrorKind::WriterInvalidated,
@@ -155,8 +155,8 @@ impl SessionWriter for Writer {
         Ok(self.committed.revision())
     }
 }
-fn publish(root: &Path, path: &Path, doc: &SessionDocument) -> Result<(), SessionStoreError> {
-    let bytes = encode(doc)?;
+fn publish(root: &Path, path: &Path, record: &SessionRecord) -> Result<(), SessionStoreError> {
+    let bytes = encode(record)?;
     decode(&bytes)?;
     let mut staged = tempfile::Builder::new()
         .prefix(".cola-")
@@ -343,16 +343,16 @@ enum Failure {
 fn data_error(e: impl Error + Send + Sync + 'static) -> SessionStoreError {
     SessionStoreError::new(SessionStoreErrorKind::InvalidData, e)
 }
-fn encode(doc: &SessionDocument) -> Result<Vec<u8>, SessionStoreError> {
-    let snapshot = doc.session().snapshot();
+fn encode(record: &SessionRecord) -> Result<Vec<u8>, SessionStoreError> {
+    let snapshot = record.session().snapshot();
     let mut bytes = vec![];
     let header = Header {
         format: "cola.session".into(),
         version: 2,
-        revision: doc.revision(),
-        invocations: doc.invocations().to_vec(),
-        views: doc.views().to_vec(),
-        acknowledgements: doc.acknowledgements().to_vec(),
+        revision: record.revision(),
+        invocations: record.invocations().to_vec(),
+        views: record.views().to_vec(),
+        acknowledgements: record.acknowledgements().to_vec(),
         session_id: snapshot.session_id,
         closed_turn_count: snapshot.turns.len(),
         active: snapshot.active.is_some(),
@@ -371,7 +371,7 @@ fn line(bytes: &mut Vec<u8>, value: &impl Serialize) -> Result<(), SessionStoreE
     bytes.push(b'\n');
     Ok(())
 }
-fn decode(bytes: &[u8]) -> Result<SessionDocument, SessionStoreError> {
+fn decode(bytes: &[u8]) -> Result<SessionRecord, SessionStoreError> {
     if !bytes.ends_with(b"\n") {
         return Err(invalid("missing final LF"));
     }
@@ -427,7 +427,7 @@ fn decode(bytes: &[u8]) -> Result<SessionDocument, SessionStoreError> {
         active,
     })
     .map_err(data_error)?;
-    SessionDocument::restore(
+    SessionRecord::restore(
         header.revision,
         session,
         header.invocations,

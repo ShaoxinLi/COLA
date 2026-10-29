@@ -22,10 +22,10 @@ struct FaultWriter<'a> {
     valid: bool,
 }
 impl SessionWriter for FaultWriter<'_> {
-    fn committed(&self) -> &SessionDocument {
+    fn committed(&self) -> &SessionRecord {
         self.inner.committed()
     }
-    fn commit(&mut self, next: SessionDocument) -> Result<u64, SessionStoreError> {
+    fn commit(&mut self, next: SessionRecord) -> Result<u64, SessionStoreError> {
         assert!(self.valid, "no further commit after storage failure");
         if next.revision() == self.revision {
             self.valid = false;
@@ -48,7 +48,7 @@ impl SessionStore for FaultStore {
     fn list(&self) -> Result<Vec<SessionId>, SessionStoreError> {
         self.inner.list()
     }
-    fn inspect(&self, id: &SessionId) -> Result<SessionDocument, SessionStoreError> {
+    fn inspect(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
         self.inner.inspect(id)
     }
     fn create(&self) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {

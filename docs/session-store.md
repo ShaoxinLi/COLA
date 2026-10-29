@@ -1,6 +1,6 @@
 # Session persistence
 
-`SessionStore` persists complete application `SessionDocument` snapshots.
+`SessionStore` persists complete application `SessionRecord` snapshots.
 Documents contain the domain session, revision, per-invocation plans and audit,
 frozen turn views, and review-failure acknowledgements.
 

@@ -316,15 +316,15 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             "Session is busy",
             None,
         ),
-        AgentErrorKind::Document(
-            DocumentError::NoReviewFailure | DocumentError::ConflictingAcknowledgement,
+        AgentErrorKind::Record(
+            RecordError::NoReviewFailure | RecordError::ConflictingAcknowledgement,
         ) => (
             FailureClass::Blocked,
             "acknowledgement_conflict",
             "Review failure acknowledgement conflicts or is not pending",
             None,
         ),
-        AgentErrorKind::Document(_) | AgentErrorKind::ReviewFailure { .. } => (
+        AgentErrorKind::Record(_) | AgentErrorKind::ReviewFailure { .. } => (
             FailureClass::Internal,
             "invalid_document",
             "Invalid session document",

@@ -147,12 +147,12 @@ impl Tool for Target {
 #[derive(Clone, Default)]
 struct Store {
     counts: Counts,
-    sessions: Rc<RefCell<BTreeMap<SessionId, SessionDocument>>>,
+    sessions: Rc<RefCell<BTreeMap<SessionId, SessionRecord>>>,
     fail_save: Option<usize>,
     fail_list: bool,
 }
 impl Store {
-    fn publish(&self, doc: &SessionDocument) -> Result<(), SessionStoreError> {
+    fn publish(&self, doc: &SessionRecord) -> Result<(), SessionStoreError> {
         let n = self.counts.save.get() + 1;
         self.counts.save.set(n);
         if self.fail_save == Some(n) {
@@ -169,14 +169,14 @@ impl Store {
 }
 struct Writer {
     store: Store,
-    doc: SessionDocument,
+    doc: SessionRecord,
     valid: bool,
 }
 impl SessionWriter for Writer {
-    fn committed(&self) -> &SessionDocument {
+    fn committed(&self) -> &SessionRecord {
         &self.doc
     }
-    fn commit(&mut self, next: SessionDocument) -> Result<u64, SessionStoreError> {
+    fn commit(&mut self, next: SessionRecord) -> Result<u64, SessionStoreError> {
         assert!(self.valid);
         self.valid = false;
         assert!(self.doc.validates_successor(&next));
@@ -188,7 +188,7 @@ impl SessionWriter for Writer {
 }
 impl SessionStore for Store {
     fn create(&self) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
-        let doc = SessionDocument::new(SessionId::new(uuid::Uuid::new_v4().to_string()).unwrap());
+        let doc = SessionRecord::new(SessionId::new(uuid::Uuid::new_v4().to_string()).unwrap());
         self.publish(&doc)?;
         Ok(Box::new(Writer {
             store: self.clone(),
@@ -196,7 +196,7 @@ impl SessionStore for Store {
             valid: true,
         }))
     }
-    fn inspect(&self, id: &SessionId) -> Result<SessionDocument, SessionStoreError> {
+    fn inspect(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
         self.counts.load.set(self.counts.load.get() + 1);
         self.sessions.borrow().get(id).cloned().ok_or_else(|| {
             SessionStoreError::new(SessionStoreErrorKind::NotFound, io::Error::other("missing"))

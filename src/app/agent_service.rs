@@ -17,18 +17,18 @@ pub struct AgentService<M, S, A, R> {
     tools: BTreeMap<ToolName, (ToolDefinition, Box<dyn Tool>)>,
     context_policy: Box<dyn ContextPolicy>,
 }
-fn error(doc: Option<&SessionDocument>, kind: AgentErrorKind) -> AgentError {
+fn error(record: Option<&SessionRecord>, kind: AgentErrorKind) -> AgentError {
     AgentError {
         kind,
-        progress: doc.map(|d| Box::new(d.session().clone())),
+        progress: record.map(|d| Box::new(d.session().clone())),
     }
 }
-fn document_error(doc: &SessionDocument, source: DocumentError) -> AgentError {
-    error(Some(doc), AgentErrorKind::Document(source))
+fn record_error(record: &SessionRecord, source: RecordError) -> AgentError {
+    error(Some(record), AgentErrorKind::Record(source))
 }
 fn commit(
     writer: &mut dyn SessionWriter,
-    next: SessionDocument,
+    next: SessionRecord,
     at: Checkpoint,
 ) -> Result<(), AgentError> {
     writer.commit(next).map(|_| ()).map_err(|source| {
@@ -104,7 +104,7 @@ where
                 )
             })
     }
-    pub fn inspect_session(&self, id: &SessionId) -> Result<SessionDocument, AgentError> {
+    pub fn inspect_session(&self, id: &SessionId) -> Result<SessionRecord, AgentError> {
         self.session_store.inspect(id).map_err(|source| {
             error(
                 None,
@@ -150,7 +150,7 @@ where
         let next = writer
             .committed()
             .acknowledge(invocation, evidence, actor)
-            .map_err(|e| document_error(writer.committed(), e))?;
+            .map_err(|e| record_error(writer.committed(), e))?;
         if let Some(next) = next {
             commit(&mut *writer, next, Checkpoint::ReviewAcknowledgement)?;
         }
@@ -232,7 +232,7 @@ where
                             },
                             requested,
                         )
-                        .map_err(|e| document_error(writer.committed(), e))?;
+                        .map_err(|e| record_error(writer.committed(), e))?;
                     commit(&mut *writer, next, Checkpoint::PlannedInvocation)?;
                     let invocation = writer.committed().invocations().last().unwrap().id;
                     let context = self.assistant.context(writer.committed().session());
@@ -280,7 +280,7 @@ where
                                         let native = writer
                                             .committed()
                                             .native_steps(turn)
-                                            .map_err(|e| document_error(writer.committed(), e))?;
+                                            .map_err(|e| record_error(writer.committed(), e))?;
                                         let input = ModelInput {
                                             context: &context,
                                             settings: &self.settings.assistant_model_settings,
@@ -316,7 +316,7 @@ where
                     let next = writer
                         .committed()
                         .accept_assistant(invocation, &observed, &advertised)
-                        .map_err(|e| document_error(writer.committed(), e))?;
+                        .map_err(|e| record_error(writer.committed(), e))?;
                     commit(&mut *writer, next, Checkpoint::AcceptedAssistant)?;
                     if let Some(kind) = context_error
                         .map(|source| AgentErrorKind::Context {
@@ -372,7 +372,7 @@ where
                             },
                             requested,
                         )
-                        .map_err(|e| document_error(writer.committed(), e))?;
+                        .map_err(|e| record_error(writer.committed(), e))?;
                     commit(&mut *writer, next, Checkpoint::PlannedInvocation)?;
                     let invocation = writer.committed().invocations().last().unwrap().id;
                     let context = self.reviewer.context(writer.committed().session(), &call);
@@ -423,7 +423,7 @@ where
                     let next = writer
                         .committed()
                         .accept_review(invocation, &observed)
-                        .map_err(|e| document_error(writer.committed(), e))?;
+                        .map_err(|e| record_error(writer.committed(), e))?;
                     commit(&mut *writer, next, Checkpoint::AcceptedReview)?;
                     let Generation::Complete { output: decision } = observed.generation else {
                         return Err(error(
@@ -494,7 +494,7 @@ fn recover(writer: &mut dyn SessionWriter) -> Result<(), AgentError> {
     if let Some(next) = writer
         .committed()
         .recover()
-        .map_err(|e| document_error(writer.committed(), e))?
+        .map_err(|e| record_error(writer.committed(), e))?
     {
         commit(writer, next, Checkpoint::Recovery)?;
     }
@@ -597,7 +597,7 @@ impl Error for AgentError {
 
 #[derive(Debug)]
 pub enum AgentErrorKind {
-    Document(DocumentError),
+    Record(RecordError),
     ReviewBlocked {
         invocation: u64,
     },
@@ -636,7 +636,7 @@ pub enum AgentErrorKind {
 impl fmt::Display for AgentErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Document(source) => write!(f, "{source}"),
+            Self::Record(source) => write!(f, "{source}"),
             Self::ReviewFailure { invocation, source } => write!(
                 f,
                 "{source}; review invocation {invocation} requires acknowledgement"
