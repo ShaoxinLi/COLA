@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 ///
 /// Implementations validate tool-specific argument fields and return ordinary
 /// failures as [`ToolOutcome::Failure`]. Execution can block the caller.
-/// The caller selects the implementation and associates its outcome with the
-/// original call ID in a [`ToolResult`].
+/// The caller selects the implementation and records its outcome through
+/// `Session::record_tool_result` with the complete `CallAddress`.
 pub trait Tool {
     fn execute(&self, arguments: &Map<String, Value>) -> ToolOutcome;
 }

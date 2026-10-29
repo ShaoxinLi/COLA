@@ -73,28 +73,11 @@ impl Provider {
             }
         }
     }
+    #[allow(dead_code)]
     pub(super) fn native(self, response: &Value) -> Value {
         match self {
             Self::OpenAI => response["output"].clone(),
             Self::Anthropic => response["content"].clone(),
-        }
-    }
-    pub(super) fn request_native(self, request: &Value) -> Vec<Value> {
-        match self {
-            Self::OpenAI => request["input"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|v| v.get("type").is_some_and(|t| t != "function_call_output"))
-                .cloned()
-                .collect(),
-            Self::Anthropic => request["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|v| v["role"] == "assistant")
-                .flat_map(|v| v["content"].as_array().unwrap().clone())
-                .collect(),
         }
     }
 }
@@ -106,19 +89,6 @@ pub(super) fn user(s: &str) -> UserMessage {
 }
 pub(super) fn tool() -> ToolDefinition {
     ToolDefinition::new(ToolName::new("lookup").unwrap(),text("Look up a value"),InputSchema::new(json!({"type":"object","properties":{"n":{"type":"integer","minimum":0}},"required":["n"],"additionalProperties":false})).unwrap())
-}
-pub(super) fn session() -> Session {
-    let mut s = Session::new(SessionId::new("fixture").unwrap());
-    s.start_turn(user("hello")).unwrap();
-    s
-}
-pub(super) fn context<O>(s: &Session) -> Context<O> {
-    Context::new(
-        text("Be useful"),
-        s.context_exchanges().unwrap(),
-        vec![tool()],
-    )
-    .unwrap()
 }
 #[derive(Clone)]
 pub(super) struct Reply {
@@ -140,10 +110,12 @@ impl From<Value> for Reply {
     }
 }
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(super) struct Request {
     pub(super) line: String,
     pub(super) headers: String,
     pub(super) body: Value,
+    pub(super) bytes: Vec<u8>,
 }
 pub(super) struct Server {
     pub(super) url: String,
@@ -210,6 +182,7 @@ impl Server {
                     line: headers.lines().next().unwrap().to_string(),
                     headers,
                     body: serde_json::from_slice(&bytes[header_end..]).unwrap(),
+                    bytes: bytes[header_end..].to_vec(),
                 };
                 received.lock().unwrap().push(request);
                 let reply = replies.next().unwrap_or_else(|| Reply {
@@ -279,6 +252,7 @@ impl Drop for Server {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn assert_safe(error: &ModelError) {
     let text = format!("{error:?} {error}");
     for secret in [

@@ -700,3 +700,24 @@ fn os_config_paths() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("config read"));
     }
 }
+
+#[test]
+fn executable_context_budget_is_configurable_and_fails_before_http() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let provider = Provider::new(Protocol::OpenAi);
+    let path = config(root, Protocol::OpenAi, &provider.url);
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["context"] = json!({"optional_turns":0,"max_request_bytes":1});
+    fs::write(&path, value.to_string()).unwrap();
+    let output = cli(root, &path, "/new\nA mandatory request cannot fit\n/exit\n");
+    assert_code(&output, 1);
+    assert_eq!(
+        lines(&output)[1]["error"]["code"],
+        "context_selection_too_large"
+    );
+    assert!(provider.requests().is_empty());
+    value["context"]["max_request_bytes"] = json!(0);
+    fs::write(&path, value.to_string()).unwrap();
+    assert_code(&cli(root, &path, "/new\n"), 2);
+}

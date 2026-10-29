@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 #[path = "../adapters/models/support.rs"]
 mod support;
 use cola::{adapters::stores::JsonlSessionStore, app::*, domain::*};
@@ -139,7 +138,7 @@ fn reviewer_failure_is_durable_and_acknowledgement_is_idempotent_without_tool_io
         );
         let id = svc.new_session().unwrap().id().clone();
         let error = svc.chat(&id, user("ask")).unwrap_err();
-        let AgentErrorKind::ReviewBlocked { invocation } = error.kind() else {
+        let AgentErrorKind::ReviewFailure { invocation, .. } = error.kind() else {
             panic!("{error:?}")
         };
         let invocation = *invocation;
@@ -324,4 +323,134 @@ fn context_selection_pins_unresolved_effect_turns_outside_optional_window() {
     let fitted = selection.fit(|ids| Ok(ids.len() * 10000)).unwrap();
     assert!(fitted.contains(&turn));
     assert_eq!(fitted.len(), 6);
+}
+
+struct BadPolicy;
+impl ContextPolicy for BadPolicy {
+    fn select(&self, _: &Session) -> ContextSelection {
+        ContextSelection {
+            closed_turns: vec![],
+            mandatory_turns: vec![],
+            max_request_bytes: 65536,
+        }
+    }
+}
+#[test]
+fn replacement_policy_cannot_unpin_unknown_effects() {
+    let p = Provider::OpenAI;
+    let server = Server::new(vec![p.tool(1).into(), decision(p, true).into()]);
+    let root = tempfile::tempdir().unwrap();
+    let mut svc = service_with_store(
+        p,
+        &server,
+        faults(root.path(), 9, false),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let id = svc.new_session().unwrap().id().clone();
+    svc.chat(&id, user("unresolved")).unwrap_err();
+    drop(svc);
+    let mut svc = service(p, &server, root.path()).with_context_policy(BadPolicy);
+    let error = svc
+        .chat(&id, user("must preserve unknown effect"))
+        .unwrap_err();
+    assert!(
+        matches!(error.kind(),AgentErrorKind::Model{source,..} if source.kind()==ModelErrorKind::InvalidSelection)
+    );
+    assert_eq!(server.requests().len(), 2);
+    assert!(
+        svc.inspect_session(&id)
+            .unwrap()
+            .session()
+            .active_turn()
+            .is_none()
+    );
+}
+struct LargeOutput;
+impl Tool for LargeOutput {
+    fn execute(&self, _: &serde_json::Map<String, serde_json::Value>) -> ToolOutcome {
+        ToolOutcome::Success("x".repeat(16000))
+    }
+}
+#[test]
+fn growing_native_chain_hits_exact_body_budget_without_truncating_results() {
+    for p in PROVIDERS {
+        let server = Server::new(vec![p.tool(1).into(), decision(p, true).into()]);
+        let root = tempfile::tempdir().unwrap();
+        let mut svc = AgentService::new(
+            Pair {
+                assistant: p.client(&server),
+                reviewer: p.reviewer(&server),
+            },
+            JsonlSessionStore::new(root.path()),
+            Roles,
+            Roles,
+            vec![(tool(), Box::new(LargeOutput))],
+            AgentSettings {
+                assistant_model_settings: p.settings(),
+                reviewer_model_settings: p.settings(),
+                max_iterations: std::num::NonZeroU32::new(8).unwrap(),
+            },
+        )
+        .unwrap()
+        .with_context_policy(RecentContextPolicy {
+            optional_turns: 8,
+            max_request_bytes: 8000,
+        });
+        let id = svc.new_session().unwrap().id().clone();
+        let error = svc.chat(&id, user("large output")).unwrap_err();
+        assert!(
+            matches!(error.kind(),AgentErrorKind::Model{source,..} if source.kind()==ModelErrorKind::ContextSelectionTooLarge)
+        );
+        assert_eq!(server.requests().len(), 2);
+        let doc = svc.inspect_session(&id).unwrap();
+        assert!(
+            matches!(doc.session().turns()[0].steps()[0].executions().next().unwrap().state(),ExecutionState::Returned(ToolOutcome::Success(s)) if s.len()==16000)
+        );
+        assert!(matches!(
+            last_outcome(&doc),
+            RecordedOutcome::PreparationFailed(_)
+        ));
+    }
+}
+struct ChangedInstructions;
+impl Assistant for ChangedInstructions {
+    fn context(&self, s: &Session) -> Result<Context<AssistantMessage>, ContextError> {
+        Context::new(
+            text(if s.active_turn().unwrap().steps().is_empty() {
+                "initial"
+            } else {
+                "edited"
+            }),
+            s.context_exchanges()?,
+            vec![tool()],
+        )
+    }
+}
+#[test]
+fn same_turn_instruction_edits_fail_before_next_network_request() {
+    let p = Provider::Anthropic;
+    let server = Server::new(vec![p.tool(1).into(), decision(p, true).into()]);
+    let root = tempfile::tempdir().unwrap();
+    let mut svc = AgentService::new(
+        Pair {
+            assistant: p.client(&server),
+            reviewer: p.reviewer(&server),
+        },
+        JsonlSessionStore::new(root.path()),
+        ChangedInstructions,
+        Roles,
+        vec![(tool(), Box::new(Target(Arc::new(AtomicUsize::new(0)))))],
+        AgentSettings {
+            assistant_model_settings: p.settings(),
+            reviewer_model_settings: p.settings(),
+            max_iterations: std::num::NonZeroU32::new(8).unwrap(),
+        },
+    )
+    .unwrap();
+    let id = svc.new_session().unwrap().id().clone();
+    let error = svc.chat(&id, user("ask")).unwrap_err();
+    assert!(
+        matches!(error.kind(),AgentErrorKind::Model{source,..} if source.kind()==ModelErrorKind::NativeHistoryIncompatible)
+    );
+    assert_eq!(server.requests().len(), 2);
 }

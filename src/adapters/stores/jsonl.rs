@@ -43,7 +43,7 @@ impl JsonlSessionStore {
         }
         Ok(doc)
     }
-    fn lock(&self, id: &SessionId) -> Result<fs::File, SessionStoreError> {
+    fn lock(&self, id: &SessionId) -> Result<SessionLock, SessionStoreError> {
         fs::create_dir_all(&self.root).map_err(storage)?;
         let lock = fs::OpenOptions::new()
             .read(true)
@@ -59,7 +59,7 @@ impl JsonlSessionStore {
             ),
             fs::TryLockError::Error(e) => storage(e),
         })?;
-        Ok(lock)
+        Ok(SessionLock(lock))
     }
 }
 impl SessionStore for JsonlSessionStore {
@@ -119,9 +119,16 @@ impl SessionStore for JsonlSessionStore {
 struct Writer {
     root: PathBuf,
     path: PathBuf,
-    _lock: fs::File,
+    _lock: SessionLock,
     committed: SessionDocument,
     valid: bool,
+}
+struct SessionLock(fs::File);
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // A concurrently forked child can briefly retain another descriptor.
+        let _ = self.0.unlock();
+    }
 }
 impl SessionWriter for Writer {
     fn committed(&self) -> &SessionDocument {

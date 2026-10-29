@@ -282,7 +282,6 @@ pub enum SessionError {
     AlreadyStarted,
     NotStarted,
     AlreadyReturned,
-    DuplicateCallId(ToolCallId),
     EffectNotUnknown,
     ConflictingResolution,
 }
@@ -303,9 +302,6 @@ impl fmt::Display for SessionError {
             Self::AlreadyStarted => f.write_str("the call has already started"),
             Self::NotStarted => f.write_str("the call has not started"),
             Self::AlreadyReturned => f.write_str("the call already has a result"),
-            Self::DuplicateCallId(id) => {
-                write!(f, "tool call ID {id} was already used in this session")
-            }
             Self::EffectNotUnknown => {
                 f.write_str("only a closed call with unknown effect can be resolved")
             }
@@ -411,10 +407,16 @@ impl Session {
         }
         Ok(())
     }
-    /// Records dispatch intent before returning call data. No tool is executed here.
-    /// A crash after this transition can leave an unknown effect even before I/O.
+    /// Resolves a native ID inside the current batch without changing execution state.
     pub fn call_address(&self, native: ToolCallId) -> Result<CallAddress, SessionError> {
         let active = self.active.as_ref().ok_or(SessionError::NoActiveTurn)?;
+        if active
+            .steps()
+            .last()
+            .is_none_or(|step| step.call_index(&native).is_none())
+        {
+            return Err(SessionError::UnknownCall);
+        }
         Ok(CallAddress {
             session: self.id.clone(),
             turn: active.id(),
@@ -427,7 +429,7 @@ impl Session {
             return Err(SessionError::UnknownCall);
         }
         let active = self.active(address.turn)?;
-        if address.step == 0 || address.step as usize != active.steps().len() {
+        if address.step == 0 || address.step != active.steps().len() as u64 {
             return Err(SessionError::UnknownCall);
         }
         active
@@ -436,6 +438,8 @@ impl Session {
             .last_mut()
             .ok_or(SessionError::UnknownCall)
     }
+    /// Records dispatch intent before returning call data. No tool is executed here.
+    /// A crash after this transition can leave an unknown effect even before I/O.
     pub fn start_tool(&mut self, address: &CallAddress) -> Result<&ToolCall, SessionError> {
         self.addressed_step(address)?.start_tool(&address.native)
     }
@@ -487,7 +491,7 @@ impl Session {
             .ok_or(SessionError::TurnNotFound)?
             .record
             .steps
-            .get_mut(address.step as usize - 1)
+            .get_mut(usize::try_from(address.step - 1).map_err(|_| SessionError::UnknownCall)?)
             .ok_or(SessionError::UnknownCall)?
             .resolve_effect(&address.native, &resolution)
             .unwrap_or(Err(SessionError::UnknownCall))

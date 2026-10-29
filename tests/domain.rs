@@ -52,11 +52,11 @@ fn result(value: &str) -> ToolResult {
 }
 fn finish_tool(session: &mut Session, turn: TurnId, value: &str) {
     session
-        .start_tool(&address(&session, turn, &id(value)))
+        .start_tool(&address(session, turn, &id(value)))
         .unwrap();
     session
         .record_tool_result(
-            &address(&session, turn, (result(value)).call_id()),
+            &address(session, turn, (result(value)).call_id()),
             (result(value)).outcome().clone(),
         )
         .unwrap();

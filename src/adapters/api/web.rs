@@ -304,7 +304,9 @@ fn service_error(error: &crate::app::AgentError) -> Reply {
     let status = match failure.class {
         inbound::FailureClass::NotFound => 404,
         inbound::FailureClass::Blocked => 409,
-        inbound::FailureClass::Refused | inbound::FailureClass::IterationLimit => 422,
+        inbound::FailureClass::Refused
+        | inbound::FailureClass::ContextSelection
+        | inbound::FailureClass::IterationLimit => 422,
         inbound::FailureClass::Incomplete | inbound::FailureClass::Model => 502,
         inbound::FailureClass::Timeout => 504,
         inbound::FailureClass::Store | inbound::FailureClass::Internal => 500,

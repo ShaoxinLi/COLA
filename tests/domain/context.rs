@@ -127,7 +127,7 @@ fn context_accepts_complete_exchanges_and_active_model_wait_with_unique_catalog(
 }
 
 #[test]
-fn context_rejects_duplicate_ids_across_exchanges_and_invalid_exchange_boundaries() {
+fn context_accepts_scoped_repeated_ids_but_rejects_invalid_exchange_boundaries() {
     let complete = |turn, call_id| {
         ContextExchange::new(
             TurnId::new(turn).unwrap(),

@@ -44,6 +44,21 @@ pub struct ModelSettings {
     pub max_output_tokens: NonZeroU32,
 }
 
+/// A deep synchronous invocation port. The recorder must commit preparation before I/O.
+///
+/// ```compile_fail
+/// use cola::{app::{ModelClient, ModelInput, BeforeModelSend}, domain::{AssistantMessage, Decision}};
+/// fn mismatched(client: &dyn ModelClient<Decision>, input: ModelInput<'_, AssistantMessage>, recorder: &mut dyn BeforeModelSend) {
+///     client.invoke(input, recorder);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use cola::{app::ModelClient, adapters::models::OpenAIClient};
+/// fn unsupported(client: OpenAIClient) {
+///     let _: Box<dyn ModelClient<String>> = Box::new(client);
+/// }
+/// ```
 pub trait ModelClient<O> {
     fn route(&self) -> String;
     fn invoke(

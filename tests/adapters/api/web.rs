@@ -1,5 +1,4 @@
-#[path = "../../support/mod.rs"]
-mod support;
+use crate::support;
 use cola::{app::*, domain::*};
 use serde_json::{Value, json};
 use std::{
@@ -710,7 +709,7 @@ fn create_and_list_failures_keep_safe_progress_and_service_residency() {
 fn http_tool_results_and_failure_progress_are_full_and_safe() {
     for (mode, status, code, role) in [
         ("timeout", 504, "model_timeout", "assistant"),
-        ("review-timeout", 409, "review_failure", "reviewer"),
+        ("review-timeout", 504, "model_timeout", "reviewer"),
         ("refused", 422, "generation_refused", "assistant"),
         ("incomplete", 502, "generation_incomplete", "assistant"),
         ("model", 502, "model_failure", "assistant"),
@@ -802,5 +801,53 @@ fn disconnect_does_not_undo_admitted_chat() {
             .turns()
             .len(),
         1
+    );
+}
+
+#[test]
+fn review_failure_acknowledgement_http_contract() {
+    let server = Server::new("review-timeout");
+    let id = server.create();
+    let (status, failure) = server.chat(&id);
+    assert_eq!(status, 504);
+    assert_eq!(failure["error"]["invocation_id"], 2);
+    let route = format!("/sessions/{id}/review-failure-acknowledgements");
+    for (body, status) in [
+        (json!({"invocation_id":0,"evidence":"checked"}), 400),
+        (json!({"invocation_id":2,"evidence":" "}), 400),
+        (json!({"invocation_id":1,"evidence":"checked"}), 409),
+        (json!({"invocation_id":2,"evidence":"checked"}), 200),
+        (json!({"invocation_id":2,"evidence":"checked"}), 200),
+        (json!({"invocation_id":2,"evidence":"different"}), 409),
+    ] {
+        assert_eq!(
+            server
+                .request(
+                    "POST",
+                    &route,
+                    body.to_string().as_bytes(),
+                    Some("application/json")
+                )
+                .0,
+            status
+        );
+    }
+    assert_eq!(server.chat(&id).0, 200);
+    let doc = JsonlSessionStore::new(server.root.path().join("sessions"))
+        .inspect(&SessionId::new(id).unwrap())
+        .unwrap();
+    assert_eq!(doc.acknowledgements().len(), 1);
+    assert_eq!(doc.acknowledgements()[0].actor, None);
+    assert!(matches!(
+        doc.session().turns()[0].outcome(),
+        TurnOutcome::Failed(_)
+    ));
+    assert_eq!(
+        doc.session().turns()[0].steps()[0]
+            .executions()
+            .next()
+            .unwrap()
+            .state(),
+        &ExecutionState::Started
     );
 }

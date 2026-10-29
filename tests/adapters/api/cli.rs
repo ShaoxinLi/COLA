@@ -1,5 +1,4 @@
-#[path = "../../support/mod.rs"]
-mod support;
+use crate::support;
 use cola::{app::*, domain::*};
 use serde_json::{Value, json};
 use std::{
@@ -380,7 +379,7 @@ fn full_tool_messages_and_session_execution_facts() {
 fn errors_retain_role_progress_and_blocked_resident_state() {
     for (mode, code, role) in [
         ("timeout", "model_timeout", "assistant"),
-        ("review-timeout", "review_failure", "reviewer"),
+        ("review-timeout", "model_timeout", "reviewer"),
         ("refused", "generation_refused", "assistant"),
         ("incomplete", "generation_incomplete", "assistant"),
         ("model", "model_failure", "assistant"),
@@ -547,4 +546,23 @@ fn output_is_flushed_and_stream_failures_propagate() {
             .run(Broken, vec![])
             .is_err()
     );
+}
+
+#[test]
+fn review_acknowledgement_reports_id_and_retries_without_model_or_tool_calls() {
+    let store = Store::default();
+    let counts = store.counts.clone();
+    let (_, replies)=run("review-timeout",store,b"/new\nrequest\n/ack-review-failure 2 inspected\n/ack-review-failure 2 inspected\n/ack-review-failure 2 conflicting\n/sessions\ncontinue\n");
+    assert_eq!(replies[1]["error"]["invocation_id"], 2);
+    assert_eq!(replies[1]["error"]["code"], "model_timeout");
+    assert_eq!(replies[2]["kind"], "review_failure_acknowledged");
+    assert_eq!(replies[3], replies[2]);
+    assert_eq!(replies[4]["error"]["code"], "acknowledgement_conflict");
+    assert_eq!(
+        replies[5]["sessions"][0]["turns"][0]["outcome"]["kind"],
+        "failed"
+    );
+    assert_eq!(replies[6]["kind"], "chatted");
+    assert_eq!(counts.tool.get(), 0);
+    assert_eq!(counts.model.get(), 2);
 }

@@ -50,6 +50,12 @@ struct FileRole {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct FileContext {
+    optional_turns: Option<usize>,
+    max_request_bytes: Option<usize>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     protocol: Protocol,
     base_url: String,
@@ -61,6 +67,7 @@ struct FileConfig {
     timeout_ms: Option<u64>,
     max_response_bytes: Option<usize>,
     max_iterations: Option<u32>,
+    context: Option<FileContext>,
 }
 enum Mode {
     Cli,
@@ -75,6 +82,7 @@ struct Launch {
     protocol: Protocol,
     connection: ClientConfig,
     settings: AgentSettings,
+    context: RecentContextPolicy,
     tool_cwd: PathBuf,
     store_root: PathBuf,
 }
@@ -198,9 +206,20 @@ fn decode_config(bytes: &[u8], mode: Mode, initial_cwd: &Path) -> Result<Launch,
         limit,
     )
     .map_err(|_| StartupError::Config("connection settings"))?;
+    let configured = file.context.unwrap_or(FileContext {
+        optional_turns: None,
+        max_request_bytes: None,
+    });
+    let context = RecentContextPolicy {
+        optional_turns: configured.optional_turns.unwrap_or(8),
+        max_request_bytes: NonZeroUsize::new(configured.max_request_bytes.unwrap_or(65536))
+            .ok_or(StartupError::Config("context max_request_bytes"))?
+            .get(),
+    };
     Ok(Launch {
         mode,
         protocol: file.protocol,
+        context,
         connection,
         settings: AgentSettings {
             assistant_model_settings: role(file.assistant)?,
@@ -250,6 +269,7 @@ fn dispatch(launch: Launch) -> Result<i32, StartupError> {
         protocol,
         connection,
         settings,
+        context,
         tool_cwd,
         store_root,
     } = launch;
@@ -258,6 +278,7 @@ fn dispatch(launch: Launch) -> Result<i32, StartupError> {
             OpenAIClient::new(connection).map_err(|_| StartupError::Client)?,
             mode,
             settings,
+            context,
             &tool_cwd,
             store_root,
         ),
@@ -265,6 +286,7 @@ fn dispatch(launch: Launch) -> Result<i32, StartupError> {
             AnthropicClient::new(connection).map_err(|_| StartupError::Client)?,
             mode,
             settings,
+            context,
             &tool_cwd,
             store_root,
         ),
@@ -287,6 +309,7 @@ fn serve<M>(
     model: M,
     mode: Mode,
     settings: AgentSettings,
+    context: RecentContextPolicy,
     cwd: &Path,
     root: PathBuf,
 ) -> Result<i32, StartupError>
@@ -308,7 +331,8 @@ where
         tools,
         settings,
     )
-    .map_err(|_| StartupError::Service)?;
+    .map_err(|_| StartupError::Service)?
+    .with_context_policy(context);
     match mode {
         Mode::Cli => CliApp::new(service)
             .run(io::stdin().lock(), io::stdout().lock())

@@ -117,7 +117,7 @@ pub enum RecordedOutcome {
     Incomplete(super::IncompleteReason),
     Failed(super::ModelError),
     PreparationFailed(super::ModelError),
-    OutputRejected,
+    OutputRejected { reason: String },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InvocationState {
@@ -125,7 +125,7 @@ pub enum InvocationState {
     Prepared(RequestEvidence),
     Finished {
         request: Option<RequestEvidence>,
-        response: ResponseEvidence,
+        response: Box<ResponseEvidence>,
         outcome: RecordedOutcome,
     },
     Interrupted {
@@ -335,7 +335,7 @@ impl SessionDocument {
         }
         invocation.state = InvocationState::Finished {
             request,
-            response: observation.evidence.clone(),
+            response: Box::new(observation.evidence.clone()),
             outcome,
         };
         Ok(next)
@@ -365,7 +365,11 @@ impl SessionDocument {
                 if known && session.record_assistant(turn, output.clone()).is_ok() {
                     RecordedOutcome::AssistantAccepted
                 } else {
-                    RecordedOutcome::OutputRejected
+                    RecordedOutcome::OutputRejected {
+                        reason:
+                            "Assistant output violates the advertised catalog or session transition"
+                                .into(),
+                    }
                 }
             }
             other => recorded(other, matches!(invocation.state, InvocationState::Planned)),
@@ -615,17 +619,16 @@ impl SessionDocument {
             {
                 return Err(DocumentError::InvalidEvidence);
             }
-            if let Some(r) = request {
-                if r.body.format.trim().is_empty()
+            if let Some(r) = request
+                && (r.body.format.trim().is_empty()
                     || r.body.version == 0
                     || r.body.bytes.is_empty()
                     || r.selection.windows(2).any(|w| w[0] >= w[1])
                     || r.selection
                         .iter()
-                        .any(|id| *id == 0 || *id >= i.target.turn())
-                {
-                    return Err(DocumentError::InvalidEvidence);
-                }
+                        .any(|id| *id == 0 || *id >= i.target.turn()))
+            {
+                return Err(DocumentError::InvalidEvidence);
             }
             match &i.target {
                 InvocationTarget::Assistant { turn, step } => {
@@ -661,12 +664,18 @@ impl SessionDocument {
                         || call.step == 0
                         || !reviews.insert(address)
                         || !accepted.contains_key(&(call.turn, call.step))
-                        || turn.steps.get(call.step as usize - 1).is_none_or(|s| {
-                            !s.executions.iter().any(|e| {
-                                e.call_id == call.native
-                                    && !matches!(e.state, ExecutionState::NotStarted)
+                        || turn
+                            .steps
+                            .get(
+                                usize::try_from(call.step - 1)
+                                    .map_err(|_| DocumentError::InvalidEvidence)?,
+                            )
+                            .is_none_or(|s| {
+                                !s.executions.iter().any(|e| {
+                                    e.call_id == call.native
+                                        && !matches!(e.state, ExecutionState::NotStarted)
+                                })
                             })
-                        })
                     {
                         return Err(DocumentError::InvalidEvidence);
                     }
@@ -677,6 +686,13 @@ impl SessionDocument {
             for step in 1..=turn.steps.len() as u64 {
                 if !accepted.contains_key(&(turn.id, step)) {
                     return Err(DocumentError::InvalidEvidence);
+                }
+            }
+        }
+        for turn in &records {
+            for (index, step) in turn.steps.iter().enumerate() {
+                for execution in &step.executions {
+                    if matches!(execution.state, ExecutionState::Returned(_)) && !self.invocations.iter().any(|i| matches!(&i.target, InvocationTarget::Reviewer { call } if call.turn == turn.id && call.step == index as u64+1 && call.native == execution.call_id) && matches!(i.state, InvocationState::Finished { outcome: RecordedOutcome::Review { .. }, .. })) { return Err(DocumentError::InvalidEvidence); }
                 }
             }
         }
@@ -727,7 +743,7 @@ fn recorded<O>(generation: &Generation<O>, planned: bool) -> RecordedOutcome {
 }
 fn failure(outcome: &RecordedOutcome) -> TurnFailure {
     let text = match outcome {
-        RecordedOutcome::OutputRejected => "Model output rejected".into(),
+        RecordedOutcome::OutputRejected { reason } => format!("Model output rejected: {reason}"),
         RecordedOutcome::Refused => "Model refused generation".into(),
         RecordedOutcome::Incomplete(reason) => format!("Model generation incomplete ({reason:?})"),
         RecordedOutcome::Failed(e) | RecordedOutcome::PreparationFailed(e) => {
@@ -735,7 +751,7 @@ fn failure(outcome: &RecordedOutcome) -> TurnFailure {
         }
         _ => "Reviewer failure".into(),
     };
-    if matches!(outcome, RecordedOutcome::OutputRejected)
+    if matches!(outcome, RecordedOutcome::OutputRejected { .. })
         || matches!(outcome, RecordedOutcome::Failed(e) if e.kind() == ModelErrorKind::MalformedResponse)
     {
         TurnFailure::MalformedResponse(NonEmptyText::new(text).unwrap())

@@ -324,7 +324,7 @@ where
                     if matches!(
                         writer.committed().invocations().last().unwrap().state,
                         InvocationState::Finished {
-                            outcome: RecordedOutcome::OutputRejected,
+                            outcome: RecordedOutcome::OutputRejected { .. },
                             ..
                         }
                     ) {
@@ -430,7 +430,13 @@ where
                     let Generation::Complete { output: decision } = observed.generation else {
                         return Err(error(
                             Some(writer.committed()),
-                            AgentErrorKind::ReviewBlocked { invocation },
+                            AgentErrorKind::ReviewFailure {
+                                invocation,
+                                source: Box::new(
+                                    generation_error(&observed.generation, ModelRole::Reviewer)
+                                        .expect("nondecision generation"),
+                                ),
+                            },
                         ));
                     };
                     let outcome = if decision.should_allow() {
@@ -583,19 +589,14 @@ pub enum AgentErrorKind {
     ReviewBlocked {
         invocation: u64,
     },
+    ReviewFailure {
+        invocation: u64,
+        source: Box<AgentErrorKind>,
+    },
     DuplicateTool(ToolName),
-    CatalogMismatch(ToolName),
-    UnknownTool(ToolCall),
     Store {
         at: Checkpoint,
         source: SessionStoreError,
-    },
-    Blocked {
-        at: Checkpoint,
-    },
-    Context {
-        role: ModelRole,
-        source: ContextError,
     },
     Model {
         role: ModelRole,
@@ -617,16 +618,16 @@ impl fmt::Display for AgentErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Document(source) => write!(f, "{source}"),
+            Self::ReviewFailure { invocation, source } => write!(
+                f,
+                "{source}; review invocation {invocation} requires acknowledgement"
+            ),
             Self::ReviewBlocked { invocation } => write!(
                 f,
                 "review failure requires acknowledgement for invocation {invocation}"
             ),
             Self::DuplicateTool(name) => write!(f, "duplicate tool {name}"),
-            Self::CatalogMismatch(name) => write!(f, "catalog mismatch for {name}"),
-            Self::UnknownTool(call) => write!(f, "unadvertised tool {}", call.name()),
             Self::Store { at, source } => write!(f, "agent save/load at {at:?}: {source}"),
-            Self::Blocked { at } => write!(f, "agent session blocked at {at:?}"),
-            Self::Context { role, source } => write!(f, "{role:?} context: {source}"),
             Self::Model { role, source } => write!(f, "{role:?}: {source}"),
             Self::Refused { role, .. } => write!(f, "{role:?} refused generation"),
             Self::Incomplete { role, reason } => {
@@ -641,8 +642,8 @@ impl fmt::Display for AgentErrorKind {
 impl Error for AgentErrorKind {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::ReviewFailure { source, .. } => Some(source),
             Self::Store { source, .. } => Some(source),
-            Self::Context { source, .. } => Some(source),
             Self::Model { source, .. } => Some(source),
             Self::RejectedOutput(source) => Some(source),
             _ => None,

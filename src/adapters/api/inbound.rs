@@ -156,6 +156,7 @@ pub(super) enum FailureClass {
     NotFound,
     Blocked,
     Refused,
+    ContextSelection,
     IterationLimit,
     Incomplete,
     Timeout,
@@ -292,7 +293,14 @@ pub(super) struct ClassifiedFailure {
     pub dto: FailureDto,
 }
 pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
-    let (class, code, message, role) = match error.kind() {
+    let (kind, invocation_id) = match error.kind() {
+        AgentErrorKind::ReviewFailure { invocation, source } => {
+            (source.as_ref(), Some(*invocation))
+        }
+        AgentErrorKind::ReviewBlocked { invocation } => (error.kind(), Some(*invocation)),
+        _ => (error.kind(), None),
+    };
+    let (class, code, message, role) = match kind {
         AgentErrorKind::Store {
             at: Checkpoint::LoadSession,
             source,
@@ -308,10 +316,18 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             "Session is busy",
             None,
         ),
-        AgentErrorKind::Document(_) => (
+        AgentErrorKind::Document(
+            DocumentError::NoReviewFailure | DocumentError::ConflictingAcknowledgement,
+        ) => (
             FailureClass::Blocked,
             "acknowledgement_conflict",
             "Review failure acknowledgement conflicts or is not pending",
+            None,
+        ),
+        AgentErrorKind::Document(_) | AgentErrorKind::ReviewFailure { .. } => (
+            FailureClass::Internal,
+            "invalid_document",
+            "Invalid session document",
             None,
         ),
         AgentErrorKind::ReviewBlocked { .. } => (
@@ -324,12 +340,6 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             FailureClass::Store,
             "store_failure",
             "Session storage failed",
-            None,
-        ),
-        AgentErrorKind::Blocked { .. } => (
-            FailureClass::Blocked,
-            "session_blocked",
-            "Session is blocked",
             None,
         ),
         AgentErrorKind::Refused { role, .. } => (
@@ -345,7 +355,21 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             Some(*role),
         ),
         AgentErrorKind::Model { role, source } => {
-            if source.kind() == ModelErrorKind::Timeout {
+            if source.kind() == ModelErrorKind::ContextSelectionTooLarge {
+                (
+                    FailureClass::ContextSelection,
+                    "context_selection_too_large",
+                    "Required context exceeds the request budget",
+                    Some(*role),
+                )
+            } else if source.kind() == ModelErrorKind::InvalidSelection {
+                (
+                    FailureClass::Internal,
+                    "invalid_context_selection",
+                    "Context selection does not preserve required facts",
+                    Some(*role),
+                )
+            } else if source.kind() == ModelErrorKind::Timeout {
                 (
                     FailureClass::Timeout,
                     "model_timeout",
@@ -373,24 +397,6 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             "Duplicate tool registration",
             None,
         ),
-        AgentErrorKind::CatalogMismatch(_) => (
-            FailureClass::Internal,
-            "catalog_mismatch",
-            "Tool catalog mismatch",
-            None,
-        ),
-        AgentErrorKind::UnknownTool(_) => (
-            FailureClass::Internal,
-            "unknown_tool",
-            "Assistant requested an unknown tool",
-            None,
-        ),
-        AgentErrorKind::Context { role, .. } => (
-            FailureClass::Internal,
-            "context_failure",
-            "Context assembly failed",
-            Some(*role),
-        ),
         AgentErrorKind::RejectedOutput(_) => (
             FailureClass::Internal,
             "rejected_output",
@@ -409,10 +415,7 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
         dto: FailureDto {
             code,
             message,
-            invocation_id: match error.kind() {
-                AgentErrorKind::ReviewBlocked { invocation } => Some(*invocation),
-                _ => None,
-            },
+            invocation_id,
             role: role.map(|r| match r {
                 ModelRole::Assistant => ModelRoleDto::Assistant,
                 ModelRole::Reviewer => ModelRoleDto::Reviewer,

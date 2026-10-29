@@ -1,11 +1,12 @@
 #[path = "adapters/stores/jsonl.rs"]
 mod jsonl;
+#[path = "support/mod.rs"]
+mod support;
 #[path = "adapters/models"]
 mod models {
     mod anthropic;
     mod client;
     mod openai;
-    #[allow(dead_code)]
     mod support;
 }
 #[path = "adapters/tools"]

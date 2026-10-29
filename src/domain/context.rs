@@ -1,6 +1,6 @@
 use super::{
     AssistantMessage, CallAddress, EffectResolution, ExecutionState, Message, NonEmptyText,
-    Session, ToolCall, ToolCallId, ToolDefinition, ToolName, ToolResult, TurnId, TurnOutcome,
+    Session, ToolCall, ToolDefinition, ToolName, ToolResult, TurnId, TurnOutcome,
 };
 use std::{collections::BTreeSet, error::Error, fmt, marker::PhantomData};
 
@@ -33,7 +33,6 @@ pub enum ContextError {
     InvalidMessageOrder,
     UnresolvedToolBatch,
     MismatchedToolResult,
-    DuplicateCallId(ToolCallId),
     DuplicateToolName(ToolName),
     InvalidOutcome,
     InvalidTurnOrder,
@@ -52,7 +51,6 @@ impl fmt::Display for ContextError {
             Self::MismatchedToolResult => {
                 f.write_str("tool result does not match the next requested call")
             }
-            Self::DuplicateCallId(id) => write!(f, "duplicate tool call ID {id} in context"),
             Self::DuplicateToolName(name) => {
                 write!(f, "duplicate tool name {name} in context catalog")
             }

@@ -195,17 +195,16 @@ impl Engine {
                 (Provider::Anthropic, Some("tool_use")) => item.get("id"),
                 _ => None,
             };
-            if let Some(id) = id.and_then(Value::as_str) {
-                if id.trim().is_empty() || !calls.insert(id.into()) {
-                    return Err(ModelError::new(ModelErrorKind::NativeIdCollision));
-                }
+            if let Some(id) = id.and_then(Value::as_str)
+                && (id.trim().is_empty() || !calls.insert(id.into()))
+            {
+                return Err(ModelError::new(ModelErrorKind::NativeIdCollision));
             }
-            if self.provider == Provider::OpenAI {
-                if let Some(id) = item.get("id").and_then(Value::as_str) {
-                    if !items.insert(id.into()) {
-                        return Err(ModelError::new(ModelErrorKind::NativeIdCollision));
-                    }
-                }
+            if self.provider == Provider::OpenAI
+                && let Some(id) = item.get("id").and_then(Value::as_str)
+                && !items.insert(id.into())
+            {
+                return Err(ModelError::new(ModelErrorKind::NativeIdCollision));
             }
         }
         Ok(())
@@ -514,6 +513,12 @@ impl Transport {
         let mut bytes = vec![];
         let read = response.take(max as u64 + 1).read_to_end(&mut bytes);
         if read.is_err() || bytes.len() > max {
+            let timed_out = read.as_ref().err().is_some_and(|e| {
+                e.kind() == std::io::ErrorKind::TimedOut
+                    || e.get_ref()
+                        .and_then(|source| source.downcast_ref::<reqwest::Error>())
+                        .is_some_and(reqwest::Error::is_timeout)
+            });
             let oversized = bytes.len() > max;
             bytes.truncate(max);
             let capture = CaptureCompleteness::Partial {
@@ -524,6 +529,8 @@ impl Transport {
                 Some(status),
                 Some(ModelError::new(if oversized {
                     ModelErrorKind::ResponseTooLarge
+                } else if timed_out {
+                    ModelErrorKind::Timeout
                 } else {
                     ModelErrorKind::Transport
                 })),
