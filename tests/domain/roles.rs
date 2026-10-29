@@ -63,7 +63,9 @@ fn external_roles_assemble_typed_context_through_trait_objects() {
             ),
         )
         .unwrap();
-    session.start_tool(prior, prior_call.id()).unwrap();
+    session
+        .start_tool(&super::address(&session, prior, prior_call.id()))
+        .unwrap();
     session.interrupt(prior, StopReason::ProcessLost).unwrap();
     let closed = session.closed_context_exchanges().unwrap();
     let turn = session

@@ -366,14 +366,17 @@ fn exercise(protocol: Protocol, web: bool) {
     );
     assert!(!root.join("tools/denied.txt").exists());
     let store = JsonlSessionStore::new(root.join("sessions"));
-    let session = store.load(&SessionId::new(&id).unwrap()).unwrap();
+    let document = store.inspect(&SessionId::new(&id).unwrap()).unwrap();
+    let session = document.session();
     assert_eq!(session.turns().len(), 2);
     let persisted = fs::read_dir(root.join("sessions"))
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .unwrap();
     let content = fs::read_to_string(persisted).unwrap();
     for line in content.lines() {
         let _: Value = serde_json::from_str(line).unwrap();
@@ -451,9 +454,55 @@ fn exercise(protocol: Protocol, web: bool) {
     }
     drop(server);
     let restarted = cli(root, &path, &format!("/use {id}\nAfter restart\n/exit\n"));
-    assert_code(&restarted, 1);
-    assert_eq!(lines(&restarted)[1]["error"]["code"], "model_failure");
-    assert_eq!(provider.requests().len(), 7);
+    assert_code(&restarted, 0);
+    assert_eq!(lines(&restarted)[1]["kind"], "chatted");
+    assert_eq!(provider.requests().len(), 8);
+    assert_eq!(
+        store
+            .inspect(&SessionId::new(&id).unwrap())
+            .unwrap()
+            .session()
+            .turns()
+            .len(),
+        3
+    );
+    if web {
+        let mut process = Process::spawn(
+            root,
+            &[
+                "web".as_ref(),
+                "--config".as_ref(),
+                path.as_os_str(),
+                "--bind".as_ref(),
+                "127.0.0.1:0".as_ref(),
+            ],
+        );
+        let address = process.address();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(WAIT)
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = http(
+            &client,
+            &format!("{address}/sessions/{id}/messages"),
+            Some(json!({"text":"After Web restart"})),
+            200,
+        );
+        assert_eq!(
+            response["messages"].as_array().unwrap().last().unwrap()["text"],
+            "second turn complete"
+        );
+        assert_eq!(
+            store
+                .inspect(&SessionId::new(&id).unwrap())
+                .unwrap()
+                .session()
+                .turns()
+                .len(),
+            4
+        );
+    }
 }
 
 #[test]

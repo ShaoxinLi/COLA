@@ -134,6 +134,7 @@ pub(super) struct FailureDto {
     code: &'static str,
     message: &'static str,
     role: Option<ModelRoleDto>,
+    invocation_id: Option<u64>,
     progress: Option<SessionDto>,
     durability: DurabilityDto,
 }
@@ -301,6 +302,24 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             "Session not found",
             None,
         ),
+        AgentErrorKind::Store { source, .. } if source.kind() == SessionStoreErrorKind::Busy => (
+            FailureClass::Blocked,
+            "session_busy",
+            "Session is busy",
+            None,
+        ),
+        AgentErrorKind::Document(_) => (
+            FailureClass::Blocked,
+            "acknowledgement_conflict",
+            "Review failure acknowledgement conflicts or is not pending",
+            None,
+        ),
+        AgentErrorKind::ReviewBlocked { .. } => (
+            FailureClass::Blocked,
+            "review_failure",
+            "Review failure requires acknowledgement",
+            Some(ModelRole::Reviewer),
+        ),
         AgentErrorKind::Store { .. } => (
             FailureClass::Store,
             "store_failure",
@@ -390,6 +409,10 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
         dto: FailureDto {
             code,
             message,
+            invocation_id: match error.kind() {
+                AgentErrorKind::ReviewBlocked { invocation } => Some(*invocation),
+                _ => None,
+            },
             role: role.map(|r| match r {
                 ModelRole::Assistant => ModelRoleDto::Assistant,
                 ModelRole::Reviewer => ModelRoleDto::Reviewer,
@@ -404,6 +427,7 @@ pub(super) fn input_failure(code: &'static str, message: &'static str) -> Failur
         code,
         message,
         role: None,
+        invocation_id: None,
         progress: None,
         durability: DurabilityDto::Unconfirmed,
     }

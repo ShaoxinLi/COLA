@@ -1,6 +1,6 @@
 use super::{
-    AssistantMessage, Message, NonEmptyText, SessionId, ToolCall, ToolCallId, ToolCalls, ToolName,
-    ToolOutcome, ToolResult, TurnId, UserMessage, ValueError,
+    AssistantMessage, CallAddress, Message, NonEmptyText, SessionId, ToolCall, ToolCallId,
+    ToolCalls, ToolName, ToolOutcome, ToolResult, TurnId, UserMessage, ValueError,
 };
 use serde_json::Value;
 use std::{error::Error, fmt};
@@ -399,18 +399,6 @@ impl Session {
         if self.next_action() != NextAction::AskModel {
             return Err(SessionError::NotAwaitingModel);
         }
-        if let Some(calls) = message.calls() {
-            for call in calls.as_slice() {
-                if self
-                    .records()
-                    .flat_map(|r| &r.steps)
-                    .flat_map(Step::calls)
-                    .any(|prior| prior.id() == call.id())
-                {
-                    return Err(SessionError::DuplicateCallId(call.id().clone()));
-                }
-            }
-        }
         let completed = matches!(message, AssistantMessage::Answer(_));
         self.active
             .as_mut()
@@ -425,31 +413,39 @@ impl Session {
     }
     /// Records dispatch intent before returning call data. No tool is executed here.
     /// A crash after this transition can leave an unknown effect even before I/O.
-    pub fn start_tool(
-        &mut self,
-        id: TurnId,
-        call_id: &ToolCallId,
-    ) -> Result<&ToolCall, SessionError> {
-        let active = self.active(id)?;
-        let step = active
+    pub fn call_address(&self, native: ToolCallId) -> Result<CallAddress, SessionError> {
+        let active = self.active.as_ref().ok_or(SessionError::NoActiveTurn)?;
+        Ok(CallAddress {
+            session: self.id.clone(),
+            turn: active.id(),
+            step: active.steps().len() as u64,
+            native,
+        })
+    }
+    fn addressed_step(&mut self, address: &CallAddress) -> Result<&mut Step, SessionError> {
+        if address.session != self.id {
+            return Err(SessionError::UnknownCall);
+        }
+        let active = self.active(address.turn)?;
+        if address.step == 0 || address.step as usize != active.steps().len() {
+            return Err(SessionError::UnknownCall);
+        }
+        active
             .record
             .steps
             .last_mut()
-            .ok_or(SessionError::UnknownCall)?;
-        step.start_tool(call_id)
+            .ok_or(SessionError::UnknownCall)
+    }
+    pub fn start_tool(&mut self, address: &CallAddress) -> Result<&ToolCall, SessionError> {
+        self.addressed_step(address)?.start_tool(&address.native)
     }
     pub fn record_tool_result(
         &mut self,
-        id: TurnId,
-        result: ToolResult,
+        address: &CallAddress,
+        outcome: ToolOutcome,
     ) -> Result<(), SessionError> {
-        let active = self.active(id)?;
-        let step = active
-            .record
-            .steps
-            .last_mut()
-            .ok_or(SessionError::UnknownCall)?;
-        step.record_tool_result(result)
+        self.addressed_step(address)?
+            .record_tool_result(ToolResult::new(address.native.clone(), outcome))
     }
     pub fn interrupt(&mut self, id: TurnId, reason: StopReason) -> Result<(), SessionError> {
         self.active(id)?;
@@ -472,22 +468,28 @@ impl Session {
     /// A different resolution is rejected, preserving the original evidence.
     pub fn resolve_effect(
         &mut self,
-        id: TurnId,
-        call_id: &ToolCallId,
+        address: &CallAddress,
         resolution: EffectResolution,
     ) -> Result<(), SessionError> {
-        if self.active.as_ref().is_some_and(|turn| turn.id() == id) {
+        if address.session != self.id || address.step == 0 {
+            return Err(SessionError::UnknownCall);
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|turn| turn.id() == address.turn)
+        {
             return Err(SessionError::EffectNotUnknown);
         }
-        let turn = self
-            .turns
+        self.turns
             .iter_mut()
-            .find(|turn| turn.id() == id)
-            .ok_or(SessionError::TurnNotFound)?;
-        turn.record
+            .find(|turn| turn.id() == address.turn)
+            .ok_or(SessionError::TurnNotFound)?
+            .record
             .steps
-            .iter_mut()
-            .find_map(|step| step.resolve_effect(call_id, &resolution))
+            .get_mut(address.step as usize - 1)
+            .ok_or(SessionError::UnknownCall)?
+            .resolve_effect(&address.native, &resolution)
             .unwrap_or(Err(SessionError::UnknownCall))
     }
 }
@@ -584,7 +586,7 @@ impl Session {
         }
     }
     /// Validates snapshots by replaying the same public state transitions.
-    /// Formerly active work is closed as `Interrupted(ProcessLost)`, never resumed.
+    /// Active work is preserved. Recovery is an explicit application transaction.
     pub fn restore(snapshot: SessionSnapshot) -> Result<Self, RestoreError> {
         let mut session = Self::new(SessionId::new(snapshot.session_id)?);
         for turn in snapshot.turns {
@@ -613,7 +615,7 @@ impl Session {
             ));
         }
         let mut resolutions = vec![];
-        for step in snapshot.steps {
+        for (step_index, step) in snapshot.steps.into_iter().enumerate() {
             let message = match step.assistant {
                 AssistantSnapshot::Answer(text) => AssistantMessage::answer(text)?,
                 AssistantSnapshot::ToolRequests { text, calls } => {
@@ -657,18 +659,24 @@ impl Session {
             }
             self.record_assistant(id, message)?;
             for (call_id, execution) in call_ids.into_iter().zip(step.executions) {
+                let address = CallAddress {
+                    session: self.id.clone(),
+                    turn: id,
+                    step: step_index as u64 + 1,
+                    native: call_id.clone(),
+                };
                 match execution.state {
                     ExecutionState::NotStarted => {}
                     ExecutionState::Started => {
-                        self.start_tool(id, &call_id)?;
+                        self.start_tool(&address)?;
                     }
                     ExecutionState::Returned(outcome) => {
-                        self.start_tool(id, &call_id)?;
-                        self.record_tool_result(id, ToolResult::new(call_id.clone(), outcome))?;
+                        self.start_tool(&address)?;
+                        self.record_tool_result(&address, outcome)?;
                     }
                 }
                 if let Some(resolution) = execution.resolution {
-                    resolutions.push((call_id, resolution));
+                    resolutions.push((address, resolution));
                 }
             }
         }
@@ -682,10 +690,16 @@ impl Session {
             }
             Some(TurnOutcome::Interrupted(reason)) => self.interrupt(id, reason)?,
             Some(TurnOutcome::Failed(failure)) => self.fail(id, failure)?,
-            None => self.interrupt(id, StopReason::ProcessLost)?,
+            None => {
+                if self.active.as_ref().is_none_or(|t| t.id() != id) {
+                    return Err(RestoreError::InvalidSnapshot(
+                        "active snapshot cannot contain a completed answer",
+                    ));
+                }
+            }
         }
-        for (call_id, resolution) in resolutions {
-            self.resolve_effect(id, &call_id, resolution)?;
+        for (address, resolution) in resolutions {
+            self.resolve_effect(&address, resolution)?;
         }
         Ok(())
     }

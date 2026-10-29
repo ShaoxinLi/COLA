@@ -1,28 +1,23 @@
-use crate::domain::{Session, SessionId};
+use crate::domain::SessionId;
 use std::{error::Error, fmt};
 
-/// Synchronous persistence of complete session facts.
 pub trait SessionStore {
-    /// Returns all sessions sorted by ID, recovering active turns as `ProcessLost`.
-    /// Recovery retains dispatch intent and does not write back. A missing store
-    /// returns an empty list. Any corrupt committed session fails the listing.
-    fn list(&self) -> Result<Vec<Session>, SessionStoreError>;
-    /// Replaces the saved state for this ID with all current session facts.
-    /// Active turns are saved faithfully without changing the live session.
-    /// Repeating an identical save is safe. Unreadable representations are
-    /// refused with `InvalidData`, preserving any previous saved state.
-    /// Corrupt or unsupported existing records are also preserved and refused.
-    /// An error after replacement may leave the new state visible; errors do
-    /// not imply rollback, and retrying the identical save is safe.
-    fn save(&self, session: &Session) -> Result<(), SessionStoreError>;
-    /// Loads a session or returns `NotFound` when its record is absent.
-    /// Recovery closes active turns as `ProcessLost`, retaining dispatch intent
-    /// and typed execution and effect-resolution facts without writing back.
-    fn load(&self, id: &SessionId) -> Result<Session, SessionStoreError>;
+    fn list(&self) -> Result<Vec<SessionId>, SessionStoreError>;
+    fn create(&self) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError>;
+    fn acquire(&self, id: &SessionId) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError>;
+    fn inspect(&self, id: &SessionId) -> Result<super::SessionDocument, SessionStoreError>;
+}
+pub trait SessionWriter {
+    fn committed(&self) -> &super::SessionDocument;
+    fn commit(&mut self, next: super::SessionDocument) -> Result<u64, SessionStoreError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionStoreErrorKind {
+    Busy,
+    StaleRevision,
+    WriterInvalidated,
+    PublishedDurabilityUncertain,
     NotFound,
     InvalidData,
     UnsupportedVersion,

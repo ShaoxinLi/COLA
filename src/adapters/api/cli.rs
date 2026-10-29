@@ -11,6 +11,10 @@ use std::io::{self, BufRead, Write};
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Reply {
+    ReviewFailureAcknowledged {
+        session_id: String,
+        invocation_id: u64,
+    },
     Created {
         session: inbound::SessionDto,
     },
@@ -107,6 +111,24 @@ where
                         exit = CliExit::InvalidInput;
                         Ok(invalid())
                     }
+                }
+            } else if let Some(rest) = line.strip_prefix("/ack-review-failure ") {
+                let parsed = rest.split_once(' ').and_then(|(id, evidence)| {
+                    Some((
+                        id.parse::<u64>().ok().filter(|id| *id > 0)?,
+                        NonEmptyText::new(evidence).ok()?,
+                    ))
+                });
+                if let (Some(session), Some((invocation, evidence))) = (&selected, parsed) {
+                    self.service
+                        .acknowledge_review_failure(session, invocation, evidence, None)
+                        .map(|_| Reply::ReviewFailureAcknowledged {
+                            session_id: session.as_str().into(),
+                            invocation_id: invocation,
+                        })
+                } else {
+                    exit = CliExit::InvalidInput;
+                    Ok(invalid())
                 }
             } else if line.starts_with('/') && !line.starts_with("//") {
                 exit = CliExit::InvalidInput;

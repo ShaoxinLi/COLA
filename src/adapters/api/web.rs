@@ -25,6 +25,12 @@ use tokio::{
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Acknowledgement {
+    invocation_id: u64,
+    evidence: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PostMessage {
     text: String,
 }
@@ -50,6 +56,7 @@ struct Failure {
 }
 
 enum Command {
+    Acknowledge(SessionId, u64, NonEmptyText, oneshot::Sender<Reply>),
     New(oneshot::Sender<Reply>),
     List(oneshot::Sender<Reply>),
     Chat(SessionId, UserMessage, oneshot::Sender<Reply>),
@@ -134,6 +141,22 @@ where
             })?;
         while let Some(command) = commands.blocking_recv() {
             let (sender, reply) = match command {
+                Command::Acknowledge(id, invocation, evidence, sender) => {
+                    let reply = match self
+                        .service
+                        .acknowledge_review_failure(&id, invocation, evidence, None)
+                    {
+                        Ok(()) => (
+                            200,
+                            None,
+                            encode(
+                                &serde_json::json!({"session_id":id.as_str(), "invocation_id":invocation}),
+                            ),
+                        ),
+                        Err(e) => service_error(&e),
+                    };
+                    (sender, reply)
+                }
                 Command::New(sender) => {
                     let reply = match self.service.new_session() {
                         Ok(session) => (
@@ -229,6 +252,21 @@ async fn command(
             }
             Ok(Command::New(sender))
         }
+        (Route::Acknowledgements(id), "POST") => {
+            let bytes = body(request, false).await?;
+            let post = object::<Acknowledgement>(&bytes)?;
+            if post.invocation_id == 0 {
+                return Err(input_error(400, "invalid_input", "Invalid invocation ID"));
+            }
+            let evidence = NonEmptyText::new(post.evidence)
+                .map_err(|_| input_error(400, "invalid_input", "Nonempty evidence required"))?;
+            Ok(Command::Acknowledge(
+                id,
+                post.invocation_id,
+                evidence,
+                sender,
+            ))
+        }
         (Route::Messages(id), "POST") => {
             let bytes = body(request, false).await?;
             let post = object::<PostMessage>(&bytes)?;
@@ -241,7 +279,7 @@ async fn command(
             let mut reply = input_error(405, "method_not_allowed", "Method not allowed");
             reply.1 = Some(match route {
                 Route::Sessions => "GET, POST",
-                Route::Messages(_) => "POST",
+                Route::Messages(_) | Route::Acknowledgements(_) => "POST",
                 Route::Unknown => unreachable!(),
             });
             Err(reply)
@@ -327,6 +365,7 @@ fn object<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Reply> {
 enum Route {
     Sessions,
     Messages(SessionId),
+    Acknowledgements(SessionId),
     Unknown,
 }
 fn route(url: &str) -> Result<Route, ()> {
@@ -334,10 +373,10 @@ fn route(url: &str) -> Result<Route, ()> {
     if path == "/sessions" {
         return Ok(Route::Sessions);
     }
-    let Some(id) = path
-        .strip_prefix("/sessions/")
-        .and_then(|p| p.strip_suffix("/messages"))
-    else {
+    let Some(id) = path.strip_prefix("/sessions/").and_then(|p| {
+        p.strip_suffix("/messages")
+            .or_else(|| p.strip_suffix("/review-failure-acknowledgements"))
+    }) else {
         return Ok(Route::Unknown);
     };
     if id.contains('/') || id.is_empty() {
@@ -358,5 +397,10 @@ fn route(url: &str) -> Result<Route, ()> {
         return Err(());
     }
     let id = String::from_utf8(decoded).map_err(|_| ())?;
-    Ok(Route::Messages(SessionId::new(id).map_err(|_| ())?))
+    let id = SessionId::new(id).map_err(|_| ())?;
+    Ok(if path.ends_with("/review-failure-acknowledgements") {
+        Route::Acknowledgements(id)
+    } else {
+        Route::Messages(id)
+    })
 }

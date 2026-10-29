@@ -3,9 +3,9 @@ use super::{
 };
 use cola::domain::{
     AssistantMessage, AssistantSnapshot, Context, ContextError, EffectDisposition, ExecutionNotice,
-    ExecutionState, Message, NextAction, ResolutionSource, RestoreError, Session, SessionError,
-    SessionId, SessionSnapshot, StepSnapshot, StopReason, ToolCallSnapshot, ToolError, ToolOutcome,
-    ToolResult, TurnFailure, TurnId, TurnOutcome, TurnSnapshot,
+    ExecutionState, Message, NextAction, ResolutionSource, Session, SessionError, SessionSnapshot,
+    StepSnapshot, StopReason, ToolCallSnapshot, ToolError, ToolOutcome, ToolResult, TurnFailure,
+    TurnId, TurnOutcome, TurnSnapshot,
 };
 use serde_json::json;
 
@@ -38,25 +38,41 @@ fn multiple_batches_and_known_tool_error_recover_in_one_turn() {
     let turn = session.start_turn(user("find the file")).unwrap();
     session.record_assistant(turn, batch(&["a", "b"])).unwrap();
     assert_eq!(session.next_action(), NextAction::Execute(id("a")));
-    let request = session.start_tool(turn, &id("a")).unwrap();
+    let request = session
+        .start_tool(&super::address(&session, turn, &id("a")))
+        .unwrap();
     assert_eq!(request.arguments().get("path"), Some(&json!("notes.txt")));
     assert_eq!(session.next_action(), NextAction::AwaitTool);
     let error = ToolError::new(text("file not found"));
     session
         .record_tool_result(
-            turn,
-            ToolResult::new(id("a"), ToolOutcome::Failure(error.clone())),
+            &super::address(
+                &session,
+                turn,
+                (ToolResult::new(id("a"), ToolOutcome::Failure(error.clone()))).call_id(),
+            ),
+            (ToolResult::new(id("a"), ToolOutcome::Failure(error.clone())))
+                .outcome()
+                .clone(),
         )
         .unwrap();
     assert_eq!(session.next_action(), NextAction::Execute(id("b")));
     finish_tool(&mut session, turn, "b");
     assert_eq!(session.next_action(), NextAction::AskModel);
     session.record_assistant(turn, batch(&["retry"])).unwrap();
-    session.start_tool(turn, &id("retry")).unwrap();
+    session
+        .start_tool(&super::address(&session, turn, &id("retry")))
+        .unwrap();
     session
         .record_tool_result(
-            turn,
-            ToolResult::new(id("retry"), ToolOutcome::Success(String::new())),
+            &super::address(
+                &session,
+                turn,
+                (ToolResult::new(id("retry"), ToolOutcome::Success(String::new()))).call_id(),
+            ),
+            (ToolResult::new(id("retry"), ToolOutcome::Success(String::new())))
+                .outcome()
+                .clone(),
         )
         .unwrap();
     session
@@ -95,21 +111,28 @@ fn guard_rejections_are_atomic_and_started_calls_cannot_be_redispatched() {
     session.record_assistant(turn, batch(&["a", "b"])).unwrap();
     assert_eq!(
         reject_unchanged(&mut session, |s| s
-            .start_tool(turn, &id("missing"))
+            .start_tool(&super::address(&s, turn, &id("missing")))
             .map(|_| ())),
         SessionError::UnknownCall
     );
     assert_eq!(
-        reject_unchanged(&mut session, |s| s.start_tool(turn, &id("b")).map(|_| ())),
+        reject_unchanged(&mut session, |s| s
+            .start_tool(&super::address(&s, turn, &id("b")))
+            .map(|_| ())),
         SessionError::OutOfOrder
     );
     assert_eq!(
-        reject_unchanged(&mut session, |s| s.record_tool_result(turn, result("b"))),
+        reject_unchanged(&mut session, |s| s.record_tool_result(
+            &super::address(&s, turn, (result("b")).call_id()),
+            (result("b")).outcome().clone()
+        )),
         SessionError::NotStarted
     );
     assert_eq!(
-        reject_unchanged(&mut session, |s| s
-            .record_tool_result(turn, result("missing"))),
+        reject_unchanged(&mut session, |s| s.record_tool_result(
+            &super::address(&s, turn, (result("missing")).call_id()),
+            (result("missing")).outcome().clone()
+        )),
         SessionError::UnknownCall
     );
     assert_eq!(
@@ -117,39 +140,66 @@ fn guard_rejections_are_atomic_and_started_calls_cannot_be_redispatched() {
             .record_assistant(turn, AssistantMessage::answer("early").unwrap())),
         SessionError::NotAwaitingModel
     );
-    session.start_tool(turn, &id("a")).unwrap();
+    session
+        .start_tool(&super::address(&session, turn, &id("a")))
+        .unwrap();
     assert_eq!(
-        reject_unchanged(&mut session, |s| s.start_tool(turn, &id("b")).map(|_| ())),
+        reject_unchanged(&mut session, |s| s
+            .start_tool(&super::address(&s, turn, &id("b")))
+            .map(|_| ())),
         SessionError::OutOfOrder
     );
     assert_eq!(
-        reject_unchanged(&mut session, |s| s.record_tool_result(turn, result("b"))),
+        reject_unchanged(&mut session, |s| s.record_tool_result(
+            &super::address(&s, turn, (result("b")).call_id()),
+            (result("b")).outcome().clone()
+        )),
         SessionError::NotStarted
     );
     assert_eq!(
-        reject_unchanged(&mut session, |s| s.start_tool(turn, &id("a")).map(|_| ())),
+        reject_unchanged(&mut session, |s| s
+            .start_tool(&super::address(&s, turn, &id("a")))
+            .map(|_| ())),
         SessionError::AlreadyStarted
     );
     assert_eq!(
-        reject_unchanged(&mut session, |s| s.record_tool_result(wrong, result("a"))),
+        reject_unchanged(&mut session, |s| s.record_tool_result(
+            &super::address(&s, wrong, (result("a")).call_id()),
+            (result("a")).outcome().clone()
+        )),
         SessionError::WrongTurn
     );
-    session.record_tool_result(turn, result("a")).unwrap();
+    session
+        .record_tool_result(
+            &super::address(&session, turn, (result("a")).call_id()),
+            (result("a")).outcome().clone(),
+        )
+        .unwrap();
     assert_eq!(
-        reject_unchanged(&mut session, |s| s.record_tool_result(turn, result("a"))),
+        reject_unchanged(&mut session, |s| s.record_tool_result(
+            &super::address(&s, turn, (result("a")).call_id()),
+            (result("a")).outcome().clone()
+        )),
         SessionError::AlreadyReturned
     );
     assert_eq!(
-        reject_unchanged(&mut session, |s| s.start_tool(turn, &id("a")).map(|_| ())),
+        reject_unchanged(&mut session, |s| s
+            .start_tool(&super::address(&s, turn, &id("a")))
+            .map(|_| ())),
         SessionError::AlreadyReturned
     );
     session.interrupt(turn, StopReason::UserCancelled).unwrap();
     assert_eq!(
-        reject_unchanged(&mut session, |s| s.record_tool_result(turn, result("b"))),
+        reject_unchanged(&mut session, |s| s.record_tool_result(
+            &super::address(&s, turn, (result("b")).call_id()),
+            (result("b")).outcome().clone()
+        )),
         SessionError::TurnClosed
     );
     assert_eq!(
-        reject_unchanged(&mut session, |s| s.start_tool(turn, &id("b")).map(|_| ())),
+        reject_unchanged(&mut session, |s| s
+            .start_tool(&super::address(&s, turn, &id("b")))
+            .map(|_| ())),
         SessionError::TurnClosed
     );
     assert_eq!(
@@ -169,27 +219,36 @@ fn guard_rejections_are_atomic_and_started_calls_cannot_be_redispatched() {
 }
 
 #[test]
-fn duplicate_call_ids_across_steps_and_turns_reject_the_whole_reply() {
+fn repeated_native_ids_are_scoped_and_stale_receipts_are_rejected() {
     let mut session = session();
-    let first = session.start_turn(user("read")).unwrap();
-    session.record_assistant(first, batch(&["used"])).unwrap();
-    finish_tool(&mut session, first, "used");
+    let turn = session.start_turn(user("read")).unwrap();
+    session.record_assistant(turn, batch(&["same"])).unwrap();
+    let old = session.call_address(id("same")).unwrap();
+    session.start_tool(&old).unwrap();
+    session
+        .record_tool_result(&old, ToolOutcome::Success("one".into()))
+        .unwrap();
+    session.record_assistant(turn, batch(&["same"])).unwrap();
+    let current = session.call_address(id("same")).unwrap();
+    assert_ne!(old, current);
+    session.start_tool(&current).unwrap();
     assert_eq!(
-        reject_unchanged(&mut session, |s| s
-            .record_assistant(first, batch(&["new", "used"]))),
-        SessionError::DuplicateCallId(id("used"))
+        session.record_tool_result(&old, ToolOutcome::Success("stale".into())),
+        Err(SessionError::UnknownCall)
     );
     session
-        .record_assistant(first, AssistantMessage::answer("done").unwrap())
+        .record_tool_result(&current, ToolOutcome::Success("two".into()))
         .unwrap();
-    let second = session.start_turn(user("again")).unwrap();
+    session
+        .record_assistant(turn, AssistantMessage::answer("done").unwrap())
+        .unwrap();
+    let next = session.start_turn(user("again")).unwrap();
+    session.record_assistant(next, batch(&["same"])).unwrap();
     assert_eq!(
-        reject_unchanged(&mut session, |s| s
-            .record_assistant(second, batch(&["new", "used"]))),
-        SessionError::DuplicateCallId(id("used"))
+        session.record_tool_result(&current, ToolOutcome::Success("stale".into())),
+        Err(SessionError::TurnClosed)
     );
-    assert_eq!(session.next_action(), NextAction::AskModel);
-    session.record_assistant(second, batch(&["new"])).unwrap();
+    assert!(Session::restore(session.snapshot()).is_ok());
 }
 
 #[test]
@@ -244,8 +303,7 @@ fn reconciliation_stores_source_and_evidence_without_reopening_or_fake_results()
     let (mut session, turn) = partial_turn();
     assert_eq!(
         reject_unchanged(&mut session, |s| s.resolve_effect(
-            turn,
-            &id("b"),
+            &super::address(&s, turn, &id("b")),
             resolution(ResolutionSource::Observation)
         )),
         SessionError::EffectNotUnknown
@@ -254,8 +312,7 @@ fn reconciliation_stores_source_and_evidence_without_reopening_or_fake_results()
     for call_id in ["a", "c"] {
         assert_eq!(
             reject_unchanged(&mut session, |s| s.resolve_effect(
-                turn,
-                &id(call_id),
+                &super::address(&s, turn, &id(call_id)),
                 resolution(ResolutionSource::Observation)
             )),
             SessionError::EffectNotUnknown
@@ -263,8 +320,7 @@ fn reconciliation_stores_source_and_evidence_without_reopening_or_fake_results()
     }
     assert_eq!(
         reject_unchanged(&mut session, |s| s.resolve_effect(
-            turn,
-            &id("absent"),
+            &super::address(&s, turn, &id("absent")),
             resolution(ResolutionSource::Observation)
         )),
         SessionError::UnknownCall
@@ -272,19 +328,18 @@ fn reconciliation_stores_source_and_evidence_without_reopening_or_fake_results()
     let original_messages = session.messages();
     let fact = resolution(ResolutionSource::UserAttestation);
     session
-        .resolve_effect(turn, &id("b"), fact.clone())
+        .resolve_effect(&super::address(&session, turn, &id("b")), fact.clone())
         .unwrap();
     assert_eq!(session.messages(), original_messages);
     assert_eq!(session.next_action(), NextAction::AwaitUser);
     let before = session.snapshot();
     session
-        .resolve_effect(turn, &id("b"), fact.clone())
+        .resolve_effect(&super::address(&session, turn, &id("b")), fact.clone())
         .unwrap();
     assert_eq!(session.snapshot(), before);
     assert_eq!(
         reject_unchanged(&mut session, |s| s.resolve_effect(
-            turn,
-            &id("b"),
+            &super::address(&s, turn, &id("b")),
             resolution(ResolutionSource::Observation)
         )),
         SessionError::ConflictingResolution
@@ -361,36 +416,11 @@ fn closed_snapshot_roundtrip_preserves_complete_multi_batch_history() {
 }
 
 #[test]
-fn restoration_closes_active_work_as_process_lost_and_never_reexecutes() {
-    let (session, turn) = partial_turn();
-    let mut restored = Session::restore(session.snapshot()).unwrap();
-    assert!(restored.active_turn().is_none());
-    assert_eq!(restored.next_action(), NextAction::AwaitUser);
-    assert_eq!(
-        restored.turns()[0].outcome(),
-        &TurnOutcome::Interrupted(StopReason::ProcessLost)
-    );
-    assert_eq!(restored.messages(), session.messages());
-    assert_eq!(
-        restored.turns()[0].steps()[0]
-            .executions()
-            .nth(1)
-            .unwrap()
-            .state(),
-        &ExecutionState::Started
-    );
-    assert_eq!(
-        reject_unchanged(&mut restored, |s| s.start_tool(turn, &id("c")).map(|_| ())),
-        SessionError::TurnClosed
-    );
-    assert_eq!(restored.start_turn(user("new request")).unwrap().get(), 2);
-    let mut awaiting_model = Session::new(SessionId::new("awaiting-model").unwrap());
-    awaiting_model.start_turn(user("question")).unwrap();
-    let recovered = Session::restore(awaiting_model.snapshot()).unwrap();
-    assert_eq!(
-        recovered.turns()[0].outcome(),
-        &TurnOutcome::Interrupted(StopReason::ProcessLost)
-    );
+fn restoration_preserves_active_facts_without_implicit_recovery() {
+    let (session, _) = partial_turn();
+    let restored = Session::restore(session.snapshot()).unwrap();
+    assert_eq!(restored, session);
+    assert_eq!(restored.next_action(), NextAction::AwaitTool);
 }
 
 #[test]
@@ -500,12 +530,7 @@ fn snapshot_rejects_duplicate_ids_across_closed_turns_and_answer_followed_by_ste
     };
     calls[0].id = "a".into();
     duplicate.turns[1].steps[0].executions[0].call_id = "a".into();
-    assert!(matches!(
-        Session::restore(duplicate),
-        Err(RestoreError::InvalidTransition(
-            SessionError::DuplicateCallId(_)
-        ))
-    ));
+    assert!(Session::restore(duplicate).is_ok());
     let mut after_answer = session.snapshot();
     let duplicate = after_answer.turns[0].steps[0].clone();
     after_answer.turns[0].steps.push(duplicate);

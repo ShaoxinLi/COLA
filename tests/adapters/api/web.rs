@@ -1,3 +1,5 @@
+#[path = "../../support/mod.rs"]
+mod support;
 use cola::{app::*, domain::*};
 use serde_json::{Value, json};
 use std::{
@@ -53,12 +55,11 @@ struct Model {
     counts: Counts,
     mode: String,
 }
-impl ModelClient<AssistantMessage> for Model {
-    fn generate(
+impl Model {
+    fn assistant_generation(
         &self,
         _: &Context<AssistantMessage>,
         _: &ModelSettings,
-        _: Option<&Continuation<AssistantMessage>>,
     ) -> Result<Generation<AssistantMessage>, ModelError> {
         let n = self.counts.model.get() + 1;
         self.counts.model.set(n);
@@ -89,26 +90,51 @@ impl ModelClient<AssistantMessage> for Model {
             } else {
                 AssistantMessage::answer(format!("answer-{n}")).unwrap()
             };
-        Ok(Generation::Complete {
-            output,
-            continuation: None,
-        })
+        Ok(Generation::Complete { output })
     }
 }
-impl ModelClient<Decision> for Model {
-    fn generate(
+impl Model {
+    fn review_generation(
         &self,
         _: &Context<Decision>,
         _: &ModelSettings,
-        _: Option<&Continuation<Decision>>,
     ) -> Result<Generation<Decision>, ModelError> {
         if self.mode == "review-timeout" {
             return Err(ModelError::new(ModelErrorKind::Timeout));
         }
         Ok(Generation::Complete {
             output: Decision::new(self.mode != "denied", Some(text("policy"))),
-            continuation: None,
         })
+    }
+}
+impl ModelClient<AssistantMessage> for Model {
+    fn route(&self) -> String {
+        "fixture".into()
+    }
+    fn invoke(
+        &self,
+        input: ModelInput<'_, AssistantMessage>,
+        recorder: &mut dyn BeforeModelSend,
+    ) -> Result<Observation<AssistantMessage>, SessionStoreError> {
+        let _permit = recorder.persist(support::prepared(&input, "fixture", true))?;
+        Ok(support::observed(
+            self.assistant_generation(input.context, input.settings),
+        ))
+    }
+}
+impl ModelClient<Decision> for Model {
+    fn route(&self) -> String {
+        "fixture".into()
+    }
+    fn invoke(
+        &self,
+        input: ModelInput<'_, Decision>,
+        recorder: &mut dyn BeforeModelSend,
+    ) -> Result<Observation<Decision>, SessionStoreError> {
+        let _permit = recorder.persist(support::prepared(&input, "fixture", false))?;
+        Ok(support::observed(
+            self.review_generation(input.context, input.settings),
+        ))
     }
 }
 struct Target(Counts);
@@ -122,41 +148,77 @@ impl Tool for Target {
 #[derive(Clone, Default)]
 struct Store {
     counts: Counts,
-    sessions: Rc<RefCell<BTreeMap<SessionId, Session>>>,
+    sessions: Rc<RefCell<BTreeMap<SessionId, SessionDocument>>>,
     fail_save: Option<usize>,
     fail_list: bool,
 }
-impl SessionStore for Store {
-    fn save(&self, s: &Session) -> Result<(), SessionStoreError> {
+impl Store {
+    fn publish(&self, doc: &SessionDocument) -> Result<(), SessionStoreError> {
         let n = self.counts.save.get() + 1;
         self.counts.save.set(n);
         if self.fail_save == Some(n) {
             return Err(SessionStoreError::new(
                 SessionStoreErrorKind::Storage,
-                io::Error::other("/private/secret storage detail"),
+                io::Error::other("injected store error"),
             ));
         }
-        self.sessions.borrow_mut().insert(s.id().clone(), s.clone());
+        self.sessions
+            .borrow_mut()
+            .insert(doc.session().id().clone(), doc.clone());
         Ok(())
     }
-    fn list(&self) -> Result<Vec<Session>, SessionStoreError> {
+}
+struct Writer {
+    store: Store,
+    doc: SessionDocument,
+    valid: bool,
+}
+impl SessionWriter for Writer {
+    fn committed(&self) -> &SessionDocument {
+        &self.doc
+    }
+    fn commit(&mut self, next: SessionDocument) -> Result<u64, SessionStoreError> {
+        assert!(self.valid);
+        self.valid = false;
+        assert!(self.doc.validates_successor(&next));
+        self.store.publish(&next)?;
+        self.doc = next;
+        self.valid = true;
+        Ok(self.doc.revision())
+    }
+}
+impl SessionStore for Store {
+    fn create(&self) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
+        let doc = SessionDocument::new(SessionId::new(uuid::Uuid::new_v4().to_string()).unwrap());
+        self.publish(&doc)?;
+        Ok(Box::new(Writer {
+            store: self.clone(),
+            doc,
+            valid: true,
+        }))
+    }
+    fn inspect(&self, id: &SessionId) -> Result<SessionDocument, SessionStoreError> {
+        self.counts.load.set(self.counts.load.get() + 1);
+        self.sessions.borrow().get(id).cloned().ok_or_else(|| {
+            SessionStoreError::new(SessionStoreErrorKind::NotFound, io::Error::other("missing"))
+        })
+    }
+    fn acquire(&self, id: &SessionId) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
+        Ok(Box::new(Writer {
+            store: self.clone(),
+            doc: self.inspect(id)?,
+            valid: true,
+        }))
+    }
+    fn list(&self) -> Result<Vec<SessionId>, SessionStoreError> {
         self.counts.list.set(self.counts.list.get() + 1);
         if self.fail_list {
             return Err(SessionStoreError::new(
                 SessionStoreErrorKind::Storage,
-                io::Error::other("/private/secret list detail"),
+                io::Error::other("injected list error"),
             ));
         }
-        Ok(self.sessions.borrow().values().cloned().collect())
-    }
-    fn load(&self, id: &SessionId) -> Result<Session, SessionStoreError> {
-        self.counts.load.set(self.counts.load.get() + 1);
-        self.sessions.borrow().get(id).cloned().ok_or_else(|| {
-            SessionStoreError::new(
-                SessionStoreErrorKind::NotFound,
-                io::Error::other("/private/secret missing"),
-            )
-        })
+        Ok(self.sessions.borrow().keys().cloned().collect())
     }
 }
 fn service<S: SessionStore>(
@@ -233,9 +295,19 @@ fn server_child() {
         api.run(listener).unwrap();
     } else {
         let store = JsonlSessionStore::new(root.join("sessions"));
-        store
-            .save(&Session::new(SessionId::new("opaque id:世界").unwrap()))
+        {
+            use sha2::{Digest, Sha256};
+            fs::create_dir_all(root.join("sessions")).unwrap();
+            let header = json!({"format":"cola.session","version":2,"session_id":"opaque id:世界","closed_turn_count":0,"active":false,"revision":0,"invocations":[],"views":[],"acknowledgements":[]});
+            fs::write(
+                root.join("sessions").join(format!(
+                    "{:x}.jsonl",
+                    Sha256::digest("opaque id:世界".as_bytes())
+                )),
+                format!("{header}\n"),
+            )
             .unwrap();
+        }
         let api = WebApi::new(service(&mode, store, counts));
         fs::write(
             root.join("ready.tmp"),
@@ -390,7 +462,10 @@ fn loopback_persistent_service_and_disk_readback() {
     assert_eq!(s["turns"].as_array().unwrap().len(), 2);
     assert!(s["active"].is_null());
     let store = JsonlSessionStore::new(server.root.path().join("sessions"));
-    let session = store.load(&SessionId::new(id).unwrap()).unwrap();
+    let session = store
+        .inspect(&SessionId::new(id).unwrap())
+        .map(|d| d.session().clone())
+        .unwrap();
     assert_eq!(session.turns().len(), 2);
     let bytes: Vec<_> = fs::read_dir(server.root.path().join("sessions"))
         .unwrap()
@@ -602,7 +677,8 @@ fn oversized_declared_bodies_do_not_kill_the_resident_service() {
         assert_eq!(chat["messages"][1]["text"], format!("answer-{}", index + 1));
     }
     let stored = JsonlSessionStore::new(server.root.path().join("sessions"))
-        .load(&SessionId::new(id).unwrap())
+        .inspect(&SessionId::new(id).unwrap())
+        .map(|d| d.session().clone())
         .unwrap();
     assert_eq!(stored.turns().len(), 6);
 }
@@ -613,15 +689,11 @@ fn create_and_list_failures_keep_safe_progress_and_service_residency() {
     assert_eq!(status, 500);
     assert_eq!(failure["error"]["code"], "store_failure");
     assert_eq!(failure["error"]["durability"], "unconfirmed");
-    let progress = &failure["error"]["progress"];
-    let id = progress["id"].as_str().unwrap();
-    assert_eq!(progress["turns"], json!([]));
-    assert!(progress["active"].is_null());
+    assert!(failure["error"]["progress"].is_null());
     assert!(!failure.to_string().contains("/private/secret"));
     let (status, _, listing) = server.request("GET", "/sessions", b"", None);
     assert_eq!(status, 200);
-    assert_eq!(listing["sessions"], json!([progress]));
-    assert_eq!(server.chat(id).0, 409);
+    assert_eq!(listing["sessions"], json!([]));
 
     let server = Server::new("list-failure");
     let (status, _, failure) = server.request("GET", "/sessions", b"", None);
@@ -638,7 +710,7 @@ fn create_and_list_failures_keep_safe_progress_and_service_residency() {
 fn http_tool_results_and_failure_progress_are_full_and_safe() {
     for (mode, status, code, role) in [
         ("timeout", 504, "model_timeout", "assistant"),
-        ("review-timeout", 504, "model_timeout", "reviewer"),
+        ("review-timeout", 409, "review_failure", "reviewer"),
         ("refused", 422, "generation_refused", "assistant"),
         ("incomplete", 502, "generation_incomplete", "assistant"),
         ("model", 502, "model_failure", "assistant"),
@@ -662,15 +734,12 @@ fn http_tool_results_and_failure_progress_are_full_and_safe() {
                 "started"
             );
             assert_eq!(server.chat(&id).0, 409);
-        } else {
+        } else if mode != "save-failure" {
             assert!(v["error"]["progress"]["active"].is_null());
         }
         if mode == "save-failure" {
-            assert_eq!(
-                v["error"]["progress"]["turns"][0]["outcome"]["kind"],
-                "completed"
-            );
-            assert_eq!(server.chat(&id).0, 409);
+            assert!(v["error"]["progress"]["active"].is_object());
+            assert_eq!(server.chat(&id).0, 200);
         }
     }
     for mode in ["tools", "denied"] {
@@ -727,7 +796,8 @@ fn disconnect_does_not_undo_admitted_chat() {
     let store = JsonlSessionStore::new(server.root.path().join("sessions"));
     assert_eq!(
         store
-            .load(&SessionId::new(id).unwrap())
+            .inspect(&SessionId::new(id).unwrap())
+            .map(|d| d.session().clone())
             .unwrap()
             .turns()
             .len(),

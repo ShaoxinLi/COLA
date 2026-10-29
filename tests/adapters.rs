@@ -5,6 +5,7 @@ mod models {
     mod anthropic;
     mod client;
     mod openai;
+    #[allow(dead_code)]
     mod support;
 }
 #[path = "adapters/tools"]
