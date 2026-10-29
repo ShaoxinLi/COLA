@@ -21,15 +21,30 @@ fn config_rejects_unsafe_urls_secrets_and_limits_with_redacted_diagnostics() {
         assert_eq!(error.kind(), ModelErrorKind::InvalidConfig);
         assert_safe(&error);
     }
-    assert!(
-        ClientConfig::new(
+    for key in [
+        "",
+        " ",
+        "bad header",
+        "clé",
+        "密钥",
+        "key🔑",
+        "bad\nheader",
+        "bad\rheader",
+        "bad\theader",
+        "bad\0header",
+        "bad\u{7f}header",
+    ] {
+        let error = ClientConfig::new(
             "http://localhost",
-            "bad\nheader",
+            key,
             Duration::from_secs(1),
-            NonZeroUsize::new(100).unwrap()
+            NonZeroUsize::new(100).unwrap(),
         )
-        .is_err()
-    );
+        .unwrap_err();
+        assert_eq!(error.kind(), ModelErrorKind::InvalidConfig);
+        assert_eq!(format!("{error}"), "model client InvalidConfig");
+        assert_safe(&error);
+    }
 }
 #[test]
 fn http_failures_are_audited_without_retry_and_do_not_leak_to_errors() {

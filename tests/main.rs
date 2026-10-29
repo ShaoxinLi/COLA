@@ -575,6 +575,9 @@ fn invalid_configuration_is_strict_and_secret_safe() {
         ("protocol", json!({"openai-responses":null})),
         ("api_key", json!("")),
         ("api_key", json!("SECRET_HEADER\n")),
+        ("api_key", json!("SECRET_clé")),
+        ("api_key", json!("SECRET_密钥")),
+        ("api_key", json!("SECRET_🔑")),
         (
             "base_url",
             json!("https://SECRET_USER:SECRET_PASSWORD@invalid.example"),
@@ -727,4 +730,24 @@ fn executable_context_budget_is_configurable_and_fails_before_http() {
     value["context"]["max_request_bytes"] = json!(0);
     fs::write(&path, value.to_string()).unwrap();
     assert_code(&cli(root, &path, "/new\n"), 2);
+}
+
+#[test]
+fn non_ascii_api_keys_fail_startup_before_store_or_network() {
+    for protocol in [Protocol::OpenAi, Protocol::Anthropic] {
+        for key in ["SECRET_clé", "SECRET_密钥", "SECRET_🔑"] {
+            let root = tempfile::tempdir().unwrap();
+            let provider = Provider::new(protocol);
+            let path = config(root.path(), protocol, &provider.url);
+            let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            value["api_key"] = json!(key);
+            fs::write(&path, value.to_string()).unwrap();
+            let output = cli(root.path(), &path, "/new\nhello\n/exit\n");
+            assert_code(&output, 2);
+            assert!(output.stdout.is_empty());
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("SECRET"));
+            assert!(!root.path().join("sessions").exists());
+            assert!(provider.requests().is_empty());
+        }
+    }
 }

@@ -409,6 +409,7 @@ impl Engine {
 pub struct ClientConfig {
     base: Url,
     key: HeaderValue,
+    bearer: HeaderValue,
     timeout: Duration,
     limit: NonZeroUsize,
 }
@@ -440,7 +441,8 @@ impl ClientConfig {
             || base.fragment().is_some()
             || timeout.is_zero()
             || timeout.as_millis() > u64::MAX as u128
-            || api_key.trim().is_empty()
+            || api_key.is_empty()
+            || !api_key.bytes().all(|byte| byte.is_ascii_graphic())
             || max_response_bytes.get() == usize::MAX
         {
             return Err(ModelError::new(ModelErrorKind::InvalidConfig));
@@ -448,9 +450,13 @@ impl ClientConfig {
         let mut key = HeaderValue::from_str(api_key)
             .map_err(|_| ModelError::new(ModelErrorKind::InvalidConfig))?;
         key.set_sensitive(true);
+        let mut bearer = HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|_| ModelError::new(ModelErrorKind::InvalidConfig))?;
+        bearer.set_sensitive(true);
         Ok(Self {
             base,
             key,
+            bearer,
             timeout,
             limit: max_response_bytes,
         })
@@ -503,11 +509,7 @@ impl Transport {
         let mut headers = HeaderMap::new();
         match provider {
             Provider::OpenAI => {
-                let mut bearer =
-                    HeaderValue::from_str(&format!("Bearer {}", self.config.key.to_str().unwrap()))
-                        .unwrap();
-                bearer.set_sensitive(true);
-                headers.insert("authorization", bearer);
+                headers.insert("authorization", self.config.bearer.clone());
             }
             Provider::Anthropic => {
                 headers.insert("x-api-key", self.config.key.clone());
