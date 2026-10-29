@@ -1060,3 +1060,45 @@ fn arbitrary_schema_constraints_survive_service_catalog_and_native_requests() {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
+
+#[test]
+fn archive_rejects_a_successful_return_after_a_denied_review() {
+    use cola::adapters::stores::JsonlSessionStore;
+    let p = Provider::OpenAI;
+    let server = Server::new(vec![
+        p.tool(1).into(),
+        decision(p, true).into(),
+        p.answer("done").into(),
+    ]);
+    let root = tempfile::tempdir().unwrap();
+    let mut svc = service(p, &server, root.path());
+    let id = svc.new_session().unwrap().id().clone();
+    svc.chat(&id, user("ask")).unwrap();
+    drop(svc);
+    let path = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .unwrap();
+    let archive = std::fs::read_to_string(&path).unwrap();
+    let (header, turns) = archive.split_once('\n').unwrap();
+    let mut header: serde_json::Value = serde_json::from_str(header).unwrap();
+    assert_eq!(
+        header["invocations"][1]["state"]["Finished"]["outcome"]["Review"]["allow"],
+        true
+    );
+    header["invocations"][1]["state"]["Finished"]["outcome"]["Review"]["allow"] =
+        serde_json::json!(false);
+    let corrupted = format!("{header}\n{turns}");
+    std::fs::write(&path, &corrupted).unwrap();
+    let store = JsonlSessionStore::new(root.path());
+    assert_eq!(
+        store.inspect(&id).unwrap_err().kind(),
+        SessionStoreErrorKind::InvalidData
+    );
+    assert_eq!(
+        store.acquire(&id).err().unwrap().kind(),
+        SessionStoreErrorKind::InvalidData
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupted);
+}

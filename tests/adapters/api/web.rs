@@ -1,4 +1,4 @@
-use crate::support;
+use super::{observed, prepared};
 use cola::{app::*, domain::*};
 use serde_json::{Value, json};
 use std::{
@@ -149,8 +149,8 @@ impl ModelClient<AssistantMessage> for Model {
         input: ModelInput<'_, AssistantMessage>,
         recorder: &mut dyn BeforeModelSend,
     ) -> Result<Observation<AssistantMessage>, SessionStoreError> {
-        let _permit = recorder.persist(support::prepared(&input, "fixture", true))?;
-        Ok(support::observed(
+        let _permit = recorder.persist(prepared(&input, "fixture", true))?;
+        Ok(observed(
             self.assistant_generation(input.context, input.settings),
         ))
     }
@@ -164,8 +164,8 @@ impl ModelClient<Decision> for Model {
         input: ModelInput<'_, Decision>,
         recorder: &mut dyn BeforeModelSend,
     ) -> Result<Observation<Decision>, SessionStoreError> {
-        let _permit = recorder.persist(support::prepared(&input, "fixture", false))?;
-        Ok(support::observed(
+        let _permit = recorder.persist(prepared(&input, "fixture", false))?;
+        Ok(observed(
             self.review_generation(input.context, input.settings),
         ))
     }
