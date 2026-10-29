@@ -18,6 +18,7 @@ recorders. They require loopback TCP and use dummy credentials.
 - `http_failures_are_audited_without_retry_and_do_not_leak_to_errors` checks status mapping, raw archive evidence, and safe errors.
 - `deadline_bounded_capture_malformed_json_and_connection_errors_are_safe` checks response deadlines, partial capture, malformed JSON, and bounded chunked reads.
 - `redirects_are_never_followed` checks that credentials cannot reach a redirect destination.
+- `corrupt_invocation_associations_and_frozen_views_fail_read_validation` and `archive_rejects_a_successful_return_after_a_denied_review` keep raw archive mutation at the adapter boundary; public record lifecycle assertions live in `tests/app/session_record.rs`.
 - The remaining decode and provider-specific cases check refusal, incomplete output, unknown native blocks, invalid calls, actual-model metadata, and usage capture.
 
 These are local protocol fixtures. They do not prove current live schemas,

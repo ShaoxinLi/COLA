@@ -3,7 +3,8 @@
 [`AgentService`](../src/app/agent_service.rs) runs reviewed tool workflows from a
 committed [`SessionRecord`](../src/app/session_record.rs). A new service or
 process can continue any closed session using the same store and explicit
-configuration. There is no resident session cache or continuation token.
+configuration. There is no resident session cache or continuation token. See the
+[session record guide](session_record.md) for aggregate ownership and audit invariants.
 
 ## Operations and extension points
 
@@ -14,10 +15,10 @@ Tool names are unique. Advertised definitions must match the registered catalog.
 
 | Operation | Result |
 | --- | --- |
-| `new_session()` | Publishes an empty document and returns its domain session. |
+| `new_session()` | Publishes an empty record and returns its domain session. |
 | `chat(id, user)` | Runs one turn and returns its messages, including the user message. |
 | `list_session()` | Reads current stored sessions in ID order without recovery writes. |
-| `inspect_session(id)` | Reads the full document, including model audit and acknowledgements. |
+| `inspect_session(id)` | Reads the full record, including model audit and acknowledgements. |
 | `resolve_effect(address, resolution)` | Records evidence for the exact closed execution. |
 | `acknowledge_review_failure(id, invocation, evidence, actor)` | Records an explicit acknowledgement and releases that review block. |
 
@@ -32,7 +33,7 @@ Model audit metadata never enters these semantic facts.
 ## Commit and I/O ordering
 
 A write command holds one OS session lock through its synchronous workflow.
-Each command reads the latest document under that lock.
+Each command reads the latest record under that lock.
 
 1. Commit the user message and a planned invocation.
 2. The model adapter compiles the request. The application recorder commits its
@@ -81,6 +82,7 @@ is a separate operation addressed by session, turn, step, and native ID.
 
 ## Context policy and limits
 
+The [context policy guide](context_policy.md) describes selection and fitting.
 `with_context_policy` replaces the default `RecentContextPolicy`. The default
 selects eight optional closed turns plus every turn with an unresolved effect.
 Mandatory turns do not consume the optional quota. A custom policy cannot omit
@@ -98,7 +100,7 @@ independently and never prune the assistant's frozen view.
 Closed turns are quoted semantic history with role and outcome labels. New turns
 can change provider or model. Within a turn, selected history, current user,
 system, tools, and settings are frozen. Later requests append accepted native
-responses and actual tool results from the document. Prefix or model changes
+responses and actual tool results from the record. Prefix or model changes
 fail before HTTP.
 
 The byte cap is not a model-specific token-window estimate. The application does

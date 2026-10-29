@@ -5,23 +5,27 @@ Use `SessionStore::create`, `acquire`, `inspect`, and `list` through disposable
 publishes validated successor revisions. Inspection is read only; recovery is an
 explicit application commit.
 
-After Launch and Doctor, set `COLA_VERIFY_FEATURE=session-persistence` and run:
+After Launch and Doctor, set `COLA_VERIFY_FEATURE=session-persistence` and run
+all commands below inside the driver's evidence capture block:
 
 ```bash
 "$COLA_VERIFY_ADAPTERS" jsonl:: --nocapture --test-threads=1
+"$COLA_VERIFY_APP" session_store:: --nocapture --test-threads=1
+"$COLA_VERIFY_APP" session_record:: --nocapture --test-threads=1
+"$COLA_VERIFY_APP" agent_service::every_checkpoint_failure_stops_external_io_even_after_publication --exact --nocapture --test-threads=1
+"$COLA_VERIFY_ADAPTERS" models::client::corrupt_invocation_associations_and_frozen_views_fail_read_validation --exact --nocapture --test-threads=1
+"$COLA_VERIFY_ADAPTERS" models::client::archive_rejects_a_successful_return_after_a_denied_review --exact --nocapture --test-threads=1
 ```
 
-- `empty_document_roundtrip_and_stale_commit_invalidates_the_writer` checks versioned empty documents, stale revision rejection, and writer invalidation.
-- `independent_process_lock_is_stable_and_released_on_exit` runs a child process against the same session and checks busy ownership and later acquisition.
-- `old_version_corruption_and_identity_mismatch_are_preserved_and_refused` checks unsupported version 1, corrupt counts, identity mismatches, and unchanged rejected bytes.
+- JSONL cases cover version 2 snapshots, stale revisions, writer invalidation, independent-process locks, corruption, identity mismatch, and unchanged rejected bytes.
+- Record cases cover exact audit evidence, accepted-step provenance, frozen views, read-only reopening, durable review blocks, acknowledgement consistency, and planned/prepared recovery through public service/store entry points.
+- The service checkpoint matrix covers failures before and after publication and proves that later external I/O stops.
+- The adapter corruption cases reject invalid provenance, lifecycle, acknowledgement, frozen-view associations, and a successful return after denied review.
 
-Also run the app group for before/after-publication failure injection and explicit
-recovery. Run `models::client::corrupt_invocation_associations_and_frozen_views_fail_read_validation`
-for provenance, lifecycle, acknowledgement, and frozen-view corruption. The
-executable integration tests run fresh CLI `/use` and Web processes against
-persisted histories for both providers.
+The executable integration tests separately run fresh CLI `/use` and Web
+processes against persisted histories for both providers.
 
-JSONL files are full document snapshots, not append-only logs. Filenames hash IDs;
-lock files remain stable and are not deleted to unlock. A publication error may
-leave newer data visible and never permits further external I/O with that writer.
-Tests do not claim network-filesystem locking or hardware power-loss guarantees.
+JSONL files are full record snapshots. Filenames hash IDs; lock files remain
+stable and are not deleted to unlock. A publication error may leave newer data
+visible and never permits further external I/O with that writer. Tests do not
+claim network-filesystem locking or hardware power-loss guarantees.

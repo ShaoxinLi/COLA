@@ -13,7 +13,7 @@ obtain the application-owned recorder and durable workflow.
 
 `ModelInput<O>` carries checked semantic context, model settings, selection
 policy, an optional frozen turn view, and accepted native steps read from the
-document. Each native step includes its archived response and actual results.
+[session record](session_record.md). Each native step includes its archived response and actual results.
 Reviewer inputs carry a mandatory `ReviewSubject` with the full active turn,
 candidate call, and exact address. They contain no assistant native steps.
 
@@ -31,7 +31,7 @@ retains response bytes, returned model identity when present, response ID,
 status, usage, capture completeness, and timing. Missing actual model identity
 stays unknown rather than copying the requested model.
 
-The application accepts output and evidence in one document revision. A complete
+The application accepts output and evidence in one record revision. A complete
 response that violates the advertised catalog or domain transition becomes an
 audited `OutputRejected` with a reason and no executable step.
 
@@ -81,3 +81,13 @@ The complete request-byte cap also applies after native-chain growth. It does
 not trim native dependencies or tool output. See the
 [context policy limits](agent-service.md#context-policy-and-limits) for the
 model-token-capacity boundary.
+
+## Previous live validation
+
+On 2026-10-29, a live run of the durable-session implementation used seven fresh
+CLI/Web processes against DeepSeek and Alibaba Cloud Bailian Responses endpoints.
+Its 15 calls completed with HTTP 200; four reviewed file reads retained their
+native IDs, and subsequent turns recalled four changing file values across model
+switches. This was a scoped compatibility check, not a reliability or quality
+evaluation. Anthropic coverage used local fixtures. Current automated verification
+requires no live credentials; this refactor makes no new live-provider claim.

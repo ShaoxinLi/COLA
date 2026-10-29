@@ -156,8 +156,10 @@ cp -R tests/. "$COLA_VERIFY_EVIDENCE/test-sources/"
 ```
 
 Prove the action and resulting state through assertions on public return values
-and a second view of side effects. JSONL tests read raw bytes, inspect and list stored documents, and test process
-locks. Application tests commit recovery explicitly and verify invocation audit.
+and a second view of side effects. JSONL tests read raw bytes, inspect and list stored records, and test process
+locks. Application tests separate service orchestration, public context-policy behavior,
+and session-record audit/recovery into matching modules. Shared HTTP fixtures
+remain adapter-owned; the storage-port fault double lives in `tests/app/session_store.rs`.
 Tool tests read actual files, check rejected writes leave bytes
 unchanged, and inspect real subprocess output. Provider tests inspect captured
 HTTP requests and public responses. A final screen or a successful build alone

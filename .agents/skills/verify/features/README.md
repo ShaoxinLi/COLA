@@ -31,7 +31,7 @@ precondition is a failure to verify the feature, not permission to skip it.
 ## Features
 
 - [Agent chats](agent-chats.md) covers service creation, per-call review, durable invocation audit, limits, and failures.
-- [Session persistence](session-persistence.md) covers JSONL documents, locks, inspection, recovery, and refused writes.
+- [Session persistence](session-persistence.md) covers session records, JSONL snapshots, locks, inspection, recovery, and refused writes.
 - [Host tools](host-tools.md) covers file reads and writes, Bash, validation, and path anchoring.
 - [Provider adapters](provider-adapters.md) covers OpenAI and Anthropic HTTP requests, responses, frozen native views, and errors.
 - [Conversation contracts](conversation-contracts.md) covers public values, session transitions, recovery, context, and caller-defined roles.

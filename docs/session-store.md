@@ -1,7 +1,7 @@
 # Session persistence
 
-`SessionStore` persists complete application `SessionRecord` snapshots.
-Documents contain the domain session, revision, per-invocation plans and audit,
+`SessionStore` persists complete application [`SessionRecord`](session_record.md) snapshots.
+Records contain the domain session, revision, per-invocation plans and audit,
 frozen turn views, and review-failure acknowledgements.
 
 ## Store and writer contracts
@@ -11,11 +11,11 @@ frozen turn views, and review-failure acknowledgements.
 | `list()` | Returns sorted IDs without recovery or writes. |
 | `inspect(id)` | Validates and returns exact stored facts, including any active turn. |
 | `create()` | Publishes a new empty session and returns its exclusive writer. |
-| `acquire(id)` | Acquires the stable OS lock, synchronizes file and directory, then reads the current document. |
+| `acquire(id)` | Acquires the stable OS lock, synchronizes file and directory, then reads the current record. |
 | `SessionWriter::committed()` | Returns the last successfully committed working copy. |
 | `SessionWriter::commit(next)` | Publishes a validated successor with the same identity and revision exactly one higher. |
 
-Document fields and mutation methods are not externally writable. Application
+Record fields and mutation methods are not externally writable. Application
 transitions bind accepted assistant steps to invocation provenance, reviews to
 complete call addresses, requests to frozen views, and acknowledgements to actual
 review failures. Restore rejects missing or duplicate accepted-step provenance,

@@ -49,8 +49,8 @@ traits. Adapters implement those contracts and own external I/O.
 | Layer | Responsibility | Reference |
 | --- | --- | --- |
 | `src/domain` | Checked values, conversation transitions, tools, context, and recovery. | [Domain contracts](docs/domain.md) |
-| `src/app` | Agent orchestration, model generation, and session persistence ports. | [Agent service](docs/agent-service.md), [model clients](docs/model-clients.md#application-contracts), [session persistence](docs/session-store.md#application-contract) |
-| `src/adapters` | Web and CLI APIs, OpenAI and Anthropic clients, JSONL storage, Bash, and file tools. | [Inbound APIs](#inbound-apis), [model clients](docs/model-clients.md#adapter-implementations), [session persistence](docs/session-store.md#jsonl-adapter), [tool adapters](docs/tools.md) |
+| `src/app` | Agent orchestration, model generation, and session persistence ports. | [Agent service](docs/agent-service.md), [model clients](docs/model-clients.md#invocation-contract), [session records](docs/session_record.md), [context policy](docs/context_policy.md), [session persistence](docs/session-store.md#store-and-writer-contracts) |
+| `src/adapters` | Web and CLI APIs, OpenAI and Anthropic clients, JSONL storage, Bash, and file tools. | [Inbound APIs](#inbound-apis), [model clients](docs/model-clients.md#connection-and-response-boundaries), [session persistence](docs/session-store.md#jsonl-version-2), [tool adapters](docs/tools.md) |
 | `src/main.rs` | JSON configuration, context policies, component assembly, and process startup. | [Run COLA](#run-cola), [startup configuration](docs/api.md#executable-configuration) |
 
 `Session` validates and records facts without external I/O. `Assistant` and
@@ -145,7 +145,9 @@ cargo clippy --all-targets -- -D warnings
 
 Tests mirror the source layers in `tests/domain.rs`, `tests/app.rs`, and
 `tests/adapters.rs`. `tests/main.rs` launches the executable through both APIs.
-Model tests use local HTTP fixtures, while storage and tool tests use temporary
+Application policy and record cases live in `tests/app/context_policy.rs` and
+`tests/app/session_record.rs`; service tests cover orchestration. Model tests use
+local HTTP fixtures, while storage and tool tests use temporary
 files and real processes. Automated tests do not require live provider keys.
 
 Generate API reference documentation with `cargo doc --no-deps`.
