@@ -1,5 +1,5 @@
 use super::support::*;
-use cola::{adapters::models::ClientConfig, app::*};
+use cola::{adapters::models::ClientConfig, app::*, domain::*};
 use serde_json::{Value, json};
 use std::{num::NonZeroUsize, time::Duration};
 
@@ -663,6 +663,17 @@ fn multiple_native_steps_append_exact_responses_and_correlated_results() {
                     ),
                 }
             }
+            let expected: Vec<_> = (1..=index / 2)
+                .map(|n| {
+                    native_result(
+                        provider,
+                        &format!("native-{n}"),
+                        true,
+                        "observed target result",
+                    )
+                })
+                .collect();
+            assert_eq!(native_results(provider, &request.body), expected);
             assert!(request.bytes.len() <= 65536);
         }
     }
@@ -831,5 +842,221 @@ fn reviewer_subject_is_complete_user_role_data_separate_from_system_instructions
         );
         assert!(!texts.join(" ").contains("signature-"));
         assert!(!texts.join(" ").contains("opaque-redacted"));
+    }
+}
+
+fn native_result(provider: Provider, id: &str, success: bool, output: &str) -> Value {
+    match provider {
+        Provider::OpenAI => {
+            json!({"type":"function_call_output","call_id":id,"output":if success {json!({"success":true,"output":output})} else {json!({"success":false,"error":output})}.to_string()})
+        }
+        Provider::Anthropic => {
+            json!({"type":"tool_result","tool_use_id":id,"is_error":!success,"content":output})
+        }
+    }
+}
+fn native_results(provider: Provider, body: &Value) -> Vec<Value> {
+    match provider {
+        Provider::OpenAI => body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["type"] == "function_call_output")
+            .cloned()
+            .collect(),
+        Provider::Anthropic => body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["content"].as_array())
+            .flatten()
+            .filter(|v| v["type"] == "tool_result")
+            .cloned()
+            .collect(),
+    }
+}
+#[test]
+fn selective_batch_review_preserves_order_ids_empty_success_and_real_failure() {
+    use cola::adapters::stores::JsonlSessionStore;
+    use std::sync::{Arc, Mutex};
+    struct BatchTarget(Arc<Mutex<Vec<u64>>>);
+    impl Tool for BatchTarget {
+        fn execute(&self, args: &serde_json::Map<String, Value>) -> ToolOutcome {
+            let n = args["n"].as_u64().unwrap();
+            self.0.lock().unwrap().push(n);
+            match n {
+                1 => ToolOutcome::Success(String::new()),
+                3 => ToolOutcome::Failure(ToolError::new(text("genuine target failure"))),
+                _ => ToolOutcome::Success("ordinary result".into()),
+            }
+        }
+    }
+    for provider in PROVIDERS {
+        let ids = ["Call-A_9", "denied:Mixed-ID", "failure.03", "last-Z"];
+        let mut batch = provider.tool(1);
+        let field = match provider {
+            Provider::OpenAI => "output",
+            Provider::Anthropic => "content",
+        };
+        let mut calls = vec![];
+        for (n, id) in ids.iter().enumerate() {
+            let mut call = provider.tool(n + 1)[field]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone();
+            call[match provider {
+                Provider::OpenAI => "call_id",
+                Provider::Anthropic => "id",
+            }] = json!(id);
+            calls.push(call);
+        }
+        let parts = batch[field].as_array_mut().unwrap();
+        parts.pop();
+        parts.extend(calls);
+        let server = Server::new(vec![
+            batch.clone().into(),
+            decision(provider, true).into(),
+            decision(provider, false).into(),
+            decision(provider, true).into(),
+            decision(provider, true).into(),
+            provider.answer("done").into(),
+        ]);
+        let root = tempfile::tempdir().unwrap();
+        let executions = Arc::new(Mutex::new(vec![]));
+        let mut svc = AgentService::new(
+            Pair {
+                assistant: provider.client(&server),
+                reviewer: provider.reviewer(&server),
+            },
+            JsonlSessionStore::new(root.path()),
+            Roles,
+            Roles,
+            vec![(
+                tool(),
+                Box::new(BatchTarget(executions.clone())) as Box<dyn Tool>,
+            )],
+            AgentSettings {
+                assistant_model_settings: provider.settings(),
+                reviewer_model_settings: provider.settings(),
+                max_iterations: std::num::NonZeroU32::new(8).unwrap(),
+            },
+        )
+        .unwrap();
+        let id = svc.new_session().unwrap().id().clone();
+        svc.chat(&id, user("batch")).unwrap();
+        assert_eq!(*executions.lock().unwrap(), vec![1, 3, 4]);
+        assert_eq!(svc.inspect_session(&id).unwrap().review_block(), None);
+        let request = server.request(5);
+        assert_eq!(
+            native_results(provider, &request.body),
+            vec![
+                native_result(provider, ids[0], true, ""),
+                native_result(
+                    provider,
+                    ids[1],
+                    false,
+                    "Not executed: tool call denied by review. Reason: No reason provided"
+                ),
+                native_result(provider, ids[2], false, "genuine target failure"),
+                native_result(provider, ids[3], true, "ordinary result")
+            ]
+        );
+        match provider {
+            Provider::OpenAI => {
+                let input = request.body["input"].as_array().unwrap();
+                let native = provider.native(&batch);
+                let offset = input.iter().position(|v| v == &native[0]).unwrap();
+                assert_eq!(
+                    &input[offset..offset + native.as_array().unwrap().len()],
+                    native.as_array().unwrap()
+                );
+                assert_eq!(
+                    &input[offset + native.as_array().unwrap().len()..],
+                    native_results(provider, &request.body)
+                );
+            }
+            Provider::Anthropic => {
+                let messages = request.body["messages"].as_array().unwrap();
+                let offset = messages
+                    .iter()
+                    .position(|m| {
+                        m["role"] == "assistant" && m["content"] == provider.native(&batch)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    messages[offset + 1],
+                    json!({"role":"user","content":native_results(provider,&request.body)})
+                );
+            }
+        }
+    }
+}
+#[test]
+fn arbitrary_schema_constraints_survive_service_catalog_and_native_requests() {
+    use cola::adapters::stores::JsonlSessionStore;
+    use std::sync::{Arc, atomic::AtomicUsize};
+    #[derive(Clone)]
+    struct Catalog(ToolDefinition);
+    impl Assistant for Catalog {
+        fn context(&self, s: &Session) -> Result<Context<AssistantMessage>, ContextError> {
+            Context::new(
+                text("instructions"),
+                s.context_exchanges()?,
+                vec![self.0.clone()],
+            )
+        }
+    }
+    impl ToolCallReviewer for Catalog {
+        fn context(&self, s: &Session, _: &ToolCall) -> Result<Context<Decision>, ContextError> {
+            Context::new(
+                text("review"),
+                s.closed_context_exchanges()?,
+                vec![self.0.clone()],
+            )
+        }
+    }
+    let schema = json!({"type":"object","properties":{"entries":{"type":"array","minItems":1,"items":{"type":"object","properties":{"mode":{"enum":["read","write"]},"count":{"type":"integer","minimum":2},"value":{"oneOf":[{"type":"string","minLength":3},{"type":"null"}]}},"required":["mode","count","value"],"additionalProperties":false}}},"required":["entries"],"additionalProperties":false});
+    let definition = ToolDefinition::new(
+        ToolName::new("lookup").unwrap(),
+        text("complex schema"),
+        InputSchema::new(schema.clone()).unwrap(),
+    );
+    for provider in PROVIDERS {
+        let server = Server::new(vec![provider.answer("done").into()]);
+        let root = tempfile::tempdir().unwrap();
+        let roles = Catalog(definition.clone());
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut svc = AgentService::new(
+            Pair {
+                assistant: provider.client(&server),
+                reviewer: provider.reviewer(&server),
+            },
+            JsonlSessionStore::new(root.path()),
+            roles.clone(),
+            roles,
+            vec![(
+                definition.clone(),
+                Box::new(Target(count.clone())) as Box<dyn Tool>,
+            )],
+            AgentSettings {
+                assistant_model_settings: provider.settings(),
+                reviewer_model_settings: provider.settings(),
+                max_iterations: std::num::NonZeroU32::new(8).unwrap(),
+            },
+        )
+        .unwrap();
+        let id = svc.new_session().unwrap().id().clone();
+        svc.chat(&id, user("schema")).unwrap();
+        let request = server.request(0);
+        assert_eq!(
+            request.body["tools"][0][match provider {
+                Provider::OpenAI => "parameters",
+                Provider::Anthropic => "input_schema",
+            }],
+            schema
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

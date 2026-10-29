@@ -703,3 +703,109 @@ fn role_context_errors_retain_their_domain_source_and_review_block() {
         assert_eq!(server.requests().len(), usize::from(review_only));
     }
 }
+
+#[test]
+fn every_resolution_is_a_labelled_closed_turn_fact_without_native_return() {
+    use serde_json::{Value, json};
+    for provider in PROVIDERS {
+        for (disposition, label) in [
+            (EffectDisposition::Completed, "completed"),
+            (EffectDisposition::NotPerformed, "not_performed"),
+        ] {
+            for (source, provenance) in [
+                (ResolutionSource::Observation, "observation"),
+                (ResolutionSource::UserAttestation, "user_attestation"),
+                (
+                    ResolutionSource::ApplicationAttestation,
+                    "application_attestation",
+                ),
+            ] {
+                let server = Server::new(vec![
+                    provider.tool(1).into(),
+                    decision(provider, true).into(),
+                    provider.answer("recovered").into(),
+                ]);
+                let root = tempfile::tempdir().unwrap();
+                let targets = Arc::new(AtomicUsize::new(0));
+                let mut svc = service_with_store(
+                    provider,
+                    &server,
+                    faults(root.path(), 8, false),
+                    targets.clone(),
+                );
+                let id = svc.new_session().unwrap().id().clone();
+                assert!(matches!(
+                    svc.chat(&id, user("ask")).unwrap_err().kind(),
+                    AgentErrorKind::Store { .. }
+                ));
+                let doc = svc.inspect_session(&id).unwrap();
+                assert_eq!(doc.revision(), 7);
+                assert!(matches!(
+                    doc.invocations()[1].state,
+                    InvocationState::Prepared { .. }
+                ));
+                assert_eq!(server.requests().len(), 2);
+                let address = doc
+                    .session()
+                    .call_address(ToolCallId::new("native-1").unwrap())
+                    .unwrap();
+                drop(svc);
+                let mut reopened = service(provider, &server, root.path());
+                reopened
+                    .acknowledge_review_failure(&id, 2, text("review incident inspected"), None)
+                    .unwrap();
+                let recovered = reopened.inspect_session(&id).unwrap();
+                assert_eq!(
+                    recovered.session().turns()[0].outcome(),
+                    &TurnOutcome::Interrupted(StopReason::ProcessLost)
+                );
+                reopened
+                    .resolve_effect(
+                        address,
+                        EffectResolution::new(disposition, source, text("resolution evidence")),
+                    )
+                    .unwrap();
+                reopened.chat(&id, user("continue from facts")).unwrap();
+                assert_eq!(targets.load(Ordering::SeqCst), 0);
+                assert_eq!(server.requests().len(), 3);
+                let request = server.request(2).body;
+                assert!(!request.to_string().contains("function_call_output"));
+                assert!(!request.to_string().contains("tool_result"));
+                let events = match provider {
+                    Provider::OpenAI => &request["input"],
+                    Provider::Anthropic => &request["messages"],
+                };
+                let mut facts = vec![];
+                for event in events.as_array().unwrap() {
+                    assert_eq!(event["role"], "user");
+                    let texts: Vec<&str> = match &event["content"] {
+                        Value::String(s) => vec![s],
+                        Value::Array(parts) => {
+                            parts.iter().filter_map(|p| p["text"].as_str()).collect()
+                        }
+                        _ => panic!("unexpected event"),
+                    };
+                    for content in texts {
+                        if let Some((quoted, raw)) =
+                            content.split_once("Execution facts (not new tool results): ")
+                        {
+                            assert!(quoted.starts_with("Quoted closed-turn history."));
+                            facts.extend(serde_json::from_str::<Vec<Value>>(raw).unwrap());
+                        }
+                    }
+                }
+                assert!(facts.contains(&json!({"fact":"turn_closed","turn":1,"outcome":{"status":"interrupted","reason":"process_lost"}})), "request {request}");
+                let effects: Vec<_> = facts
+                    .iter()
+                    .filter(|f| f["fact"] == "unknown_effect")
+                    .collect();
+                assert_eq!(
+                    effects,
+                    vec![
+                        &json!({"fact":"unknown_effect","session":id.as_str(),"turn":1,"step":1,"call_id":"native-1","name":"lookup","arguments":{"n":1},"resolution":{"disposition":label,"source":provenance,"evidence":"resolution evidence"}})
+                    ]
+                );
+            }
+        }
+    }
+}
