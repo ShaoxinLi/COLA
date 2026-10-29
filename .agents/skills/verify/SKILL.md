@@ -15,7 +15,8 @@ Assemble the five Bash blocks below into one script in section order. Run it
 once with `bash` from the checkout being verified. For another feature, replace
 the Drive selection before running the script. Separate shell tool calls lose
 the variables and trigger cleanup as soon as Launch exits. Prerequisites are
-a Rust toolchain supporting edition 2024, Cargo, Python 3, Git, and `shasum`.
+a Rust toolchain supporting edition 2024 and `std::fs::File::try_lock`, Cargo,
+Python 3, Git, and `shasum`.
 Host tool journeys also need Bash, `tr`, and Unix `mkfifo` for the FIFO case.
 Cargo may download locked dependencies during launch. The drive uses local
 fixtures with dummy credentials and needs no provider keys or seed database.
@@ -103,14 +104,15 @@ cat "$COLA_VERIFY_DOCTOR/doctor.log"
 Each run has its own build and temporary directories. HTTP fixtures bind
 `127.0.0.1:0`, so concurrent runs do not share ports. The host tool path-anchor
 test also creates a temporary directory in the checkout and removes it on drop.
-Use one service writer per session when adding journeys. Storage has no stale
-write detection. Never point a test at a user's `.cola` directory.
+A write command owns a stable OS session lock and commits consecutive revisions.
+A second writer receives `Busy`. Read-only inspection does not recover active
+work. Never point a test at a user's `.cola` directory.
 
 ## Drive
 
 Use the compiled Rust test runner. Filters are stable module paths from this
 checkout, not substring guesses about behavior. The following complete journey
-verifies JSONL persistence through `SessionStore::save`, `load`, and `list`.
+verifies JSONL persistence through `SessionStore::create`, `acquire`, `inspect`, and `list`.
 
 ```bash
 COLA_VERIFY_FEATURE=session-persistence
@@ -136,8 +138,9 @@ external crate consumers of `cola`, so public session transitions are user
 operations. Most service cases substitute collaborators through production
 traits. The native provider service cases combine the real JSONL store and HTTP
 adapters with local provider fixtures and a tool double. Adapter tests separately
-verify real disk, subprocess, and HTTP effects. No journey combines live
-providers with real host tools.
+verify real disk, subprocess, and HTTP effects. `tests/main.rs` also launches
+fresh CLI and Web executables with real host tools and local provider fixtures.
+Live-provider verification is separate from this credential-free driver.
 
 ## Evidence
 
@@ -153,15 +156,16 @@ cp -R tests/. "$COLA_VERIFY_EVIDENCE/test-sources/"
 ```
 
 Prove the action and resulting state through assertions on public return values
-and a second view of side effects. JSONL tests read raw bytes and load and list
-stored sessions. Tool tests read actual files, check rejected writes leave bytes
+and a second view of side effects. JSONL tests read raw bytes, inspect and list stored documents, and test process
+locks. Application tests commit recovery explicitly and verify invocation audit.
+Tool tests read actual files, check rejected writes leave bytes
 unchanged, and inspect real subprocess output. Provider tests inspect captured
 HTTP requests and public responses. A final screen or a successful build alone
 does not prove a journey.
 
 Mocks belong at the library's existing `ModelClient`, `SessionStore`, and `Tool`
 ports. Local provider fixtures exercise real HTTP encoding and decoding.
-Even tests named `real_providers` use local fixtures. Report live provider auth,
+These integration tests use local fixtures. Report live provider auth,
 model availability, quotas, and current wire compatibility as unverified.
 Temporary files disappear on normal test completion. Their read-back assertions
 and retained source are the evidence, not a retained raw session archive.

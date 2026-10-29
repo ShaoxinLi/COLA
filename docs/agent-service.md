@@ -1,92 +1,103 @@
 # Agent service
 
-[`AgentService`](../src/app/agent_service.rs) runs a user message through model
-requests, per-call review, tool execution, and saves. Keep the service alive
-across chat calls to retain each session's native model continuation.
+[`AgentService`](../src/app/agent_service.rs) runs reviewed tool workflows from a
+committed [`SessionDocument`](../src/app/session_document.rs). A new service or
+process can continue any closed session using the same store and explicit
+configuration. There is no resident session cache or continuation token.
 
-## Collaborators and operations
+## Operations and extension points
 
-The service receives a model client, session store, assistant, reviewer,
-registered tools, and `AgentSettings`. `Assistant` and `ToolCallReviewer` assemble
-input. The client implements both `ModelClient<AssistantMessage>` and
-`ModelClient<Decision>`, as both provider adapters do.
+`AgentService::new` receives a client implementing both
+`ModelClient<AssistantMessage>` and `ModelClient<Decision>`, a `SessionStore`,
+`Assistant`, `ToolCallReviewer`, registered tools, and `AgentSettings`.
+Tool names are unique. Advertised definitions must match the registered catalog.
 
-`AgentSettings` supplies separate assistant and reviewer model settings and a
-nonzero `max_iterations`. The two settings can select different models and
-efforts on the same provider client.
-
-Tool names must be unique. The assistant can advertise a subset of registered
-tools with matching definitions. A tool adapter's `definition()` supplies both
-the catalog entry and the registration.
-
-| Method | Result |
+| Operation | Result |
 | --- | --- |
-| `new_session()` | Saves an empty session and returns a clone. |
-| `chat(id, user)` | Runs one turn and returns that turn's messages, including its user message. |
-| `list_session()` | Returns sessions sorted by ID. Resident facts override stored copies. |
+| `new_session()` | Publishes an empty document and returns its domain session. |
+| `chat(id, user)` | Runs one turn and returns its messages, including the user message. |
+| `list_session()` | Reads current stored sessions in ID order without recovery writes. |
+| `inspect_session(id)` | Reads the full document, including model audit and acknowledgements. |
+| `resolve_effect(address, resolution)` | Records evidence for the exact closed execution. |
+| `acknowledge_review_failure(id, invocation, evidence, actor)` | Records an explicit acknowledgement and releases that review block. |
 
-Returned values cannot mutate the service.
+`Assistant` and `ToolCallReviewer` remain caller-defined context hooks. They may
+select historical exchanges but cannot alter their facts. Assistant context must
+preserve the exact current exchange. The application supplies the reviewer with
+mandatory current-turn facts, the exact candidate, and its complete address.
+Model audit metadata never enters these semantic facts.
 
-## Per-call review
+## Commit and I/O ordering
 
-The service accepts the exact assistant response and handles calls in declaration
-order. Each call gets a separate review. If a file read is approved and a log
-deletion is denied, the read executes and the deletion receives a failure result
-that states it was not executed and gives the denial reason.
+A write command holds one OS session lock through its synchronous workflow.
+Each command reads the latest document under that lock.
 
-A denial is an ordinary `ToolOutcome::Failure`. It does not fail the turn or
-cancel sibling calls. If no reason is supplied, the result says so. Ordinary
-tool failures also return to the model.
+1. Commit the user message and a planned invocation.
+2. The model adapter compiles the request. The application recorder commits its
+   exact nonsecret bytes and the initial frozen view before permitting HTTP.
+3. Commit the response evidence and accepted assistant step together. Rejected
+   output is audited without creating an executable step.
+4. Record tool dispatch intent, plan and prepare its review, then commit the
+   review decision before executing the target.
+5. Commit each tool result before another model request.
 
-The reviewer receives the current session and exact call. Its context builder
-must include relevant active-turn facts, such as earlier results. See the
-[context assembly contracts](domain.md#context-assembly-contracts).
+A denial becomes an ordinary tool failure result. It does not block siblings or
+fail the turn. A failed tool also produces an ordinary result. `max_iterations`
+counts assistant invocations, and an accepted batch finishes before the next
+iteration check.
 
-## Persistence checkpoints
+Any commit error ends the command. Its writer becomes unusable, including when
+rename succeeded but directory synchronization failed. `progress()` contains
+the last confirmed committed working copy. Disk may already contain a newer
+revision after an uncertain publication.
 
-The service saves the accepted assistant response, then handles each call as
-follows.
+## Recovery and review failures
 
-1. Record `Started` and save before invoking the reviewer.
-2. On approval, execute the tool. On denial, create a non-execution result.
-3. Record and save the result before handling the next call.
+Inspection preserves active facts. The next writer explicitly commits recovery,
+closing an abandoned active turn as `Interrupted(ProcessLost)`. It never resumes
+that turn or retries its tools. Planned invocations become not sent. Prepared
+invocations without a committed response become response unknown.
 
-Dispatch includes review. `Started` records an attempt and does not prove that
-the target tool ran. A failed intent save prevents review and execution. A crash
-during review can recover as an unknown effect. Denials and tool failures share
-the same outcome type and differ in their descriptions.
+Review refusal, incompleteness, malformed output, transport failure, preparation
+failure, and unknown prepared responses block later chats. The initial failure
+retains its typed cause and invocation ID. Later attempts return `ReviewBlocked`.
+A planned-only reviewer interrupted before preparation does not create a block.
 
-The [session persistence reference](session-store.md#dispatch-checkpoints)
-describes the caller's checkpoint obligations.
+Acknowledgement requires nonblank evidence. Identical invocation, evidence, and
+actor retries are idempotent. Conflicting or nonpending acknowledgements fail.
+If the failed turn is still active, acknowledgement closes it with the original
+failure. An existing `ProcessLost` outcome stays unchanged. A pending invocation
+is recovered before acknowledgement. CLI and unauthenticated Web callers use
+`actor: None`.
 
-## Failures and iteration limits
+Acknowledgement performs no tool or model I/O. It does not fabricate a result,
+change `Started` to `NotStarted`, or resolve an unknown effect. Effect resolution
+is a separate operation addressed by session, turn, step, and native ID.
 
-`AgentError::kind()` identifies the cause. `progress()` exposes resident session
-facts when available. Those facts may be newer than stored data.
+## Context policy and limits
 
-| Failure | Result |
-| --- | --- |
-| Reviewer cannot produce a decision | Return the error, preserve the started call, and block the session. No target or later sibling runs. |
-| Save fails | Return the store error and checkpoint, preserve live facts, and block the session. Publication may already have happened. |
-| Assistant cannot complete | Return the typed cause and save the failed turn. |
-| Iteration limit is reached | Save `Interrupted(IterationLimit)` and return progress. |
+`with_context_policy` replaces the default `RecentContextPolicy`. The default
+selects eight optional closed turns plus every turn with an unresolved effect.
+Mandatory turns do not consume the optional quota. A custom policy cannot omit
+unresolved-effect turns. Fitting drops the oldest optional whole turns until the
+complete encoded request fits. Required content that cannot fit produces
+`ContextSelectionTooLarge` before HTTP and closes the assistant turn.
 
-A blocked session rejects later chats without further I/O. The service does not
-retry tools, reload over known results, or repair blocked sessions. Inspect
-progress before recreating the service after resolving the failure.
+CLI and Web configuration expose `context.optional_turns` and
+`context.max_request_bytes`. The default request cap is 64 KiB. It includes
+system instructions, tools,
+settings, semantic history, current input, and native dependencies. The same cap
+protects every later request in a growing tool chain. Reviewer requests fit
+independently and never prune the assistant's frozen view.
 
-`max_iterations` counts assistant generations, excluding reviews and tool calls.
-A requested batch finishes before the next budget check. Its saved results may
-therefore receive no further model request in that turn.
+Closed turns are quoted semantic history with role and outcome labels. New turns
+can change provider or model. Within a turn, selected history, current user,
+system, tools, and settings are frozen. Later requests append accepted native
+responses and actual tool results from the document. Prefix or model changes
+fail before HTTP.
 
-## Lifetime and restart limits
-
-Continuations live in memory. Recreating the service loads saved facts through
-normal recovery, which closes active work as `ProcessLost` without repeating it.
-Provider adapters reject retained complete tool history without its continuation
-with `MissingContinuation`. See [recovery limits](model-clients.md#recovery-and-limits).
-
-Use one service writer per stored session. Storage has no stale-write detection
-across instances. Resident sessions and continuations remain in memory for the
-service's lifetime. The loop is synchronous, with no streaming, cancellation,
-automatic retries, or history fitting.
+The byte cap is not a model-specific token-window estimate. The application does
+not infer context capacities for arbitrary model IDs. Callers must select a
+request cap suitable for their configured models. The implementation provides no
+universal guarantee against upstream truncation under an incorrectly sized cap.
+There is no streaming, automatic retry, active-turn resumption, or cancellation.

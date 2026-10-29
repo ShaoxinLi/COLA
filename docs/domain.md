@@ -47,17 +47,19 @@ user message and ordered assistant steps. Each requested call has an execution
 record. Getters expose immutable facts.
 
 Rejected transitions leave the session unchanged. Active operations require the
-current `TurnId`. Calls address the latest batch in declaration order.
+current `TurnId`. `CallAddress { session, turn, step, native }` identifies a tool
+execution. Its one-based step is validated at every operation boundary.
+`call_address(native)` obtains an address for the current batch.
 
 | Operation | Required state | Recorded change |
 | --- | --- | --- |
 | `start_turn(user)` | No active turn. | Allocates consecutive IDs starting at one and stores the user message. |
-| `record_assistant(id, message)` | `AskModel`, with call IDs unused throughout the session. | Adds a step. An answer closes the turn as `Completed`. |
-| `start_tool(id, call_id)` | The next call is `NotStarted`. | Records `Started` and returns the call before external I/O. |
-| `record_tool_result(id, result)` | The matching call is `Started`. | Records `Returned(outcome)`, including tool failures. |
+| `record_assistant(id, message)` | `AskModel`, with IDs distinct inside the new batch. | Adds a step. An answer closes the turn as `Completed`. |
+| `start_tool(address)` | The next call is `NotStarted`. | Records `Started` and returns the call before external I/O. |
+| `record_tool_result(address, outcome)` | The matching call is `Started`. | Records `Returned(outcome)`, including tool failures. |
 | `interrupt(id, reason)` | An active turn. | Closes it as `Interrupted` without inventing results. |
 | `fail(id, failure)` | An active turn. | Closes it as `Failed` without inventing results. |
-| `resolve_effect(id, call_id, resolution)` | A closed call remains `Started`. | Adds effect evidence without changing execution state. |
+| `resolve_effect(address, resolution)` | A closed call remains `Started`. | Adds effect evidence without changing execution state. |
 
 `next_action()` returns `AwaitUser` when no turn is active, `AskModel` when no
 call is pending, `Execute(call_id)` for the next unstarted call, or `AwaitTool`
@@ -78,12 +80,11 @@ preserves `Started`, creates no result, and never reopens a turn or schedules a 
 
 `Context<O>` associates input with expected output type `O`. It contains nonblank
 instructions, ordered `ContextExchange` values, and a catalog with unique tool
-names. Call IDs are unique across exchanges and notices. Turn IDs strictly
+names. Native call IDs can repeat across steps and turns. Turn IDs strictly
 increase. Empty or entirely closed history is valid.
 
 Each exchange starts with one user message and contains complete tool batches
-with returns in declaration order. Orphan results, repeated call IDs, and
-unresolved batches are rejected. A completed exchange ends in an answer.
+with returns in declaration order. Orphan results and unresolved batches are rejected. A completed exchange ends in an answer.
 An active, interrupted, or failed exchange has no answer. Only the last exchange
 can be active, and it must await the model.
 
@@ -108,9 +109,9 @@ facts and never fabricate tool returns. `Context` does not select or fit history
 facts. `ToolCallReviewer::context` also receives the exact call and builds
 `Context<Decision>`. Neither trait invokes a model or tool.
 
-The reviewer selects history and renders the call and relevant active-turn facts
-in its instructions. `closed_context_exchanges` remains available during a
-pending batch. There is no built-in lossless projection of an active review.
+The reviewer selects history and policy instructions. The application adds the
+exact candidate address and complete active-turn facts to each review. `closed_context_exchanges` remains available during a
+pending batch.
 `Decision` records allowance and an optional nonblank reason. It does not itself
 authorize execution, establish freshness, or verify call membership.
 
@@ -121,10 +122,11 @@ snapshot types mirror the session, turn, step, call, and execution hierarchy.
 Closed turns require an outcome. The active turn requires none.
 
 `Session::restore()` validates raw values through normal transitions. It checks
-turn numbering, call uniqueness, execution alignment and order, outcomes, and
+turn numbering, batch-local call uniqueness, execution alignment and order, outcomes, and
 resolution eligibility. Failures return `RestoreError`.
 
-Restore closes active work as `Interrupted(ProcessLost)` without executing calls.
+Restore preserves active work exactly. The application commits explicit
+`Interrupted(ProcessLost)` recovery under its write lock without executing calls.
 Closed turns retain partial batches and resolution evidence. Validation checks
 structural consistency but does not authenticate recorded effects.
 
