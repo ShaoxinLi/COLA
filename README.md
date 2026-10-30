@@ -49,7 +49,7 @@ traits. Adapters implement those contracts and own external I/O.
 | Layer | Responsibility | Reference |
 | --- | --- | --- |
 | `src/domain` | Checked values, conversation transitions, tools, context, and recovery. | [Domain contracts](docs/domain.md) |
-| `src/app` | Agent orchestration, model generation, and session persistence ports. | [Agent service](docs/agent-service.md), [model clients](docs/model-clients.md#invocation-contract), [session records](docs/session_record.md), [context policy](docs/context_policy.md), [session persistence](docs/session-store.md#store-and-writer-contracts) |
+| `src/app` | Agent orchestration, model generation, and session persistence ports. | [Agent service](docs/agent-service.md), [model clients](docs/model-clients.md#invocation-contract), [session records](docs/session-record.md), [context policy](docs/context-policy.md), [session persistence](docs/session-store.md#store-and-writer-contracts) |
 | `src/adapters` | Web and CLI APIs, OpenAI and Anthropic clients, JSONL storage, Bash, and file tools. | [Inbound APIs](#inbound-apis), [model clients](docs/model-clients.md#connection-and-response-boundaries), [session persistence](docs/session-store.md#jsonl-version-2), [tool adapters](docs/tools.md) |
 | `src/main.rs` | JSON configuration, context policies, component assembly, and process startup. | [Run COLA](#run-cola), [startup configuration](docs/api.md#executable-configuration) |
 

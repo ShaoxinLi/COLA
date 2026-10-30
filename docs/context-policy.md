@@ -36,7 +36,7 @@ fitting returns `ContextSelectionTooLarge`.
 Model adapters measure the complete encoded request, including instructions,
 tools, settings, current input, selected history, and native dependencies.
 The first assistant request freezes the fitted view in the
-[session record](session_record.md). Later requests preserve that prefix and
+[session record](session-record.md). Later requests preserve that prefix and
 append accepted native responses and actual tool results. The same byte cap
 applies as the chain grows; native content and tool results are not truncated.
 Reviewer requests fit independently without pruning the assistant view.

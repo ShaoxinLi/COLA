@@ -23,8 +23,8 @@ The policy selection and record acknowledgement/recovery cases originally lived
 in the service suite. Service orchestration retains the checks that relate a
 policy or role to external I/O. Provider rendering, actual encoded-body fitting,
 and archive corruption remain in `tests/adapters/models/client.rs`.
-See the [policy guide](../../../../docs/context_policy.md) and
-[record guide](../../../../docs/session_record.md) for module boundaries.
+See the [policy guide](../../../../docs/context-policy.md) and
+[record guide](../../../../docs/session-record.md) for module boundaries.
 
 The domain, adapter, and executable suites add scoped receipts, cold reload,
 multiple native steps, CLI/Web acknowledgement, iteration limits, and fresh

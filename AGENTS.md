@@ -1,4 +1,4 @@
-# COLA architecture
+# Architecture
 
 Favor a three-layer architecture that makes responsibilities easy to locate and changes easier to reason about. Keep core rules separate from workflow coordination and external mechanisms, so each can evolve without forcing unrelated changes elsewhere.
 

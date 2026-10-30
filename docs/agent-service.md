@@ -4,7 +4,7 @@
 committed [`SessionRecord`](../src/app/session_record.rs). A new service or
 process can continue any closed session using the same store and explicit
 configuration. There is no resident session cache or continuation token. See the
-[session record guide](session_record.md) for aggregate ownership and audit invariants.
+[session record guide](session-record.md) for aggregate ownership and audit invariants.
 
 ## Operations and extension points
 
@@ -82,7 +82,7 @@ is a separate operation addressed by session, turn, step, and native ID.
 
 ## Context policy and limits
 
-The [context policy guide](context_policy.md) describes selection and fitting.
+The [context policy guide](context-policy.md) describes selection and fitting.
 `with_context_policy` replaces the default `RecentContextPolicy`. The default
 selects eight optional closed turns plus every turn with an unresolved effect.
 Mandatory turns do not consume the optional quota. A custom policy cannot omit

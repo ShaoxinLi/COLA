@@ -1,6 +1,6 @@
 # Session persistence
 
-`SessionStore` persists complete application [`SessionRecord`](session_record.md) snapshots.
+`SessionStore` persists complete application [`SessionRecord`](session-record.md) snapshots.
 Records contain the domain session, revision, per-invocation plans and audit,
 frozen turn views, and review-failure acknowledgements.
 

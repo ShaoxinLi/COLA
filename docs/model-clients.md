@@ -13,7 +13,7 @@ obtain the application-owned recorder and durable workflow.
 
 `ModelInput<O>` carries checked semantic context, model settings, selection
 policy, an optional frozen turn view, and accepted native steps read from the
-[session record](session_record.md). Each native step includes its archived response and actual results.
+[session record](session-record.md). Each native step includes its archived response and actual results.
 Reviewer inputs carry a mandatory `ReviewSubject` with the full active turn,
 candidate call, and exact address. They contain no assistant native steps.
 
