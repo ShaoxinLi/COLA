@@ -73,28 +73,11 @@ impl Provider {
             }
         }
     }
+    #[allow(dead_code)]
     pub(super) fn native(self, response: &Value) -> Value {
         match self {
             Self::OpenAI => response["output"].clone(),
             Self::Anthropic => response["content"].clone(),
-        }
-    }
-    pub(super) fn request_native(self, request: &Value) -> Vec<Value> {
-        match self {
-            Self::OpenAI => request["input"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|v| v.get("type").is_some_and(|t| t != "function_call_output"))
-                .cloned()
-                .collect(),
-            Self::Anthropic => request["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|v| v["role"] == "assistant")
-                .flat_map(|v| v["content"].as_array().unwrap().clone())
-                .collect(),
         }
     }
 }
@@ -106,53 +89,6 @@ pub(super) fn user(s: &str) -> UserMessage {
 }
 pub(super) fn tool() -> ToolDefinition {
     ToolDefinition::new(ToolName::new("lookup").unwrap(),text("Look up a value"),InputSchema::new(json!({"type":"object","properties":{"n":{"type":"integer","minimum":0}},"required":["n"],"additionalProperties":false})).unwrap())
-}
-pub(super) fn session() -> Session {
-    let mut s = Session::new(SessionId::new("fixture").unwrap());
-    s.start_turn(user("hello")).unwrap();
-    s
-}
-pub(super) fn context<O>(s: &Session) -> Context<O> {
-    Context::new(
-        text("Be useful"),
-        s.context_exchanges().unwrap(),
-        vec![tool()],
-    )
-    .unwrap()
-}
-pub(super) fn complete<O>(generation: Generation<O>) -> (O, Option<Continuation<O>>) {
-    match generation {
-        Generation::Complete {
-            output,
-            continuation,
-        } => (output, continuation),
-        other => panic!(
-            "expected complete, got {}",
-            match other {
-                Generation::Refused { .. } => "refused",
-                Generation::Incomplete { .. } => "incomplete",
-                _ => unreachable!(),
-            }
-        ),
-    }
-}
-pub(super) fn accept(s: &mut Session, output: AssistantMessage) {
-    let turn = s.active_turn().unwrap().id();
-    let calls = output
-        .calls()
-        .map(|c| c.as_slice().to_vec())
-        .unwrap_or_default();
-    s.record_assistant(turn, output).unwrap();
-    for (i, call) in calls.iter().enumerate() {
-        s.start_tool(turn, call.id()).unwrap();
-        let outcome = if i == 0 {
-            ToolOutcome::Success(String::new())
-        } else {
-            ToolOutcome::Failure(ToolError::new(text("tool failed")))
-        };
-        s.record_tool_result(turn, ToolResult::new(call.id().clone(), outcome))
-            .unwrap();
-    }
 }
 #[derive(Clone)]
 pub(super) struct Reply {
@@ -174,10 +110,12 @@ impl From<Value> for Reply {
     }
 }
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(super) struct Request {
     pub(super) line: String,
     pub(super) headers: String,
     pub(super) body: Value,
+    pub(super) bytes: Vec<u8>,
 }
 pub(super) struct Server {
     pub(super) url: String,
@@ -244,6 +182,7 @@ impl Server {
                     line: headers.lines().next().unwrap().to_string(),
                     headers,
                     body: serde_json::from_slice(&bytes[header_end..]).unwrap(),
+                    bytes: bytes[header_end..].to_vec(),
                 };
                 received.lock().unwrap().push(request);
                 let reply = replies.next().unwrap_or_else(|| Reply {
@@ -285,7 +224,7 @@ impl Server {
             worker: Some(worker),
         }
     }
-    fn config(&self) -> ClientConfig {
+    pub(super) fn config(&self) -> ClientConfig {
         ClientConfig::new(
             &self.url,
             "secret-key",
@@ -313,6 +252,7 @@ impl Drop for Server {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn assert_safe(error: &ModelError) {
     let text = format!("{error:?} {error}");
     for secret in [
@@ -325,4 +265,98 @@ pub(super) fn assert_safe(error: &ModelError) {
         assert!(!text.contains(secret), "leak {text}");
     }
     assert!(error.source().is_none());
+}
+
+#[derive(Clone)]
+pub(super) struct Roles;
+impl Assistant for Roles {
+    fn context(&self, s: &Session) -> Result<Context<AssistantMessage>, ContextError> {
+        Context::new(text("Be useful"), s.context_exchanges()?, vec![tool()])
+    }
+}
+impl ToolCallReviewer for Roles {
+    fn context(&self, s: &Session, _: &ToolCall) -> Result<Context<Decision>, ContextError> {
+        Context::new(
+            text("Review carefully"),
+            s.closed_context_exchanges()?,
+            vec![tool()],
+        )
+    }
+}
+pub(super) struct Pair {
+    pub assistant: Box<dyn ModelClient<AssistantMessage>>,
+    pub reviewer: Box<dyn ModelClient<Decision>>,
+}
+impl ModelClient<AssistantMessage> for Pair {
+    fn route(&self) -> String {
+        self.assistant.route()
+    }
+    fn invoke(
+        &self,
+        input: ModelInput<'_, AssistantMessage>,
+        recorder: &mut dyn BeforeModelSend,
+    ) -> Result<Observation<AssistantMessage>, SessionStoreError> {
+        self.assistant.invoke(input, recorder)
+    }
+}
+impl ModelClient<Decision> for Pair {
+    fn route(&self) -> String {
+        self.reviewer.route()
+    }
+    fn invoke(
+        &self,
+        input: ModelInput<'_, Decision>,
+        recorder: &mut dyn BeforeModelSend,
+    ) -> Result<Observation<Decision>, SessionStoreError> {
+        self.reviewer.invoke(input, recorder)
+    }
+}
+pub(super) struct Target(pub Arc<std::sync::atomic::AtomicUsize>);
+impl Tool for Target {
+    fn execute(&self, _: &serde_json::Map<String, Value>) -> ToolOutcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ToolOutcome::Success("observed target result".into())
+    }
+}
+pub(super) type Service<S = cola::adapters::stores::JsonlSessionStore> =
+    AgentService<Pair, S, Roles, Roles>;
+pub(super) fn service(provider: Provider, server: &Server, root: &std::path::Path) -> Service {
+    service_with_store(
+        provider,
+        server,
+        cola::adapters::stores::JsonlSessionStore::new(root),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    )
+}
+pub(super) fn service_with_store<S: SessionStore>(
+    provider: Provider,
+    server: &Server,
+    store: S,
+    count: Arc<std::sync::atomic::AtomicUsize>,
+) -> Service<S> {
+    AgentService::new(
+        Pair {
+            assistant: provider.client(server),
+            reviewer: provider.reviewer(server),
+        },
+        store,
+        Roles,
+        Roles,
+        vec![(tool(), Box::new(Target(count)))],
+        AgentSettings {
+            assistant_model_settings: provider.settings(),
+            reviewer_model_settings: provider.settings(),
+            max_iterations: NonZeroU32::new(8).unwrap(),
+        },
+    )
+    .unwrap()
+}
+pub(super) fn decision(provider: Provider, allow: bool) -> Value {
+    provider.answer(&json!({"should_allow":allow,"reason":null}).to_string())
+}
+pub(super) fn last_outcome(doc: &SessionRecord) -> &RecordedOutcome {
+    match &doc.invocations().last().unwrap().state {
+        InvocationState::Finished { outcome, .. } => outcome,
+        state => panic!("unexpected {state:?}"),
+    }
 }

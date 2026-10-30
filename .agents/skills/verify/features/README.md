@@ -23,15 +23,15 @@ coverage. Inspect the saved source for the side-effect assertions being claimed.
 ## Proof and skip reporting
 
 Retain the action trace, test names, results, source, hashes, and exit status.
-The library has no browser, CLI, desktop window, or HTTP service of its own.
-Public API integration tests are its consumer journeys. Report fixture-based
+The library integration tests are its Rust consumer journeys. The `cola`
+executable also has CLI and Web process journeys in `tests/main.rs`. Report fixture-based
 orchestration and local HTTP compatibility with those limits. A failed
 precondition is a failure to verify the feature, not permission to skip it.
 
 ## Features
 
-- [Agent chats](agent-chats.md) covers service creation, per-call review, continuation, limits, and failures.
-- [Session persistence](session-persistence.md) covers JSONL save, load, list, recovery, and refused writes.
+- [Agent chats](agent-chats.md) covers service creation, per-call review, durable invocation audit, limits, and failures.
+- [Session persistence](session-persistence.md) covers session records, JSONL snapshots, locks, inspection, recovery, and refused writes.
 - [Host tools](host-tools.md) covers file reads and writes, Bash, validation, and path anchoring.
-- [Provider adapters](provider-adapters.md) covers OpenAI and Anthropic HTTP requests, responses, continuation, and errors.
+- [Provider adapters](provider-adapters.md) covers OpenAI and Anthropic HTTP requests, responses, frozen native views, and errors.
 - [Conversation contracts](conversation-contracts.md) covers public values, session transitions, recovery, context, and caller-defined roles.

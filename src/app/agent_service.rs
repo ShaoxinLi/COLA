@@ -1,12 +1,5 @@
-use super::{
-    Continuation, Generation, IncompleteReason, ModelClient, ModelError, ModelErrorKind,
-    ModelSettings, SessionStore, SessionStoreError,
-};
-use crate::domain::{
-    Assistant, AssistantMessage, ContextError, Decision, Message, NextAction, NonEmptyText,
-    Session, SessionError, SessionId, StopReason, Tool, ToolCall, ToolCallReviewer, ToolDefinition,
-    ToolError, ToolName, ToolOutcome, ToolResult, TurnFailure, TurnId, UserMessage,
-};
+use super::*;
+use crate::domain::*;
 use std::{collections::BTreeMap, error::Error, fmt, num::NonZeroU32};
 
 #[derive(Clone, Debug)]
@@ -15,9 +8,6 @@ pub struct AgentSettings {
     pub reviewer_model_settings: ModelSettings,
     pub max_iterations: NonZeroU32,
 }
-
-/// Synchronous reviewed dispatch with resident, memory-only native continuations.
-/// A dispatch attempt includes review. `Started` never proves target execution.
 pub struct AgentService<M, S, A, R> {
     model_client: M,
     session_store: S,
@@ -25,102 +15,45 @@ pub struct AgentService<M, S, A, R> {
     reviewer: R,
     settings: AgentSettings,
     tools: BTreeMap<ToolName, (ToolDefinition, Box<dyn Tool>)>,
-    sessions: BTreeMap<SessionId, Entry>,
+    context_policy: Box<dyn ContextPolicy>,
 }
-
-struct Entry {
-    session: Session,
-    continuation: Option<Continuation<AssistantMessage>>,
-    state: RuntimeState,
-}
-
-enum RuntimeState {
-    Ready,
-    Blocked(Checkpoint),
-}
-
-impl Entry {
-    fn new(session: Session) -> Self {
-        Self {
-            session,
-            continuation: None,
-            state: RuntimeState::Ready,
-        }
-    }
-
-    fn error(&self, kind: AgentErrorKind) -> AgentError {
-        AgentError {
-            kind,
-            progress: Some(Box::new(self.session.clone())),
-        }
-    }
-
-    fn save(&mut self, store: &impl SessionStore, at: Checkpoint) -> Result<(), AgentError> {
-        if let Err(source) = store.save(&self.session) {
-            self.state = RuntimeState::Blocked(at);
-            return Err(self.error(AgentErrorKind::Store { at, source }));
-        }
-        Ok(())
-    }
-
-    fn close_error(
-        &mut self,
-        store: &impl SessionStore,
-        turn: TurnId,
-        kind: AgentErrorKind,
-    ) -> AgentError {
-        let closed = if matches!(kind, AgentErrorKind::IterationLimit) {
-            self.session.interrupt(turn, StopReason::IterationLimit)
-        } else {
-            let failure = match &kind {
-                AgentErrorKind::RejectedOutput(_) | AgentErrorKind::UnknownTool(_) => {
-                    TurnFailure::MalformedResponse(
-                        NonEmptyText::new("Invalid assistant output").unwrap(),
-                    )
-                }
-                AgentErrorKind::Model { source, .. }
-                    if matches!(
-                        source.kind(),
-                        ModelErrorKind::MalformedResponse | ModelErrorKind::UnsupportedResponse
-                    ) =>
-                {
-                    TurnFailure::MalformedResponse(
-                        NonEmptyText::new("Malformed or unsupported assistant response").unwrap(),
-                    )
-                }
-                AgentErrorKind::Context { .. } => TurnFailure::ModelFailure(
-                    NonEmptyText::new("Assistant context assembly failed").unwrap(),
-                ),
-                AgentErrorKind::CatalogMismatch(_) => TurnFailure::ModelFailure(
-                    NonEmptyText::new(
-                        "Assistant tool catalog does not match registered definitions",
-                    )
-                    .unwrap(),
-                ),
-                AgentErrorKind::Refused { .. } => TurnFailure::ModelFailure(
-                    NonEmptyText::new("Assistant refused generation").unwrap(),
-                ),
-                AgentErrorKind::Incomplete { reason, .. } => TurnFailure::ModelFailure(
-                    NonEmptyText::new(format!("Assistant generation incomplete ({reason:?})"))
-                        .unwrap(),
-                ),
-                _ => TurnFailure::ModelFailure(
-                    NonEmptyText::new("Assistant model request failed").unwrap(),
-                ),
-            };
-            self.session.fail(turn, failure)
-        };
-        if closed.is_err() {
-            self.state = RuntimeState::Blocked(Checkpoint::ClosedTurn);
-            return self.error(AgentErrorKind::UnexpectedState);
-        }
-        match self.save(store, Checkpoint::ClosedTurn) {
-            Ok(()) => self.error(kind),
-            Err(error) => error,
-        }
+fn error(record: Option<&SessionRecord>, kind: AgentErrorKind) -> AgentError {
+    AgentError {
+        kind,
+        progress: record.map(|d| Box::new(d.session().clone())),
     }
 }
-
+fn record_error(record: &SessionRecord, source: RecordError) -> AgentError {
+    error(Some(record), AgentErrorKind::Record(source))
+}
+fn commit(
+    writer: &mut dyn SessionWriter,
+    next: SessionRecord,
+    at: Checkpoint,
+) -> Result<(), AgentError> {
+    writer.commit(next).map(|_| ()).map_err(|source| {
+        error(
+            Some(writer.committed()),
+            AgentErrorKind::Store { at, source },
+        )
+    })
+}
+struct Recorder<'a> {
+    writer: &'a mut dyn SessionWriter,
+    invocation: u64,
+}
+impl BeforeModelSend for Recorder<'_> {
+    fn persist(&mut self, prepared: PreparedInvocation) -> Result<SendPermit, SessionStoreError> {
+        let body = prepared.request.body.clone();
+        let next = self
+            .writer
+            .committed()
+            .prepared(self.invocation, prepared)
+            .map_err(|e| SessionStoreError::new(SessionStoreErrorKind::InvalidData, e))?;
+        self.writer.commit(next)?;
+        Ok(SendPermit { body })
+    }
+}
 impl<M, S, A, R> AgentService<M, S, A, R>
 where
     M: ModelClient<AssistantMessage> + ModelClient<Decision>,
@@ -137,16 +70,10 @@ where
         settings: AgentSettings,
     ) -> Result<Self, AgentError> {
         let mut registry = BTreeMap::new();
-        for (definition, executor) in tools {
+        for (definition, tool) in tools {
             let name = definition.name().clone();
-            if registry
-                .insert(name.clone(), (definition, executor))
-                .is_some()
-            {
-                return Err(AgentError {
-                    kind: AgentErrorKind::DuplicateTool(name),
-                    progress: None,
-                });
+            if registry.insert(name.clone(), (definition, tool)).is_some() {
+                return Err(error(None, AgentErrorKind::DuplicateTool(name)));
             }
         }
         Ok(Self {
@@ -156,236 +83,493 @@ where
             reviewer,
             settings,
             tools: registry,
-            sessions: BTreeMap::new(),
+            context_policy: Box::new(RecentContextPolicy::default()),
         })
     }
-
-    /// Saves the empty session before returning it. On failure progress includes its new ID.
-    pub fn new_session(&mut self) -> Result<Session, AgentError> {
-        let session = Session::new(SessionId::new(uuid::Uuid::new_v4().to_string()).unwrap());
-        let entry = self
-            .sessions
-            .entry(session.id().clone())
-            .or_insert_with(|| Entry::new(session));
-        entry.save(&self.session_store, Checkpoint::NewSession)?;
-        Ok(entry.session.clone())
+    pub fn with_context_policy(mut self, policy: impl ContextPolicy + 'static) -> Self {
+        self.context_policy = Box::new(policy);
+        self
     }
-
-    /// Sorted session facts, with live resident state taking precedence over stored recovery.
-    pub fn list_session(&self) -> Result<Vec<Session>, AgentError> {
-        let mut sessions: BTreeMap<_, _> = self
-            .session_store
-            .list()
-            .map_err(|source| AgentError {
-                kind: AgentErrorKind::Store {
-                    at: Checkpoint::ListSessions,
+    pub fn new_session(&mut self) -> Result<Session, AgentError> {
+        self.session_store
+            .create()
+            .map(|w| w.committed().session().clone())
+            .map_err(|source| {
+                error(
+                    None,
+                    AgentErrorKind::Store {
+                        at: Checkpoint::NewSession,
+                        source,
+                    },
+                )
+            })
+    }
+    pub fn inspect_session(&self, id: &SessionId) -> Result<SessionRecord, AgentError> {
+        self.session_store.inspect(id).map_err(|source| {
+            error(
+                None,
+                AgentErrorKind::Store {
+                    at: Checkpoint::LoadSession,
                     source,
                 },
-                progress: None,
-            })?
-            .into_iter()
-            .map(|session| (session.id().clone(), session))
-            .collect();
-        sessions.extend(
-            self.sessions
-                .iter()
-                .map(|(id, entry)| (id.clone(), entry.session.clone())),
-        );
-        Ok(sessions.into_values().collect())
+            )
+        })
     }
-
-    /// Returns only the newly completed turn, including its user message.
-    /// Failed saves and reviewer infrastructure failures block future chats without I/O.
-    pub fn chat(
+    pub fn list_session(&self) -> Result<Vec<Session>, AgentError> {
+        self.session_store
+            .list()
+            .map_err(|source| {
+                error(
+                    None,
+                    AgentErrorKind::Store {
+                        at: Checkpoint::ListSessions,
+                        source,
+                    },
+                )
+            })?
+            .iter()
+            .map(|id| self.inspect_session(id).map(|d| d.session().clone()))
+            .collect()
+    }
+    pub fn acknowledge_review_failure(
         &mut self,
-        session_id: &SessionId,
-        user_message: UserMessage,
-    ) -> Result<Vec<Message>, AgentError> {
-        let entry = match self.sessions.entry(session_id.clone()) {
-            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let session = self
-                    .session_store
-                    .load(session_id)
-                    .map_err(|source| AgentError {
-                        kind: AgentErrorKind::Store {
-                            at: Checkpoint::LoadSession,
-                            source,
-                        },
-                        progress: None,
-                    })?;
-                entry.insert(Entry::new(session))
-            }
-        };
-        if let RuntimeState::Blocked(at) = entry.state {
-            return Err(entry.error(AgentErrorKind::Blocked { at }));
+        id: &SessionId,
+        invocation: u64,
+        evidence: NonEmptyText,
+        actor: Option<NonEmptyText>,
+    ) -> Result<(), AgentError> {
+        let mut writer = self.acquire(id)?;
+        if writer.committed().invocations().iter().any(|i| {
+            matches!(
+                i.state,
+                InvocationState::Planned | InvocationState::Prepared(_)
+            )
+        }) {
+            recover(&mut *writer)?;
         }
-        let turn = match entry.session.start_turn(user_message) {
-            Ok(turn) => turn,
-            Err(source) => {
-                entry.state = RuntimeState::Blocked(Checkpoint::StartedTurn);
-                return Err(entry.error(AgentErrorKind::RejectedOutput(source)));
-            }
-        };
-        entry.save(&self.session_store, Checkpoint::StartedTurn)?;
+        let next = writer
+            .committed()
+            .acknowledge(invocation, evidence, actor)
+            .map_err(|e| record_error(writer.committed(), e))?;
+        if let Some(next) = next {
+            commit(&mut *writer, next, Checkpoint::ReviewAcknowledgement)?;
+        }
+        Ok(())
+    }
+    pub fn resolve_effect(
+        &mut self,
+        address: CallAddress,
+        resolution: EffectResolution,
+    ) -> Result<(), AgentError> {
+        let mut writer = self.acquire(&address.session)?;
+        recover(&mut *writer)?;
+        let next = writer
+            .committed()
+            .mutate_session(|s| s.resolve_effect(&address, resolution))
+            .map_err(|e| error(Some(writer.committed()), AgentErrorKind::RejectedOutput(e)))?;
+        commit(&mut *writer, next, Checkpoint::EffectResolution)
+    }
+    fn acquire(&self, id: &SessionId) -> Result<Box<dyn SessionWriter + '_>, AgentError> {
+        self.session_store.acquire(id).map_err(|source| {
+            error(
+                None,
+                AgentErrorKind::Store {
+                    at: Checkpoint::LoadSession,
+                    source,
+                },
+            )
+        })
+    }
+    pub fn chat(&mut self, id: &SessionId, user: UserMessage) -> Result<Vec<Message>, AgentError> {
+        let mut writer = self.acquire(id)?;
+        recover(&mut *writer)?;
+        if let Some(invocation) = writer.committed().review_block() {
+            return Err(error(
+                Some(writer.committed()),
+                AgentErrorKind::ReviewBlocked { invocation },
+            ));
+        }
+        let next = writer
+            .committed()
+            .mutate_session(|s| s.start_turn(user).map(|_| ()))
+            .map_err(|e| error(Some(writer.committed()), AgentErrorKind::RejectedOutput(e)))?;
+        commit(&mut *writer, next, Checkpoint::StartedTurn)?;
+        let turn = writer.committed().session().active_turn().unwrap().id();
         let mut attempts = 0;
         loop {
-            match entry.session.next_action() {
+            match writer.committed().session().next_action() {
                 NextAction::AskModel => {
                     if attempts == self.settings.max_iterations.get() {
-                        return Err(entry.close_error(
-                            &self.session_store,
-                            turn,
+                        let next = writer
+                            .committed()
+                            .mutate_session(|s| s.interrupt(turn, StopReason::IterationLimit))
+                            .unwrap();
+                        commit(&mut *writer, next, Checkpoint::ClosedTurn)?;
+                        return Err(error(
+                            Some(writer.committed()),
                             AgentErrorKind::IterationLimit,
                         ));
                     }
-                    let accepted = (|| {
-                        let context = self.assistant.context(&entry.session).map_err(|source| {
-                            AgentErrorKind::Context {
-                                role: ModelRole::Assistant,
-                                source,
-                            }
-                        })?;
-                        for definition in context.tools() {
-                            if self
-                                .tools
-                                .get(definition.name())
-                                .is_none_or(|(registered, _)| registered != definition)
-                            {
-                                return Err(AgentErrorKind::CatalogMismatch(
-                                    definition.name().clone(),
-                                ));
-                            }
+                    attempts += 1;
+                    let step = writer
+                        .committed()
+                        .session()
+                        .active_turn()
+                        .unwrap()
+                        .steps()
+                        .len() as u64
+                        + 1;
+                    let requested = RequestedModel {
+                        route: ModelClient::<AssistantMessage>::route(&self.model_client),
+                        settings: self.settings.assistant_model_settings.clone(),
+                    };
+                    let next = writer
+                        .committed()
+                        .plan(
+                            InvocationTarget::Assistant {
+                                turn: turn.get(),
+                                step,
+                            },
+                            requested,
+                        )
+                        .map_err(|e| record_error(writer.committed(), e))?;
+                    commit(&mut *writer, next, Checkpoint::PlannedInvocation)?;
+                    let invocation = writer.committed().invocations().last().unwrap().id;
+                    let context = self.assistant.context(writer.committed().session());
+                    let context_error = context.as_ref().err().cloned();
+                    let mut advertised = vec![];
+                    let observed = match context {
+                        Err(_) => {
+                            Observation::failed(ModelError::new(ModelErrorKind::InvalidSelection))
                         }
-                        attempts += 1;
-                        let generated = ModelClient::<AssistantMessage>::generate(
-                            &self.model_client,
-                            &context,
-                            &self.settings.assistant_model_settings,
-                            entry.continuation.as_ref(),
-                        );
-                        let (output, continuation) = match generated {
-                            Ok(Generation::Complete {
-                                output,
-                                continuation,
-                            }) => (output, continuation),
-                            other => return Err(generation_error(other, ModelRole::Assistant)),
-                        };
-                        if let Some(calls) = output.calls() {
-                            for call in calls.as_slice() {
-                                if !context
-                                    .tools()
-                                    .iter()
-                                    .any(|definition| definition.name() == call.name())
-                                {
-                                    return Err(AgentErrorKind::UnknownTool(call.clone()));
+                        Ok(context) => {
+                            let current = writer
+                                .committed()
+                                .session()
+                                .context_exchanges()
+                                .ok()
+                                .and_then(|e| e.last().cloned());
+                            advertised = context.tools().to_vec();
+                            if context.exchanges().last() != current.as_ref() {
+                                Observation::failed(ModelError::new(
+                                    ModelErrorKind::InvalidSelection,
+                                ))
+                            } else if advertised.iter().any(|t| {
+                                self.tools
+                                    .get(t.name())
+                                    .is_none_or(|(registered, _)| registered != t)
+                            }) {
+                                Observation::failed(ModelError::new(
+                                    ModelErrorKind::InvalidToolCatalog,
+                                ))
+                            } else {
+                                let selection = selection_for(
+                                    &*self.context_policy,
+                                    writer.committed().session(),
+                                    &context,
+                                );
+                                match selection {
+                                    Err(e) => Observation::failed(e),
+                                    Ok(selection) => {
+                                        let view = writer
+                                            .committed()
+                                            .views()
+                                            .iter()
+                                            .find(|v| v.turn == turn.get())
+                                            .cloned();
+                                        let native = writer
+                                            .committed()
+                                            .native_steps(turn)
+                                            .map_err(|e| record_error(writer.committed(), e))?;
+                                        let input = ModelInput {
+                                            context: &context,
+                                            settings: &self.settings.assistant_model_settings,
+                                            selection: &selection,
+                                            view: view.as_ref(),
+                                            native: &native,
+                                            review_subject: None,
+                                        };
+                                        ModelClient::<AssistantMessage>::invoke(
+                                            &self.model_client,
+                                            input,
+                                            &mut Recorder {
+                                                writer: &mut *writer,
+                                                invocation,
+                                            },
+                                        )
+                                        .map_err(
+                                            |source| {
+                                                error(
+                                                    Some(writer.committed()),
+                                                    AgentErrorKind::Store {
+                                                        at: Checkpoint::PreparedInvocation,
+                                                        source,
+                                                    },
+                                                )
+                                            },
+                                        )?
+                                    }
                                 }
                             }
                         }
-                        entry
-                            .session
-                            .record_assistant(turn, output)
-                            .map_err(AgentErrorKind::RejectedOutput)?;
-                        entry.continuation = continuation;
-                        Ok(())
-                    })();
-                    if let Err(kind) = accepted {
-                        return Err(entry.close_error(&self.session_store, turn, kind));
+                    };
+                    let next = writer
+                        .committed()
+                        .accept_assistant(invocation, &observed, &advertised)
+                        .map_err(|e| record_error(writer.committed(), e))?;
+                    commit(&mut *writer, next, Checkpoint::AcceptedAssistant)?;
+                    if let Some(kind) = context_error
+                        .map(|source| AgentErrorKind::Context {
+                            role: ModelRole::Assistant,
+                            source,
+                        })
+                        .or_else(|| generation_error(&observed.generation, ModelRole::Assistant))
+                    {
+                        return Err(error(Some(writer.committed()), kind));
                     }
-                    entry.save(&self.session_store, Checkpoint::AcceptedAssistant)?;
+                    if let InvocationState::Finished {
+                        outcome: RecordedOutcome::OutputRejected { reason },
+                        ..
+                    } = &writer.committed().invocations().last().unwrap().state
+                    {
+                        return Err(error(
+                            Some(writer.committed()),
+                            AgentErrorKind::OutputRejected {
+                                reason: reason.clone(),
+                            },
+                        ));
+                    }
                 }
-                NextAction::Execute(call_id) => {
-                    let call = match entry.session.start_tool(turn, &call_id) {
-                        Ok(call) => call.clone(),
+                NextAction::Execute(native) => {
+                    let address = writer.committed().session().call_address(native).unwrap();
+                    let next = writer
+                        .committed()
+                        .mutate_session(|s| s.start_tool(&address).map(|_| ()))
+                        .unwrap();
+                    commit(&mut *writer, next, Checkpoint::StartedTool)?;
+                    let call = writer
+                        .committed()
+                        .session()
+                        .active_turn()
+                        .unwrap()
+                        .steps()
+                        .last()
+                        .unwrap()
+                        .executions()
+                        .find(|e| e.call().id() == &address.native)
+                        .unwrap()
+                        .call()
+                        .clone();
+                    let requested = RequestedModel {
+                        route: ModelClient::<Decision>::route(&self.model_client),
+                        settings: self.settings.reviewer_model_settings.clone(),
+                    };
+                    let next = writer
+                        .committed()
+                        .plan(
+                            InvocationTarget::Reviewer {
+                                call: (&address).into(),
+                            },
+                            requested,
+                        )
+                        .map_err(|e| record_error(writer.committed(), e))?;
+                    commit(&mut *writer, next, Checkpoint::PlannedInvocation)?;
+                    let invocation = writer.committed().invocations().last().unwrap().id;
+                    let context = self.reviewer.context(writer.committed().session(), &call);
+                    let context_error = context.as_ref().err().cloned();
+                    let observed = match context {
                         Err(_) => {
-                            entry.state = RuntimeState::Blocked(Checkpoint::StartedTool);
-                            return Err(entry.error(AgentErrorKind::UnexpectedState));
+                            Observation::failed(ModelError::new(ModelErrorKind::InvalidSelection))
+                        }
+                        Ok(context) => {
+                            let subject = ReviewSubject {
+                                turn: writer.committed().session().active_turn().unwrap().clone(),
+                                address: address.clone(),
+                                candidate: call.clone(),
+                            };
+                            match selection_for(
+                                &*self.context_policy,
+                                writer.committed().session(),
+                                &context,
+                            ) {
+                                Err(e) => Observation::failed(e),
+                                Ok(selection) => ModelClient::<Decision>::invoke(
+                                    &self.model_client,
+                                    ModelInput {
+                                        context: &context,
+                                        settings: &self.settings.reviewer_model_settings,
+                                        selection: &selection,
+                                        view: None,
+                                        native: &[],
+                                        review_subject: Some(&subject),
+                                    },
+                                    &mut Recorder {
+                                        writer: &mut *writer,
+                                        invocation,
+                                    },
+                                )
+                                .map_err(|source| {
+                                    error(
+                                        Some(writer.committed()),
+                                        AgentErrorKind::Store {
+                                            at: Checkpoint::PreparedInvocation,
+                                            source,
+                                        },
+                                    )
+                                })?,
+                            }
                         }
                     };
-                    entry.save(&self.session_store, Checkpoint::StartedTool)?;
-                    let review = self
-                        .reviewer
-                        .context(&entry.session, &call)
-                        .map_err(|source| AgentErrorKind::Context {
-                            role: ModelRole::Reviewer,
-                            source,
-                        });
-                    let decision =
-                        review.and_then(|context| {
-                            match ModelClient::<Decision>::generate(
-                                &self.model_client,
-                                &context,
-                                &self.settings.reviewer_model_settings,
-                                None,
-                            ) {
-                                Ok(Generation::Complete { output, .. }) => Ok(output),
-                                other => Err(generation_error(other, ModelRole::Reviewer)),
-                            }
-                        });
-                    let decision = match decision {
-                        Ok(decision) => decision,
-                        Err(kind) => {
-                            entry.state = RuntimeState::Blocked(Checkpoint::StartedTool);
-                            return Err(entry.error(kind));
-                        }
+                    let next = writer
+                        .committed()
+                        .accept_review(invocation, &observed)
+                        .map_err(|e| record_error(writer.committed(), e))?;
+                    commit(&mut *writer, next, Checkpoint::AcceptedReview)?;
+                    let Generation::Complete { output: decision } = observed.generation else {
+                        return Err(error(
+                            Some(writer.committed()),
+                            AgentErrorKind::ReviewFailure {
+                                invocation,
+                                source: Box::new(
+                                    context_error
+                                        .map(|source| AgentErrorKind::Context {
+                                            role: ModelRole::Reviewer,
+                                            source,
+                                        })
+                                        .or_else(|| {
+                                            generation_error(
+                                                &observed.generation,
+                                                ModelRole::Reviewer,
+                                            )
+                                        })
+                                        .expect("nondecision generation"),
+                                ),
+                            },
+                        ));
                     };
                     let outcome = if decision.should_allow() {
                         self.tools
                             .get(call.name())
-                            .expect("accepted registered call")
+                            .expect("accepted advertised tool")
                             .1
                             .execute(call.arguments())
                     } else {
-                        let reason = decision
-                            .reason()
-                            .map(NonEmptyText::as_str)
-                            .unwrap_or("Review denied the call without providing a reason.");
                         ToolOutcome::Failure(ToolError::new(
                             NonEmptyText::new(format!(
-                                "Not executed: tool call denied by review. Reason: {reason}"
+                                "Not executed: tool call denied by review. Reason: {}",
+                                decision
+                                    .reason()
+                                    .map(NonEmptyText::as_str)
+                                    .unwrap_or("No reason provided")
                             ))
                             .unwrap(),
                         ))
                     };
-                    if entry
-                        .session
-                        .record_tool_result(turn, ToolResult::new(call_id, outcome))
-                        .is_err()
-                    {
-                        entry.state = RuntimeState::Blocked(Checkpoint::ReturnedTool);
-                        return Err(entry.error(AgentErrorKind::UnexpectedState));
-                    }
-                    entry.save(&self.session_store, Checkpoint::ReturnedTool)?;
+                    let next = writer
+                        .committed()
+                        .mutate_session(|s| s.record_tool_result(&address, outcome))
+                        .unwrap();
+                    commit(&mut *writer, next, Checkpoint::ReturnedTool)?;
                 }
                 NextAction::AwaitUser => {
-                    return Ok(entry
-                        .session
+                    return Ok(writer
+                        .committed()
+                        .session()
                         .turns()
                         .last()
-                        .expect("completed current turn")
+                        .unwrap()
                         .messages());
                 }
                 NextAction::AwaitTool => {
-                    entry.state = RuntimeState::Blocked(Checkpoint::StartedTool);
-                    return Err(entry.error(AgentErrorKind::UnexpectedState));
+                    return Err(error(
+                        Some(writer.committed()),
+                        AgentErrorKind::UnexpectedState,
+                    ));
                 }
             }
         }
     }
 }
-
-fn generation_error<O>(
-    generation: Result<Generation<O>, ModelError>,
-    role: ModelRole,
-) -> AgentErrorKind {
+fn recover(writer: &mut dyn SessionWriter) -> Result<(), AgentError> {
+    if let Some(next) = writer
+        .committed()
+        .recover()
+        .map_err(|e| record_error(writer.committed(), e))?
+    {
+        commit(writer, next, Checkpoint::Recovery)?;
+    }
+    Ok(())
+}
+fn selection_for<O>(
+    policy: &dyn ContextPolicy,
+    session: &Session,
+    context: &Context<O>,
+) -> Result<ContextSelection, ModelError> {
+    let mut selection = policy.select(session);
+    let required = RecentContextPolicy::default()
+        .select(session)
+        .mandatory_turns;
+    if required
+        .iter()
+        .any(|id| !selection.closed_turns.contains(id))
+    {
+        return Err(ModelError::new(ModelErrorKind::InvalidSelection));
+    }
+    for id in required {
+        if !selection.mandatory_turns.contains(&id) {
+            selection.mandatory_turns.push(id);
+        }
+    }
+    let closed = session
+        .closed_context_exchanges()
+        .map_err(|_| ModelError::new(ModelErrorKind::InvalidSelection))?;
+    if selection
+        .closed_turns
+        .iter()
+        .any(|id| !closed.iter().any(|e| e.turn_id() == *id))
+        || context
+            .exchanges()
+            .iter()
+            .any(|e| e.outcome().is_some() && !closed.contains(e))
+    {
+        return Err(ModelError::new(ModelErrorKind::InvalidSelection));
+    }
+    let available: Vec<_> = context
+        .exchanges()
+        .iter()
+        .filter(|e| e.outcome().is_some())
+        .map(|e| e.turn_id())
+        .collect();
+    if selection
+        .mandatory_turns
+        .iter()
+        .any(|id| !available.contains(id))
+        || available
+            .iter()
+            .any(|id| !session.turns().iter().any(|t| t.id() == *id))
+    {
+        return Err(ModelError::new(ModelErrorKind::InvalidSelection));
+    }
+    selection.closed_turns.retain(|id| available.contains(id));
+    Ok(selection)
+}
+fn generation_error<O>(generation: &Generation<O>, role: ModelRole) -> Option<AgentErrorKind> {
     match generation {
-        Err(source) => AgentErrorKind::Model { role, source },
-        Ok(Generation::Refused { reason }) => AgentErrorKind::Refused { role, reason },
-        Ok(Generation::Incomplete { reason }) => AgentErrorKind::Incomplete { role, reason },
-        Ok(Generation::Complete { .. }) => unreachable!("complete output handled by caller"),
+        Generation::Failed(source) => Some(AgentErrorKind::Model {
+            role,
+            source: source.clone(),
+        }),
+        Generation::Refused { reason } => Some(AgentErrorKind::Refused {
+            role,
+            reason: reason.clone(),
+        }),
+        Generation::Incomplete { reason } => Some(AgentErrorKind::Incomplete {
+            role,
+            reason: *reason,
+        }),
+        Generation::Complete { .. } => None,
     }
 }
-
 #[derive(Debug)]
 pub struct AgentError {
     kind: AgentErrorKind,
@@ -395,7 +579,7 @@ impl AgentError {
     pub fn kind(&self) -> &AgentErrorKind {
         &self.kind
     }
-    /// Actual resident facts. This does not assert that the latest save succeeded.
+    /// Last confirmed committed facts. A failed publication may have changed disk state.
     pub fn progress(&self) -> Option<&Session> {
         self.progress.as_deref()
     }
@@ -413,19 +597,25 @@ impl Error for AgentError {
 
 #[derive(Debug)]
 pub enum AgentErrorKind {
+    Record(RecordError),
+    ReviewBlocked {
+        invocation: u64,
+    },
+    ReviewFailure {
+        invocation: u64,
+        source: Box<AgentErrorKind>,
+    },
     DuplicateTool(ToolName),
-    CatalogMismatch(ToolName),
-    UnknownTool(ToolCall),
-    Store {
-        at: Checkpoint,
-        source: SessionStoreError,
-    },
-    Blocked {
-        at: Checkpoint,
-    },
     Context {
         role: ModelRole,
         source: ContextError,
+    },
+    OutputRejected {
+        reason: String,
+    },
+    Store {
+        at: Checkpoint,
+        source: SessionStoreError,
     },
     Model {
         role: ModelRole,
@@ -446,13 +636,20 @@ pub enum AgentErrorKind {
 impl fmt::Display for AgentErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Record(source) => write!(f, "{source}"),
+            Self::ReviewFailure { invocation, source } => write!(
+                f,
+                "{source}; review invocation {invocation} requires acknowledgement"
+            ),
+            Self::ReviewBlocked { invocation } => write!(
+                f,
+                "review failure requires acknowledgement for invocation {invocation}"
+            ),
             Self::DuplicateTool(name) => write!(f, "duplicate tool {name}"),
-            Self::CatalogMismatch(name) => write!(f, "catalog mismatch for {name}"),
-            Self::UnknownTool(call) => write!(f, "unadvertised tool {}", call.name()),
             Self::Store { at, source } => write!(f, "agent save/load at {at:?}: {source}"),
-            Self::Blocked { at } => write!(f, "agent session blocked at {at:?}"),
-            Self::Context { role, source } => write!(f, "{role:?} context: {source}"),
             Self::Model { role, source } => write!(f, "{role:?}: {source}"),
+            Self::Context { role, source } => write!(f, "{role:?} context: {source}"),
+            Self::OutputRejected { reason } => write!(f, "model output rejected: {reason}"),
             Self::Refused { role, .. } => write!(f, "{role:?} refused generation"),
             Self::Incomplete { role, reason } => {
                 write!(f, "{role:?} incomplete generation ({reason:?})")
@@ -466,9 +663,10 @@ impl fmt::Display for AgentErrorKind {
 impl Error for AgentErrorKind {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::ReviewFailure { source, .. } => Some(source),
             Self::Store { source, .. } => Some(source),
-            Self::Context { source, .. } => Some(source),
             Self::Model { source, .. } => Some(source),
+            Self::Context { source, .. } => Some(source),
             Self::RejectedOutput(source) => Some(source),
             _ => None,
         }
@@ -482,6 +680,12 @@ pub enum ModelRole {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Checkpoint {
+    Recovery,
+    PlannedInvocation,
+    PreparedInvocation,
+    AcceptedReview,
+    ReviewAcknowledgement,
+    EffectResolution,
     NewSession,
     ListSessions,
     LoadSession,

@@ -1,42 +1,27 @@
 # Provider adapters
 
-Rust callers use OpenAI or Anthropic clients to generate assistant output and
-review decisions, retain continuation, and receive typed safe errors.
+Run the provider group after Launch and Doctor:
 
-## Sub-features
+```bash
+"$COLA_VERIFY_ADAPTERS" models:: --nocapture --test-threads=1
+```
 
-- `provider-wire` sends native paths, headers, schemas, settings, and tool catalogs.
-- `provider-output` decodes checked answers, tool calls, decisions, refusals, and incomplete responses.
-- `provider-history` preserves correlations, notices, and continuation across requests.
-- `provider-binding` rejects changed or incomplete history before HTTP.
-- `provider-errors` bounds reads and deadlines, rejects redirects, and redacts diagnostics.
+Set `COLA_VERIFY_FEATURE=provider-adapters`. These tests drive `OpenAIClient` and
+`AnthropicClient` through `AgentService`, with real HTTP capture and durable
+recorders. They require loopback TCP and use dummy credentials.
 
-## How to get to it (user POV)
+- `native_chains_preserve_ids_and_raw_evidence_while_new_turns_quote_history` recreates the service and compares archived exact request bytes with bytes received over HTTP.
+- `multiple_native_steps_append_exact_responses_and_correlated_results` checks all accepted native blocks through three tool steps.
+- `repeated_ids_within_one_native_chain_are_adapter_rejections` checks conservative request-level uniqueness independently of domain scope.
+- `every_effort_native_schema_and_auth_header_remain_provider_specific` checks headers, routes, settings, and unchanged tool schemas.
+- `reviewer_schema_has_no_callable_tools_and_invalid_decisions_block` checks the strict decision schema and malformed decisions.
+- `http_failures_are_audited_without_retry_and_do_not_leak_to_errors` checks status mapping, raw archive evidence, and safe errors.
+- `deadline_bounded_capture_malformed_json_and_connection_errors_are_safe` checks response deadlines, partial capture, malformed JSON, and bounded chunked reads.
+- `redirects_are_never_followed` checks that credentials cannot reach a redirect destination.
+- `corrupt_invocation_associations_and_frozen_views_fail_read_validation` and `archive_rejects_a_successful_return_after_a_denied_review` keep raw archive mutation at the adapter boundary; public record lifecycle assertions live in `tests/app/session_record.rs`.
+- The remaining decode and provider-specific cases check refusal, incomplete output, unknown native blocks, invalid calls, actual-model metadata, and usage capture.
 
-Construct `cola::adapters::models::ClientConfig`, then `OpenAIClient` or
-`AnthropicClient`. Call `cola::app::ModelClient::generate` for either
-`AssistantMessage` or `Decision`. Carry the returned continuation with its
-accepted session history. Both clients can also be supplied to `AgentService`.
-
-## Driving it with the Rust test runner
-
-Preconditions:
-
-- Launch and Doctor pass. Set `COLA_VERIFY_FEATURE=provider-adapters`.
-- Loopback TCP bind is available. Fixtures supply dummy secrets and native payloads.
-
-Run `"$COLA_VERIFY_ADAPTERS" models:: --nocapture --test-threads=1` in the capture block.
-Cases live in `tests/adapters/models/client.rs`, `openai.rs`, and `anthropic.rs`.
-
-- Generate requests through `client::paths_headers_native_schemas_effort_and_defaults` and `client::decision_uses_fixed_strict_native_schema_and_no_callable_tools`. Inspect captured HTTP requests and typed outputs.
-- Decode native optional metadata, stops, refusals, malformed calls, and invalid decisions through the `openai::`, `anthropic::`, and `client::` cases. Partial executable output must never escape rejected responses.
-- Continue generations and completed turns through `client::cumulative_native_replay_survives_four_generations_and_completed_turns` and the receipt-binding cases. Captured request history proves replay and correlation.
-- Change history, endpoint, or provider through `client::model_endpoint_provider_history_and_receipt_binding_fail_without_network`. The fixture's captured request count proves rejection occurs before HTTP.
-- Exercise statuses, redirects, timeouts, and bounded reads through the corresponding `client::` cases. Assert typed causes, no automatic retries, and redacted diagnostics.
-
-## Gotchas
-
-- This is local HTTP compatibility proof. Live authentication, current provider schemas, quotas, and model availability remain unverified.
-- Adapter tests manipulate accepted history through public domain operations. They do not prove service review ordering. Use the agent chat map too.
-- Continuations are bound to exact accepted history. A JSONL reload does not recreate one.
-- Timing cases test limits, not performance. Report failures with the exact assertion before interpreting a slow host.
+These are local protocol fixtures. They do not prove current live schemas,
+authentication, quotas, or token capacities. Timing assertions are deadline tests,
+not performance benchmarks. Full-body byte limits apply before every request;
+they do not infer an arbitrary model's token window.

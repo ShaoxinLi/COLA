@@ -134,6 +134,7 @@ pub(super) struct FailureDto {
     code: &'static str,
     message: &'static str,
     role: Option<ModelRoleDto>,
+    invocation_id: Option<u64>,
     progress: Option<SessionDto>,
     durability: DurabilityDto,
 }
@@ -155,6 +156,7 @@ pub(super) enum FailureClass {
     NotFound,
     Blocked,
     Refused,
+    ContextSelection,
     IterationLimit,
     Incomplete,
     Timeout,
@@ -291,7 +293,14 @@ pub(super) struct ClassifiedFailure {
     pub dto: FailureDto,
 }
 pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
-    let (class, code, message, role) = match error.kind() {
+    let (kind, invocation_id) = match error.kind() {
+        AgentErrorKind::ReviewFailure { invocation, source } => {
+            (source.as_ref(), Some(*invocation))
+        }
+        AgentErrorKind::ReviewBlocked { invocation } => (error.kind(), Some(*invocation)),
+        _ => (error.kind(), None),
+    };
+    let (class, code, message, role) = match kind {
         AgentErrorKind::Store {
             at: Checkpoint::LoadSession,
             source,
@@ -301,16 +310,36 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             "Session not found",
             None,
         ),
+        AgentErrorKind::Store { source, .. } if source.kind() == SessionStoreErrorKind::Busy => (
+            FailureClass::Blocked,
+            "session_busy",
+            "Session is busy",
+            None,
+        ),
+        AgentErrorKind::Record(
+            RecordError::NoReviewFailure | RecordError::ConflictingAcknowledgement,
+        ) => (
+            FailureClass::Blocked,
+            "acknowledgement_conflict",
+            "Review failure acknowledgement conflicts or is not pending",
+            None,
+        ),
+        AgentErrorKind::Record(_) | AgentErrorKind::ReviewFailure { .. } => (
+            FailureClass::Internal,
+            "invalid_document",
+            "Invalid session document",
+            None,
+        ),
+        AgentErrorKind::ReviewBlocked { .. } => (
+            FailureClass::Blocked,
+            "review_failure",
+            "Review failure requires acknowledgement",
+            Some(ModelRole::Reviewer),
+        ),
         AgentErrorKind::Store { .. } => (
             FailureClass::Store,
             "store_failure",
             "Session storage failed",
-            None,
-        ),
-        AgentErrorKind::Blocked { .. } => (
-            FailureClass::Blocked,
-            "session_blocked",
-            "Session is blocked",
             None,
         ),
         AgentErrorKind::Refused { role, .. } => (
@@ -326,7 +355,28 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             Some(*role),
         ),
         AgentErrorKind::Model { role, source } => {
-            if source.kind() == ModelErrorKind::Timeout {
+            if source.kind() == ModelErrorKind::ContextSelectionTooLarge {
+                (
+                    FailureClass::ContextSelection,
+                    "context_selection_too_large",
+                    "Required context exceeds the request budget",
+                    Some(*role),
+                )
+            } else if source.kind() == ModelErrorKind::InvalidSelection {
+                (
+                    FailureClass::Internal,
+                    "invalid_context_selection",
+                    "Context selection does not preserve required facts",
+                    Some(*role),
+                )
+            } else if source.kind() == ModelErrorKind::InvalidToolCatalog {
+                (
+                    FailureClass::Internal,
+                    "catalog_mismatch",
+                    "Advertised tools do not match the registered catalog",
+                    Some(*role),
+                )
+            } else if source.kind() == ModelErrorKind::Timeout {
                 (
                     FailureClass::Timeout,
                     "model_timeout",
@@ -342,6 +392,18 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
                 )
             }
         }
+        AgentErrorKind::Context { role, .. } => (
+            FailureClass::Internal,
+            "invalid_context",
+            "Role context could not be assembled",
+            Some(*role),
+        ),
+        AgentErrorKind::OutputRejected { .. } => (
+            FailureClass::Model,
+            "output_rejected",
+            "Model output violates the advertised catalog or session transition",
+            Some(ModelRole::Assistant),
+        ),
         AgentErrorKind::IterationLimit => (
             FailureClass::IterationLimit,
             "iteration_limit",
@@ -353,24 +415,6 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
             "duplicate_tool",
             "Duplicate tool registration",
             None,
-        ),
-        AgentErrorKind::CatalogMismatch(_) => (
-            FailureClass::Internal,
-            "catalog_mismatch",
-            "Tool catalog mismatch",
-            None,
-        ),
-        AgentErrorKind::UnknownTool(_) => (
-            FailureClass::Internal,
-            "unknown_tool",
-            "Assistant requested an unknown tool",
-            None,
-        ),
-        AgentErrorKind::Context { role, .. } => (
-            FailureClass::Internal,
-            "context_failure",
-            "Context assembly failed",
-            Some(*role),
         ),
         AgentErrorKind::RejectedOutput(_) => (
             FailureClass::Internal,
@@ -390,6 +434,7 @@ pub(super) fn classify(error: &AgentError) -> ClassifiedFailure {
         dto: FailureDto {
             code,
             message,
+            invocation_id,
             role: role.map(|r| match r {
                 ModelRole::Assistant => ModelRoleDto::Assistant,
                 ModelRole::Reviewer => ModelRoleDto::Reviewer,
@@ -404,6 +449,7 @@ pub(super) fn input_failure(code: &'static str, message: &'static str) -> Failur
         code,
         message,
         role: None,
+        invocation_id: None,
         progress: None,
         durability: DurabilityDto::Unconfirmed,
     }

@@ -9,29 +9,14 @@ pub(super) fn request(
     settings: &ModelSettings,
     effort: Option<&str>,
     kind: OutputKind,
-    events: Vec<Event<'_>>,
+    events: Vec<Event>,
 ) -> Value {
     let decision = kind == OutputKind::Decision;
     let mut input = Vec::new();
-    if decision {
-        for text in client::review_history(snapshot) {
-            input.push(json!({"role":"user","content":text}));
-        }
-    } else {
-        for event in events {
-            match event {
-                Event::User(text) | Event::Fact(text) => {
-                    input.push(json!({"role": "user", "content": text}));
-                }
-                Event::Answer(text) => {
-                    input.push(json!({"role": "assistant", "content": text.as_str()}));
-                }
-                Event::Native(raw) => input.extend(raw.iter().cloned()),
-                Event::Result(id, result) => input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": id,
-                    "output": client::outcome(result.outcome()).to_string(),
-                })),
+    for event in events {
+        match event {
+            Event::User(text) | Event::Fact(text) => {
+                input.push(json!({"role": "user", "content": text}));
             }
         }
     }
@@ -166,12 +151,14 @@ impl std::fmt::Debug for OpenAIClient {
     }
 }
 impl<O: super::client::Output> crate::app::ModelClient<O> for OpenAIClient {
-    fn generate(
+    fn route(&self) -> String {
+        self.0.route()
+    }
+    fn invoke(
         &self,
-        context: &crate::domain::Context<O>,
-        settings: &ModelSettings,
-        continuation: Option<&crate::app::Continuation<O>>,
-    ) -> Result<crate::app::Generation<O>, ModelError> {
-        self.0.generate(context, settings, continuation)
+        input: crate::app::ModelInput<'_, O>,
+        recorder: &mut dyn crate::app::BeforeModelSend,
+    ) -> Result<crate::app::Observation<O>, crate::app::SessionStoreError> {
+        self.0.invoke(input, recorder)
     }
 }

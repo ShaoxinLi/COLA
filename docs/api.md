@@ -34,6 +34,12 @@ the following fields. Unknown and duplicate fields are rejected.
 | `timeout_ms` | Positive request timeout in milliseconds. Default `120000`. |
 | `max_response_bytes` | Positive response-body limit. Default `8388608`. |
 | `max_iterations` | Positive assistant generation limit per turn. Default `16`. |
+| `context.optional_turns` | Optional closed-turn quota, including zero. Default `8`. |
+| `context.max_request_bytes` | Positive cap on the complete request, also enforced during native-chain growth. Default `65536`. |
+
+The optional `context` object configures both assistant and reviewer request
+fitting. Set its byte cap for the capacity of the configured models. It is not an
+exact token estimator. Unknown context fields and a zero byte cap are rejected.
 
 Each role has these fields:
 
@@ -55,7 +61,7 @@ Relative configuration, tool, and store paths resolve against the process's
 initial working directory. The location of the JSON file does not change that
 base. Startup never changes the process working directory. Tool definitions
 come from one registration list and supply both model catalogs. The assistant
-receives full projected history. The reviewer receives closed history and an
+receives selected projected history. The reviewer receives closed history and an
 explicit description of the active turn and exact candidate call.
 
 | Process exit | Meaning |
@@ -66,10 +72,9 @@ explicit description of the active turn and exact candidate call.
 
 CLI invalid input takes precedence over an earlier service failure. HTTP
 service failures use the response statuses below and leave the server running.
-The executable preserves the adapters' runtime limits, including memory-only
-native continuations. Stored sessions with tool history cannot transparently
-resume after restart. One process owns each store root; startup adds no
-cross-process locking or graceful-shutdown protocol.
+The executable continues closed sessions from durable documents after restart.
+Each write command holds a cross-process OS lock for its session. Abandoned
+active turns close as `ProcessLost`; they are never resumed automatically.
 
 ## Library entry points
 
@@ -232,8 +237,8 @@ Both contain the same error object:
 
 `code` and `message` are fixed diagnostics. They exclude underlying provider and
 storage error text. `role` is `assistant`, `reviewer`, or `null`.
-`progress` is a session snapshot or `null`. The snapshot can contain changes
-that failed to save. `durability` is always `"unconfirmed"` and does not prove
+`progress` is a session snapshot or `null`. The snapshot contains the last confirmed committed working copy.
+An uncertain publication can leave a newer revision on disk. `durability` is always `"unconfirmed"` and does not prove
 that the last save succeeded. An error does not imply that a tool had no effect.
 
 | HTTP status | Error code |
@@ -241,12 +246,12 @@ that the last save succeeded. An error does not imply that a tool had no effect.
 | `400` | `invalid_input` |
 | `404` | `route_not_found`, `session_not_found` |
 | `405` | `method_not_allowed`, with an `Allow` header |
-| `409` | `session_blocked` |
+| `409` | `session_busy`, `review_failure`, `acknowledgement_conflict` |
 | `413` | `body_too_large` |
 | `415` | `unsupported_media_type` |
-| `422` | `generation_refused`, `iteration_limit` |
-| `500` | `store_failure`, `context_failure`, `catalog_mismatch`, `unknown_tool`, `rejected_output`, `unexpected_state`, `duplicate_tool`, `internal_failure` |
-| `502` | `generation_incomplete`, `model_failure` |
+| `422` | `generation_refused`, `iteration_limit`, `context_selection_too_large` |
+| `500` | `store_failure`, `invalid_document`, `invalid_context_selection`, `invalid_context`, `catalog_mismatch`, `rejected_output`, `unexpected_state`, `duplicate_tool`, `internal_failure` |
+| `502` | `generation_incomplete`, `model_failure`, `output_rejected` |
 | `504` | `model_timeout` |
 
 CLI input failures use `invalid_input`. Service failures use the corresponding
@@ -263,6 +268,21 @@ not retry that turn.
 
 The web server supports HTTP/1.1 over plain TCP. It has no TLS, authentication,
 connection cap, request deadline, or bounded shutdown.
-Native model continuations remain in memory. Stored session facts do
-not restore every continuation after restart. See
-[service lifetime and restart limits](agent-service.md#lifetime-and-restart-limits).
+Stored model audit and frozen views replace in-memory continuation tokens.
+See [recovery and review failures](agent-service.md#recovery-and-review-failures).
+
+## Review failure acknowledgement
+
+`/ack-review-failure <invocation_id> <evidence>` acts on the CLI's selected session.
+It returns `review_failure_acknowledged` with `session_id` and `invocation_id`.
+
+`POST /sessions/{session_id}/review-failure-acknowledgements` accepts a JSON object
+with a positive `invocation_id` and nonblank `evidence`. Successful and identical
+retries return 200. A conflicting or nonpending invocation returns 409. Invalid
+input returns 400. Both entry points record no actor identity.
+
+The first reviewer failure keeps its original failure code and includes
+`invocation_id`. Subsequent blocked chats return `review_failure` and that ID.
+Acknowledgement closes a still-active failed turn with its original cause, or
+preserves its existing `ProcessLost` outcome. It performs no tool or model I/O,
+creates no execution result, and does not resolve unknown effects.

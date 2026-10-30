@@ -18,4 +18,4 @@ pub use roles::{Assistant, Decision, ToolCallReviewer};
 pub use tool::{
     InputSchema, Tool, ToolCall, ToolCalls, ToolDefinition, ToolError, ToolOutcome, ToolResult,
 };
-pub use value::{NonEmptyText, SessionId, ToolCallId, ToolName, TurnId, ValueError};
+pub use value::{CallAddress, NonEmptyText, SessionId, ToolCallId, ToolName, TurnId, ValueError};

@@ -1,132 +1,93 @@
 # Model clients
 
-The application defines synchronous model generation. Adapters implement it for
-OpenAI Responses and Anthropic Messages. The caller owns context assembly,
-session transitions, tool execution, and acceptance of continuations.
+`OpenAIClient` implements the Responses protocol. `AnthropicClient` implements
+the Messages protocol. Both implement the typed application port
+`ModelClient<AssistantMessage>` and `ModelClient<Decision>`.
 
-## Application contracts
+## Invocation contract
 
-[`ModelClient<O>`](../src/app/model_client.rs) defines object-safe
-`generate(context, settings, continuation)`. The output type `O` associates the
-context, client, and continuation. `ModelSettings` contains a nonblank `ModelId`,
-an `Effort`, and nonzero `max_output_tokens`. Model IDs preserve their contents
-and redact `Debug` output.
+`ModelClient::route()` returns a nonsecret route identity. `invoke(input, recorder)`
+hides request compilation, protocol checks, fitting, preparation persistence,
+HTTP, response capture, and typed decoding. Supply clients to `AgentService` to
+obtain the application-owned recorder and durable workflow.
 
-`Generation::Complete` returns checked output and an optional replacement
-`Continuation<O>`. `Refused` carries an optional nonblank reason. `Incomplete`
-carries `OutputLimit` or `Other`. Neither stopped outcome exposes partial output.
+`ModelInput<O>` carries checked semantic context, model settings, selection
+policy, an optional frozen turn view, and accepted native steps read from the
+[session record](session_record.md). Each native step includes its archived response and actual results.
+Reviewer inputs carry a mandatory `ReviewSubject` with the full active turn,
+candidate call, and exact address. They contain no assistant native steps.
 
-A continuation is opaque, immutable, cloneable native model history. The caller
-accepts the exact returned output into `Session` before publishing the replacement token.
-Errors, refusals, incomplete responses, and rejected output leave the previous
-token available for reuse. The port defines no token serialization or recovery.
+Before network I/O, a client must call `BeforeModelSend::persist` with the exact
+request bytes and, for the first assistant invocation, its new `TurnView`.
+Only a successful commit returns `SendPermit`, which owns the committed request
+artifact. Transport consumes the permit and sends its bytes. Persistence errors
+escape the invocation immediately. They are not model failures and must not
+trigger HTTP.
 
-`ModelError::kind()` and `http_status()` expose a fixed error category and optional
-numeric status. Diagnostics exclude provider messages, URLs, credentials,
-request bodies, and underlying error sources.
+`Observation<O>` contains `Generation<O>` and independent `ResponseEvidence`.
+Generation is complete, refused, incomplete, or failed. Preparation failures
+have no response and are distinguished in the committed lifecycle. The evidence
+retains response bytes, returned model identity when present, response ID,
+status, usage, capture completeness, and timing. Missing actual model identity
+stays unknown rather than copying the requested model.
 
-## Adapter implementations
+The application accepts output and evidence in one record revision. A complete
+response that violates the advertised catalog or domain transition becomes an
+audited `OutputRejected` with a reason and no executable step.
 
-`cola::adapters::models` exports `OpenAIClient`, `AnthropicClient`, and
-`ClientConfig`. Both clients support `AssistantMessage` and `Decision` outputs.
-Provider request rendering and response decoding live in
-[`openai.rs`](../src/adapters/models/openai.rs) and
-[`anthropic.rs`](../src/adapters/models/anthropic.rs).
-[`client.rs`](../src/adapters/models/client.rs) owns shared transport, checked
-output conversion, native call correlation, replay, and history rendering.
+## Connection and response boundaries
 
-### Configuration and transport
+`ClientConfig::new` takes a base URL, credential, total timeout, and maximum
+response bytes. Base URLs allow HTTP or HTTPS without userinfo, query, or
+fragment. Clients append `responses` or `messages`. Authentication is sent only
+in headers. Headers and credentials are never included in `ModelArtifact`.
+Redirects, retries, and environment proxies are disabled.
 
-`ClientConfig::new(base_url, api_key, timeout, max_response_bytes)` validates
-explicit connection settings. Both client constructors accept this configuration.
+Responses are captured up to the configured byte limit, including non-success
+HTTP bodies. Truncated and interrupted reads are marked partial. A transport
+failure before a response is marked not returned. Safe `ModelError` values expose
+a kind and optional HTTP status without raw provider bodies, URLs, or credentials.
 
-The base URL requires HTTP or HTTPS and a host. User information, queries, and
-fragments are rejected. The key must be nonblank and valid as an HTTP header.
-Timeouts must be positive and fit in `u64` milliseconds. The byte cap is a
-`NonZeroUsize` other than `usize::MAX`.
+Requests preserve arbitrary nonblank model IDs and explicit effort/output limits.
+Native tool schemas retain the caller's JSON Schema fields. Review requests use
+a strict decision schema with `should_allow` and nullable nonblank `reason`.
+They contain descriptive tool catalogs, not callable tools. Adapters render the
+mandatory subject and optional history as labelled user-role data. Current user
+text and tool results never enter system instructions.
 
-Base paths are retained. Keys appear only in authentication headers. Client
-`Debug` output is redacted. Redirects, retries, and environment proxies are
-disabled. The deadline covers the whole HTTP exchange. Body reads enforce the
-byte cap before JSON decoding, including chunked responses.
+Unknown native item types, malformed calls, invalid decisions, and incomplete
+responses fail closed. Raw evidence remains in the archive. A refusal or partial
+response never creates executable tool calls.
 
-Non-success responses retain their HTTP status. Status `400` maps to
-`InvalidSettings`, `401` and `403` to `Authentication`, `429` to `RateLimited`,
-and `500` through `599` to `ProviderFailure`. Other failures map to `Http`.
+## Native history
 
-### Provider requests
+Native tool IDs are preserved verbatim. Domain uniqueness applies only inside a
+response batch. Both adapters conservatively reject repeated call IDs within the
+current native request chain. OpenAI also checks output-item IDs separately.
+This is an adapter compatibility policy, not a universal provider/domain rule.
 
-Requests preserve model IDs, efforts, output limits, and schemas without
-capability inference or normalization. Provider rejection returns a typed error.
+Each completed turn becomes quoted semantic history for the next turn. Old
+native reasoning and tool associations remain archived but are not replayed
+across turn boundaries. Historical requested model names, usage, and timings are
+audit only.
 
-| Setting | OpenAI | Anthropic |
-| --- | --- | --- |
-| Route appended to the base path | `/responses` | `/messages` |
-| Authentication | `Authorization: Bearer ...` | `x-api-key`, with `anthropic-version: 2026-10-21` |
-| Output limit | `max_output_tokens` | `max_tokens` |
-| Assistant tools | Function schemas with `strict: false` | Tools with `input_schema` |
-| Decision format | Strict JSON schema in `text.format` | JSON schema in `output_config.format` |
-| Native history | `store: false` and encrypted reasoning requested | Returned thinking, signatures, and redacted thinking retained |
+Within a turn, the first request is the frozen prefix. Every subsequent request
+validates that semantic prefix, system, tools, route, model, and settings are
+unchanged. It appends exact accepted native blocks and correlated real results.
+Anthropic thinking signatures and OpenAI reasoning items remain intact.
+Missing or incompatible native evidence fails before HTTP.
 
-| `Effort` | OpenAI | Anthropic |
-| --- | --- | --- |
-| `Default` | Omit reasoning effort. | Omit effort and thinking. |
-| `Off` | Set `reasoning.effort` to `"none"`. | Set `thinking.type` to `"disabled"`. Omit effort. |
-| `Low`, `Medium`, `High`, `Xhigh`, `Max` | Exact lowercase `reasoning.effort`. | Exact lowercase `output_config.effort`. Omit thinking. |
+The complete request-byte cap also applies after native-chain growth. It does
+not trim native dependencies or tool output. See the
+[context policy limits](agent-service.md#context-policy-and-limits) for the
+model-token-capacity boundary.
 
-### Checked outputs
+## Previous live validation
 
-Assistant generation requires an active last exchange. Complete text becomes an
-answer. Calls become a nonempty batch with offered names and JSON object
-arguments. Native call IDs must be nonblank and unique across the continuation.
-Domain call IDs are fresh UUID-based values independent of native IDs.
-
-Decision requests contain descriptive history and a descriptive catalog without
-callable tools. Empty history receives a neutral user prompt. Output contains
-exactly `should_allow: boolean` and `reason: string | null`. String reasons must
-be nonblank. Complete decisions return no continuation.
-
-Completion metadata takes precedence over content. Refusals and incomplete
-responses expose no partial executable output. Anthropic's
-`model_context_window_exceeded` maps to `Incomplete(Other)`. Unknown native items
-return `UnsupportedResponse`. Malformed supported items return `MalformedResponse`.
-
-OpenAI reasoning and function calls allow omitted or null optional statuses.
-Function-call item IDs can also be omitted or null. An explicit pending or
-incomplete item status prevents complete output.
-
-### Native replay
-
-Every complete assistant response returns a cumulative replacement continuation,
-including final answers. Native items retain their original fields and replay
-once at their recorded positions.
-
-The token binds the provider, normalized endpoint, model ID, prior exchanges,
-messages, outcomes, notices, returned assistant message, and native call
-correlations. Instructions, catalog, effort, token limit, credentials, and
-transport limits can change. Existing history cannot change.
-
-Replay accepts the exact assistant output followed by ordered actual tool
-returns, or an accepted answer that completes its exchange. A complete batch
-can close as interrupted or failed with its exact closure notice. Later exchanges
-can add user input and closed turns without assistant output.
-
-Unaccepted output, changed or omitted history, partial native batches, and
-mismatched tokens fail before HTTP. Notices never become invented native returns.
-
-### Recovery and limits
-
-JSONL recovery does not restore native continuations. Retained tool-request
-messages without a token return `MissingContinuation`, even for closed complete
-batches. Closed partial batches projected entirely as notices can form a new
-factual baseline. Historical plain answers can also form a baseline without
-restoring native reasoning.
-
-Tokens have no durable format or hidden cache and can grow with conversation
-length. Clients provide no streaming, asynchronous calls, history fitting,
-model discovery, or agent loop. `AgentService` supplies the
-[application loop](agent-service.md).
-
-Local HTTP tests cover requests, output validation, replay, error redaction,
-deadlines, redirects, and byte caps. They do not establish live-provider
-acceptance of a model or schema.
+On 2026-10-29, a live run of the durable-session implementation used seven fresh
+CLI/Web processes against DeepSeek and Alibaba Cloud Bailian Responses endpoints.
+Its 15 calls completed with HTTP 200; four reviewed file reads retained their
+native IDs, and subsequent turns recalled four changing file values across model
+switches. This was a scoped compatibility check, not a reliability or quality
+evaluation. Anthropic coverage used local fixtures. Current automated verification
+requires no live credentials; this refactor makes no new live-provider claim.

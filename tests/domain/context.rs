@@ -85,10 +85,7 @@ fn context_rejects_orphans_bad_order_unresolved_batches_and_inconsistent_outcome
         Message::Assistant(batch(&["a"])),
         Message::Tool(result("a")),
     ];
-    assert_eq!(
-        ContextExchange::new(turn, duplicate, None),
-        Err(ContextError::DuplicateCallId(id("a")))
-    );
+    assert!(ContextExchange::new(turn, duplicate, None).is_ok());
 }
 
 #[test]
@@ -130,7 +127,7 @@ fn context_accepts_complete_exchanges_and_active_model_wait_with_unique_catalog(
 }
 
 #[test]
-fn context_rejects_duplicate_ids_across_exchanges_and_invalid_exchange_boundaries() {
+fn context_accepts_scoped_repeated_ids_but_rejects_invalid_exchange_boundaries() {
     let complete = |turn, call_id| {
         ContextExchange::new(
             TurnId::new(turn).unwrap(),
@@ -144,14 +141,14 @@ fn context_rejects_duplicate_ids_across_exchanges_and_invalid_exchange_boundarie
         )
         .unwrap()
     };
-    assert!(matches!(
+    assert!(
         Context::<AssistantMessage>::new(
             text("rules"),
             vec![complete(1, "a"), complete(2, "a")],
             vec![]
-        ),
-        Err(ContextError::DuplicateCallId(_))
-    ));
+        )
+        .is_ok()
+    );
     assert_eq!(
         Context::<AssistantMessage>::new(
             text("rules"),
@@ -176,10 +173,7 @@ fn context_rejects_duplicate_ids_across_exchanges_and_invalid_exchange_boundarie
         .unwrap();
     let mut exchanges = cancelled.context_exchanges().unwrap();
     exchanges.push(complete(2, "b"));
-    assert_eq!(
-        Context::<AssistantMessage>::new(text("rules"), exchanges, vec![]),
-        Err(ContextError::DuplicateCallId(id("b")))
-    );
+    assert!(Context::<AssistantMessage>::new(text("rules"), exchanges, vec![]).is_ok());
 }
 
 #[test]
@@ -188,14 +182,16 @@ fn closed_projection_retains_recovery_facts_while_an_active_batch_is_pending() {
     session.interrupt(closed, StopReason::ProcessLost).unwrap();
     let fact = resolution(ResolutionSource::Observation);
     session
-        .resolve_effect(closed, &id("b"), fact.clone())
+        .resolve_effect(&super::address(&session, closed, &id("b")), fact.clone())
         .unwrap();
     let expected = session.context_exchanges().unwrap();
     let active = session.start_turn(user("read another file")).unwrap();
     session
         .record_assistant(active, batch(&["pending"]))
         .unwrap();
-    session.start_tool(active, &id("pending")).unwrap();
+    session
+        .start_tool(&super::address(&session, active, &id("pending")))
+        .unwrap();
     let before = session.snapshot();
     let exchanges = session.closed_context_exchanges().unwrap();
     assert_eq!(exchanges, expected);
@@ -222,7 +218,10 @@ fn closed_projection_retains_recovery_facts_while_an_active_batch_is_pending() {
     );
     assert_eq!(session.snapshot(), before);
     session
-        .record_tool_result(active, result("pending"))
+        .record_tool_result(
+            &super::address(&session, active, (result("pending")).call_id()),
+            (result("pending")).outcome().clone(),
+        )
         .unwrap();
     let all = session.context_exchanges().unwrap();
     assert_eq!(&all[..1], exchanges.as_slice());

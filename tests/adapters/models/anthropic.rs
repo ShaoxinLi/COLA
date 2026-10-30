@@ -1,37 +1,19 @@
 use super::support::*;
-use cola::app::{Generation, IncompleteReason};
+use cola::app::*;
 use serde_json::json;
-
 #[test]
-fn anthropic_context_window_stop_never_returns_partial_output() {
-    let p = Provider::Anthropic;
-    let response = json!({
-        "stop_reason": "model_context_window_exceeded",
-        "content": [{"type":"tool_use","id":"partial","name":"lookup","input":{}}],
-    });
-    let server = Server::new(vec![response.clone().into(), response.into()]);
-    let assistant = p
-        .client(&server)
-        .generate(&context(&session()), &p.settings(), None)
-        .unwrap();
-    let reviewer = p
-        .reviewer(&server)
-        .generate(
-            &context::<cola::domain::Decision>(&session()),
-            &p.settings(),
-            None,
-        )
-        .unwrap();
+fn anthropic_context_window_stop_is_archived_without_partial_output() {
+    let server = Server::new(vec![
+        json!({"stop_reason":"model_context_window_exceeded","content":[]}).into(),
+    ]);
+    let root = tempfile::tempdir().unwrap();
+    let mut service = service(Provider::Anthropic, &server, root.path());
+    let id = service.new_session().unwrap().id().clone();
+    service.chat(&id, user("ask")).unwrap_err();
+    let doc = service.inspect_session(&id).unwrap();
     assert!(matches!(
-        assistant,
-        Generation::Incomplete {
-            reason: IncompleteReason::Other
-        }
+        last_outcome(&doc),
+        RecordedOutcome::Incomplete(IncompleteReason::Other)
     ));
-    assert!(matches!(
-        reviewer,
-        Generation::Incomplete {
-            reason: IncompleteReason::Other
-        }
-    ));
+    assert!(doc.session().turns()[0].steps().is_empty());
 }
