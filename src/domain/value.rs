@@ -117,12 +117,3 @@ impl fmt::Display for ToolName {
         f.write_str(&self.0)
     }
 }
-
-/// Complete execution identity. Native IDs are only unique inside one step.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CallAddress {
-    pub session: SessionId,
-    pub turn: TurnId,
-    pub step: u64,
-    pub native: ToolCallId,
-}

@@ -1,8 +1,5 @@
 use crate::{
-    app::{
-        Invocation, ReviewFailureAcknowledgement, SessionRecord, SessionStore, SessionStoreError,
-        SessionStoreErrorKind, SessionWriter, TurnView,
-    },
+    app::{SessionStore, SessionStoreError, SessionStoreErrorKind},
     domain::{
         AssistantSnapshot, EffectDisposition, EffectResolution, ExecutionSnapshot, ExecutionState,
         NonEmptyText, ResolutionSource, Session, SessionId, SessionSnapshot, StepSnapshot,
@@ -20,11 +17,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Complete per-session snapshots published by same-directory replacement.
+/// Concurrent saves use the last rename; there is no stale-write detection.
 #[derive(Clone, Debug)]
 pub struct JsonlSessionStore {
     root: PathBuf,
 }
 impl JsonlSessionStore {
+    /// Chooses the root without accessing the filesystem.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -32,146 +32,77 @@ impl JsonlSessionStore {
         &self,
         path: &Path,
         requested: Option<&SessionId>,
-    ) -> Result<SessionRecord, SessionStoreError> {
-        let bytes = fs::read(path).map_err(read_error)?;
-        let record = decode(&bytes)?;
+    ) -> Result<Session, SessionStoreError> {
+        let bytes = fs::read(path)
+            .map_err(read_error)
+            .map_err(|e| context(e, path.display().to_string()))?;
+        let snapshot = decode(&bytes).map_err(|e| context(e, path.display().to_string()))?;
         if path.file_name().and_then(|s| s.to_str())
-            != Some(filename(record.session().id().as_str()).as_str())
-            || requested.is_some_and(|id| id != record.session().id())
+            != Some(filename(&snapshot.session_id).as_str())
+            || requested.is_some_and(|id| id.as_str() != snapshot.session_id)
         {
-            return Err(invalid("session identity does not match file"));
+            return Err(context(
+                invalid("session identity does not match its file"),
+                path.display().to_string(),
+            ));
         }
-        Ok(record)
-    }
-    fn lock(&self, id: &SessionId) -> Result<SessionLock, SessionStoreError> {
-        fs::create_dir_all(&self.root).map_err(storage)?;
-        let lock = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.root.join(format!("{}.lock", filename(id.as_str()))))
-            .map_err(storage)?;
-        lock.try_lock().map_err(|error| match error {
-            fs::TryLockError::WouldBlock => SessionStoreError::new(
-                SessionStoreErrorKind::Busy,
-                io::Error::new(io::ErrorKind::WouldBlock, "session_busy"),
-            ),
-            fs::TryLockError::Error(e) => storage(e),
-        })?;
-        Ok(SessionLock(lock))
+        Session::restore(snapshot).map_err(|e| {
+            context(
+                SessionStoreError::new(SessionStoreErrorKind::InvalidData, e),
+                path.display().to_string(),
+            )
+        })
     }
 }
 impl SessionStore for JsonlSessionStore {
-    fn list(&self) -> Result<Vec<SessionId>, SessionStoreError> {
+    fn list(&self) -> Result<Vec<Session>, SessionStoreError> {
         let entries = match fs::read_dir(&self.root) {
-            Ok(e) => e,
+            Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => return Err(storage(e)),
         };
-        let mut ids = vec![];
+        let mut paths = vec![];
         for entry in entries {
             let entry = entry.map_err(storage)?;
             if entry.file_name().to_str().is_some_and(recognized) {
-                ids.push(self.read(&entry.path(), None)?.session().id().clone());
+                paths.push(entry.path());
             }
         }
-        ids.sort();
-        Ok(ids)
+        paths.sort();
+        let mut sessions = paths
+            .iter()
+            .map(|p| self.read(p, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        sessions.sort_by(|a, b| a.id().cmp(b.id()));
+        Ok(sessions)
     }
-    fn create(&self) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
-        let id = SessionId::new(uuid::Uuid::new_v4().to_string()).unwrap();
-        let lock = self.lock(&id)?;
-        let record = SessionRecord::new(id);
-        let path = self.root.join(filename(record.session().id().as_str()));
-        publish(&self.root, &path, &record)?;
-        Ok(Box::new(Writer {
-            root: self.root.clone(),
-            path,
-            _lock: lock,
-            committed: record,
-            valid: true,
-        }))
-    }
-    fn acquire(&self, id: &SessionId) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
-        let path = self.root.join(filename(id.as_str()));
-        fs::metadata(&path).map_err(read_error)?;
-        let lock = self.lock(id)?;
-        fs::File::open(&path)
-            .map_err(read_error)?
-            .sync_all()
+    fn save(&self, session: &Session) -> Result<(), SessionStoreError> {
+        fs::create_dir_all(&self.root).map_err(storage)?;
+        let path = self.root.join(filename(session.id().as_str()));
+        match self.read(&path, Some(session.id())) {
+            Ok(_) => {}
+            Err(e) if e.kind() == SessionStoreErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let bytes = encode(session.snapshot())?;
+        decode(&bytes)?;
+        let mut staged = tempfile::Builder::new()
+            .prefix(".cola-")
+            .suffix(".tmp")
+            .tempfile_in(&self.root)
             .map_err(storage)?;
+        staged.write_all(&bytes).map_err(storage)?;
+        staged.as_file().sync_all().map_err(storage)?;
+        staged.persist(&path).map_err(|e| storage(e.error))?;
+        #[cfg(unix)]
         fs::File::open(&self.root)
             .and_then(|f| f.sync_all())
             .map_err(storage)?;
-        let record = self.read(&path, Some(id))?;
-        Ok(Box::new(Writer {
-            root: self.root.clone(),
-            path,
-            _lock: lock,
-            committed: record,
-            valid: true,
-        }))
+        Ok(())
     }
-    fn inspect(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
+    fn load(&self, id: &SessionId) -> Result<Session, SessionStoreError> {
         self.read(&self.root.join(filename(id.as_str())), Some(id))
     }
-}
-struct Writer {
-    root: PathBuf,
-    path: PathBuf,
-    _lock: SessionLock,
-    committed: SessionRecord,
-    valid: bool,
-}
-struct SessionLock(fs::File);
-impl Drop for SessionLock {
-    fn drop(&mut self) {
-        // A concurrently forked child can briefly retain another descriptor.
-        let _ = self.0.unlock();
-    }
-}
-impl SessionWriter for Writer {
-    fn committed(&self) -> &SessionRecord {
-        &self.committed
-    }
-    fn commit(&mut self, next: SessionRecord) -> Result<u64, SessionStoreError> {
-        if !self.valid {
-            return Err(SessionStoreError::new(
-                SessionStoreErrorKind::WriterInvalidated,
-                io::Error::other("writer invalidated"),
-            ));
-        }
-        self.valid = false;
-        if !self.committed.validates_successor(&next) {
-            return Err(SessionStoreError::new(
-                SessionStoreErrorKind::StaleRevision,
-                io::Error::other("invalid document successor"),
-            ));
-        }
-        publish(&self.root, &self.path, &next)?;
-        self.committed = next;
-        self.valid = true;
-        Ok(self.committed.revision())
-    }
-}
-fn publish(root: &Path, path: &Path, record: &SessionRecord) -> Result<(), SessionStoreError> {
-    let bytes = encode(record)?;
-    decode(&bytes)?;
-    let mut staged = tempfile::Builder::new()
-        .prefix(".cola-")
-        .suffix(".tmp")
-        .tempfile_in(root)
-        .map_err(storage)?;
-    staged.write_all(&bytes).map_err(storage)?;
-    staged.as_file().sync_all().map_err(storage)?;
-    staged.persist(path).map_err(|e| storage(e.error))?;
-    fs::File::open(root)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| {
-            SessionStoreError::new(SessionStoreErrorKind::PublishedDurabilityUncertain, e)
-        })?;
-    Ok(())
 }
 fn filename(id: &str) -> String {
     format!("{:x}.jsonl", Sha256::digest(id.as_bytes()))
@@ -235,10 +166,6 @@ struct Header {
     session_id: String,
     closed_turn_count: usize,
     active: bool,
-    revision: u64,
-    invocations: Vec<Invocation>,
-    views: Vec<TurnView>,
-    acknowledgements: Vec<ReviewFailureAcknowledgement>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case", deny_unknown_fields)]
@@ -343,16 +270,11 @@ enum Failure {
 fn data_error(e: impl Error + Send + Sync + 'static) -> SessionStoreError {
     SessionStoreError::new(SessionStoreErrorKind::InvalidData, e)
 }
-fn encode(record: &SessionRecord) -> Result<Vec<u8>, SessionStoreError> {
-    let snapshot = record.session().snapshot();
+fn encode(snapshot: SessionSnapshot) -> Result<Vec<u8>, SessionStoreError> {
     let mut bytes = vec![];
     let header = Header {
         format: "cola.session".into(),
-        version: 2,
-        revision: record.revision(),
-        invocations: record.invocations().to_vec(),
-        views: record.views().to_vec(),
-        acknowledgements: record.acknowledgements().to_vec(),
+        version: 1,
         session_id: snapshot.session_id,
         closed_turn_count: snapshot.turns.len(),
         active: snapshot.active.is_some(),
@@ -371,7 +293,7 @@ fn line(bytes: &mut Vec<u8>, value: &impl Serialize) -> Result<(), SessionStoreE
     bytes.push(b'\n');
     Ok(())
 }
-fn decode(bytes: &[u8]) -> Result<SessionRecord, SessionStoreError> {
+fn decode(bytes: &[u8]) -> Result<SessionSnapshot, SessionStoreError> {
     if !bytes.ends_with(b"\n") {
         return Err(invalid("missing final LF"));
     }
@@ -382,7 +304,7 @@ fn decode(bytes: &[u8]) -> Result<SessionRecord, SessionStoreError> {
         if probe.format != "cola.session" {
             return Err(invalid("unknown session format"));
         }
-        if probe.version != 2 {
+        if probe.version != 1 {
             return Err(SessionStoreError::new(
                 SessionStoreErrorKind::UnsupportedVersion,
                 io::Error::new(
@@ -421,20 +343,11 @@ fn decode(bytes: &[u8]) -> Result<SessionRecord, SessionStoreError> {
     if turns.len() != header.closed_turn_count || active.is_some() != header.active {
         return Err(invalid("session record count mismatch"));
     }
-    let session = Session::restore(SessionSnapshot {
+    Ok(SessionSnapshot {
         session_id: header.session_id,
         turns,
         active,
     })
-    .map_err(data_error)?;
-    SessionRecord::restore(
-        header.revision,
-        session,
-        header.invocations,
-        header.views,
-        header.acknowledgements,
-    )
-    .map_err(data_error)
 }
 impl From<TurnSnapshot> for Turn {
     fn from(t: TurnSnapshot) -> Self {

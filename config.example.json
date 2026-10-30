@@ -2,16 +2,8 @@
   "protocol": "openai-responses",
   "base_url": "https://api.deepseek.com",
   "api_key": "",
-  "assistant": {
-    "model": "deepseek-flash"
-  },
-  "reviewer": {
-    "model": "deepseek-flash"
-  },
+  "assistant": { "model": "deepseek-flash" },
+  "reviewer": { "model": "deepseek-flash" },
   "tool_cwd": ".",
-  "store_root": ".cola/sessions",
-  "context": {
-    "optional_turns": 8,
-    "max_request_bytes": 65536
-  }
+  "store_root": ".cola/sessions"
 }

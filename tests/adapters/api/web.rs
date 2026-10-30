@@ -1,4 +1,3 @@
-use super::{observed, prepared};
 use cola::{app::*, domain::*};
 use serde_json::{Value, json};
 use std::{
@@ -38,31 +37,15 @@ fn call() -> ToolCall {
 }
 struct Roles {
     counts: Counts,
-    mode: String,
 }
 impl Assistant for Roles {
     fn context(&self, s: &Session) -> Result<Context<AssistantMessage>, ContextError> {
-        if self.mode == "context-error" {
-            return Err(ContextError::MissingUser);
-        }
-        let tool = if self.mode == "catalog-mismatch" {
-            ToolDefinition::new(
-                ToolName::new("echo").unwrap(),
-                text("changed description"),
-                InputSchema::new(json!({"type":"object"})).unwrap(),
-            )
-        } else {
-            definition()
-        };
-        Context::new(text("answer"), s.context_exchanges()?, vec![tool])
+        Context::new(text("answer"), s.context_exchanges()?, vec![definition()])
     }
 }
 impl ToolCallReviewer for Roles {
     fn context(&self, s: &Session, _: &ToolCall) -> Result<Context<Decision>, ContextError> {
         self.counts.review.set(self.counts.review.get() + 1);
-        if self.mode == "review-context-error" {
-            return Err(ContextError::MissingUser);
-        }
         Context::new(text("review"), s.closed_context_exchanges()?, vec![])
     }
 }
@@ -70,33 +53,18 @@ struct Model {
     counts: Counts,
     mode: String,
 }
-impl Model {
-    fn assistant_generation(
+impl ModelClient<AssistantMessage> for Model {
+    fn generate(
         &self,
         _: &Context<AssistantMessage>,
         _: &ModelSettings,
+        _: Option<&Continuation<AssistantMessage>>,
     ) -> Result<Generation<AssistantMessage>, ModelError> {
         let n = self.counts.model.get() + 1;
         self.counts.model.set(n);
         match self.mode.as_str() {
             "timeout" => return Err(ModelError::new(ModelErrorKind::Timeout)),
             "model" => return Err(ModelError::new(ModelErrorKind::Transport)),
-            "output-rejected" => {
-                return Ok(Generation::Complete {
-                    output: AssistantMessage::tool_requests(
-                        None,
-                        ToolCalls::new(vec![
-                            ToolCall::new(
-                                ToolCallId::new("unknown-call").unwrap(),
-                                ToolName::new("unknown").unwrap(),
-                                json!({}),
-                            )
-                            .unwrap(),
-                        ])
-                        .unwrap(),
-                    ),
-                });
-            }
             "refused" => {
                 return Ok(Generation::Refused {
                     reason: Some(text("private refusal")),
@@ -109,65 +77,38 @@ impl Model {
             }
             _ => {}
         }
-        let output = if (self.mode == "tools"
-            || self.mode == "review-timeout"
-            || self.mode == "review-context-error"
-            || self.mode == "denied")
-            && n == 1
-            || self.mode == "limit"
-        {
-            AssistantMessage::tool_requests(
-                Some("checking".into()),
-                ToolCalls::new(vec![call()]).unwrap(),
-            )
-        } else {
-            AssistantMessage::answer(format!("answer-{n}")).unwrap()
-        };
-        Ok(Generation::Complete { output })
+        let output =
+            if (self.mode == "tools" || self.mode == "review-timeout" || self.mode == "denied")
+                && n == 1
+                || self.mode == "limit"
+            {
+                AssistantMessage::tool_requests(
+                    Some("checking".into()),
+                    ToolCalls::new(vec![call()]).unwrap(),
+                )
+            } else {
+                AssistantMessage::answer(format!("answer-{n}")).unwrap()
+            };
+        Ok(Generation::Complete {
+            output,
+            continuation: None,
+        })
     }
 }
-impl Model {
-    fn review_generation(
+impl ModelClient<Decision> for Model {
+    fn generate(
         &self,
         _: &Context<Decision>,
         _: &ModelSettings,
+        _: Option<&Continuation<Decision>>,
     ) -> Result<Generation<Decision>, ModelError> {
         if self.mode == "review-timeout" {
             return Err(ModelError::new(ModelErrorKind::Timeout));
         }
         Ok(Generation::Complete {
             output: Decision::new(self.mode != "denied", Some(text("policy"))),
+            continuation: None,
         })
-    }
-}
-impl ModelClient<AssistantMessage> for Model {
-    fn route(&self) -> String {
-        "fixture".into()
-    }
-    fn invoke(
-        &self,
-        input: ModelInput<'_, AssistantMessage>,
-        recorder: &mut dyn BeforeModelSend,
-    ) -> Result<Observation<AssistantMessage>, SessionStoreError> {
-        let _permit = recorder.persist(prepared(&input, "fixture", true))?;
-        Ok(observed(
-            self.assistant_generation(input.context, input.settings),
-        ))
-    }
-}
-impl ModelClient<Decision> for Model {
-    fn route(&self) -> String {
-        "fixture".into()
-    }
-    fn invoke(
-        &self,
-        input: ModelInput<'_, Decision>,
-        recorder: &mut dyn BeforeModelSend,
-    ) -> Result<Observation<Decision>, SessionStoreError> {
-        let _permit = recorder.persist(prepared(&input, "fixture", false))?;
-        Ok(observed(
-            self.review_generation(input.context, input.settings),
-        ))
     }
 }
 struct Target(Counts);
@@ -181,77 +122,41 @@ impl Tool for Target {
 #[derive(Clone, Default)]
 struct Store {
     counts: Counts,
-    sessions: Rc<RefCell<BTreeMap<SessionId, SessionRecord>>>,
+    sessions: Rc<RefCell<BTreeMap<SessionId, Session>>>,
     fail_save: Option<usize>,
     fail_list: bool,
 }
-impl Store {
-    fn publish(&self, doc: &SessionRecord) -> Result<(), SessionStoreError> {
+impl SessionStore for Store {
+    fn save(&self, s: &Session) -> Result<(), SessionStoreError> {
         let n = self.counts.save.get() + 1;
         self.counts.save.set(n);
         if self.fail_save == Some(n) {
             return Err(SessionStoreError::new(
                 SessionStoreErrorKind::Storage,
-                io::Error::other("injected store error"),
+                io::Error::other("/private/secret storage detail"),
             ));
         }
-        self.sessions
-            .borrow_mut()
-            .insert(doc.session().id().clone(), doc.clone());
+        self.sessions.borrow_mut().insert(s.id().clone(), s.clone());
         Ok(())
     }
-}
-struct Writer {
-    store: Store,
-    doc: SessionRecord,
-    valid: bool,
-}
-impl SessionWriter for Writer {
-    fn committed(&self) -> &SessionRecord {
-        &self.doc
-    }
-    fn commit(&mut self, next: SessionRecord) -> Result<u64, SessionStoreError> {
-        assert!(self.valid);
-        self.valid = false;
-        assert!(self.doc.validates_successor(&next));
-        self.store.publish(&next)?;
-        self.doc = next;
-        self.valid = true;
-        Ok(self.doc.revision())
-    }
-}
-impl SessionStore for Store {
-    fn create(&self) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
-        let doc = SessionRecord::new(SessionId::new(uuid::Uuid::new_v4().to_string()).unwrap());
-        self.publish(&doc)?;
-        Ok(Box::new(Writer {
-            store: self.clone(),
-            doc,
-            valid: true,
-        }))
-    }
-    fn inspect(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
-        self.counts.load.set(self.counts.load.get() + 1);
-        self.sessions.borrow().get(id).cloned().ok_or_else(|| {
-            SessionStoreError::new(SessionStoreErrorKind::NotFound, io::Error::other("missing"))
-        })
-    }
-    fn acquire(&self, id: &SessionId) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
-        Ok(Box::new(Writer {
-            store: self.clone(),
-            doc: self.inspect(id)?,
-            valid: true,
-        }))
-    }
-    fn list(&self) -> Result<Vec<SessionId>, SessionStoreError> {
+    fn list(&self) -> Result<Vec<Session>, SessionStoreError> {
         self.counts.list.set(self.counts.list.get() + 1);
         if self.fail_list {
             return Err(SessionStoreError::new(
                 SessionStoreErrorKind::Storage,
-                io::Error::other("injected list error"),
+                io::Error::other("/private/secret list detail"),
             ));
         }
-        Ok(self.sessions.borrow().keys().cloned().collect())
+        Ok(self.sessions.borrow().values().cloned().collect())
+    }
+    fn load(&self, id: &SessionId) -> Result<Session, SessionStoreError> {
+        self.counts.load.set(self.counts.load.get() + 1);
+        self.sessions.borrow().get(id).cloned().ok_or_else(|| {
+            SessionStoreError::new(
+                SessionStoreErrorKind::NotFound,
+                io::Error::other("/private/secret missing"),
+            )
+        })
     }
 }
 fn service<S: SessionStore>(
@@ -272,11 +177,9 @@ fn service<S: SessionStore>(
         store,
         Roles {
             counts: counts.clone(),
-            mode: mode.into(),
         },
         Roles {
             counts: counts.clone(),
-            mode: mode.into(),
         },
         vec![(definition(), Box::new(Target(counts)))],
         AgentSettings {
@@ -330,19 +233,9 @@ fn server_child() {
         api.run(listener).unwrap();
     } else {
         let store = JsonlSessionStore::new(root.join("sessions"));
-        {
-            use sha2::{Digest, Sha256};
-            fs::create_dir_all(root.join("sessions")).unwrap();
-            let header = json!({"format":"cola.session","version":2,"session_id":"opaque id:世界","closed_turn_count":0,"active":false,"revision":0,"invocations":[],"views":[],"acknowledgements":[]});
-            fs::write(
-                root.join("sessions").join(format!(
-                    "{:x}.jsonl",
-                    Sha256::digest("opaque id:世界".as_bytes())
-                )),
-                format!("{header}\n"),
-            )
+        store
+            .save(&Session::new(SessionId::new("opaque id:世界").unwrap()))
             .unwrap();
-        }
         let api = WebApi::new(service(&mode, store, counts));
         fs::write(
             root.join("ready.tmp"),
@@ -497,10 +390,7 @@ fn loopback_persistent_service_and_disk_readback() {
     assert_eq!(s["turns"].as_array().unwrap().len(), 2);
     assert!(s["active"].is_null());
     let store = JsonlSessionStore::new(server.root.path().join("sessions"));
-    let session = store
-        .inspect(&SessionId::new(id).unwrap())
-        .map(|d| d.session().clone())
-        .unwrap();
+    let session = store.load(&SessionId::new(id).unwrap()).unwrap();
     assert_eq!(session.turns().len(), 2);
     let bytes: Vec<_> = fs::read_dir(server.root.path().join("sessions"))
         .unwrap()
@@ -712,8 +602,7 @@ fn oversized_declared_bodies_do_not_kill_the_resident_service() {
         assert_eq!(chat["messages"][1]["text"], format!("answer-{}", index + 1));
     }
     let stored = JsonlSessionStore::new(server.root.path().join("sessions"))
-        .inspect(&SessionId::new(id).unwrap())
-        .map(|d| d.session().clone())
+        .load(&SessionId::new(id).unwrap())
         .unwrap();
     assert_eq!(stored.turns().len(), 6);
 }
@@ -724,11 +613,15 @@ fn create_and_list_failures_keep_safe_progress_and_service_residency() {
     assert_eq!(status, 500);
     assert_eq!(failure["error"]["code"], "store_failure");
     assert_eq!(failure["error"]["durability"], "unconfirmed");
-    assert!(failure["error"]["progress"].is_null());
+    let progress = &failure["error"]["progress"];
+    let id = progress["id"].as_str().unwrap();
+    assert_eq!(progress["turns"], json!([]));
+    assert!(progress["active"].is_null());
     assert!(!failure.to_string().contains("/private/secret"));
     let (status, _, listing) = server.request("GET", "/sessions", b"", None);
     assert_eq!(status, 200);
-    assert_eq!(listing["sessions"], json!([]));
+    assert_eq!(listing["sessions"], json!([progress]));
+    assert_eq!(server.chat(id).0, 409);
 
     let server = Server::new("list-failure");
     let (status, _, failure) = server.request("GET", "/sessions", b"", None);
@@ -749,10 +642,6 @@ fn http_tool_results_and_failure_progress_are_full_and_safe() {
         ("refused", 422, "generation_refused", "assistant"),
         ("incomplete", 502, "generation_incomplete", "assistant"),
         ("model", 502, "model_failure", "assistant"),
-        ("catalog-mismatch", 500, "catalog_mismatch", "assistant"),
-        ("context-error", 500, "invalid_context", "assistant"),
-        ("review-context-error", 500, "invalid_context", "reviewer"),
-        ("output-rejected", 502, "output_rejected", "assistant"),
         ("limit", 422, "iteration_limit", ""),
         ("save-failure", 500, "store_failure", ""),
     ] {
@@ -767,18 +656,21 @@ fn http_tool_results_and_failure_progress_are_full_and_safe() {
         }
         assert!(!v.to_string().contains("/private/secret"));
         assert!(!v.to_string().contains("private refusal"));
-        if mode == "review-timeout" || mode == "review-context-error" {
+        if mode == "review-timeout" {
             assert_eq!(
                 v["error"]["progress"]["active"]["steps"][0]["executions"][0]["state"]["kind"],
                 "started"
             );
             assert_eq!(server.chat(&id).0, 409);
-        } else if mode != "save-failure" {
+        } else {
             assert!(v["error"]["progress"]["active"].is_null());
         }
         if mode == "save-failure" {
-            assert!(v["error"]["progress"]["active"].is_object());
-            assert_eq!(server.chat(&id).0, 200);
+            assert_eq!(
+                v["error"]["progress"]["turns"][0]["outcome"]["kind"],
+                "completed"
+            );
+            assert_eq!(server.chat(&id).0, 409);
         }
     }
     for mode in ["tools", "denied"] {
@@ -835,59 +727,10 @@ fn disconnect_does_not_undo_admitted_chat() {
     let store = JsonlSessionStore::new(server.root.path().join("sessions"));
     assert_eq!(
         store
-            .inspect(&SessionId::new(id).unwrap())
-            .map(|d| d.session().clone())
+            .load(&SessionId::new(id).unwrap())
             .unwrap()
             .turns()
             .len(),
         1
-    );
-}
-
-#[test]
-fn review_failure_acknowledgement_http_contract() {
-    let server = Server::new("review-timeout");
-    let id = server.create();
-    let (status, failure) = server.chat(&id);
-    assert_eq!(status, 504);
-    assert_eq!(failure["error"]["invocation_id"], 2);
-    let route = format!("/sessions/{id}/review-failure-acknowledgements");
-    for (body, status) in [
-        (json!({"invocation_id":0,"evidence":"checked"}), 400),
-        (json!({"invocation_id":2,"evidence":" "}), 400),
-        (json!({"invocation_id":1,"evidence":"checked"}), 409),
-        (json!({"invocation_id":2,"evidence":"checked"}), 200),
-        (json!({"invocation_id":2,"evidence":"checked"}), 200),
-        (json!({"invocation_id":2,"evidence":"different"}), 409),
-    ] {
-        assert_eq!(
-            server
-                .request(
-                    "POST",
-                    &route,
-                    body.to_string().as_bytes(),
-                    Some("application/json")
-                )
-                .0,
-            status
-        );
-    }
-    assert_eq!(server.chat(&id).0, 200);
-    let doc = JsonlSessionStore::new(server.root.path().join("sessions"))
-        .inspect(&SessionId::new(id).unwrap())
-        .unwrap();
-    assert_eq!(doc.acknowledgements().len(), 1);
-    assert_eq!(doc.acknowledgements()[0].actor, None);
-    assert!(matches!(
-        doc.session().turns()[0].outcome(),
-        TurnOutcome::Failed(_)
-    ));
-    assert_eq!(
-        doc.session().turns()[0].steps()[0]
-            .executions()
-            .next()
-            .unwrap()
-            .state(),
-        &ExecutionState::Started
     );
 }

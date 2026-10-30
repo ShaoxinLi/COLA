@@ -43,16 +43,9 @@ fn external_tool_executes_arguments_and_records_success_or_failure() {
                 AssistantMessage::tool_requests(None, ToolCalls::new(vec![call]).unwrap()),
             )
             .unwrap();
-        let call = session
-            .start_tool(&super::address(&session, turn, &id("echo-call")))
-            .unwrap();
+        let call = session.start_tool(turn, &id("echo-call")).unwrap();
         let result = ToolResult::new(call.id().clone(), tool.execute(call.arguments()));
-        session
-            .record_tool_result(
-                &super::address(&session, turn, (result).call_id()),
-                (result).outcome().clone(),
-            )
-            .unwrap();
+        session.record_tool_result(turn, result).unwrap();
 
         assert_eq!(
             session.messages().last(),

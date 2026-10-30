@@ -1,4 +1,3 @@
-use super::{observed, prepared};
 use cola::{app::*, domain::*};
 use serde_json::{Value, json};
 use std::{
@@ -54,11 +53,12 @@ struct Model {
     counts: Counts,
     mode: String,
 }
-impl Model {
-    fn assistant_generation(
+impl ModelClient<AssistantMessage> for Model {
+    fn generate(
         &self,
         _: &Context<AssistantMessage>,
         _: &ModelSettings,
+        _: Option<&Continuation<AssistantMessage>>,
     ) -> Result<Generation<AssistantMessage>, ModelError> {
         let n = self.counts.model.get() + 1;
         self.counts.model.set(n);
@@ -89,51 +89,26 @@ impl Model {
             } else {
                 AssistantMessage::answer(format!("answer-{n}")).unwrap()
             };
-        Ok(Generation::Complete { output })
+        Ok(Generation::Complete {
+            output,
+            continuation: None,
+        })
     }
 }
-impl Model {
-    fn review_generation(
+impl ModelClient<Decision> for Model {
+    fn generate(
         &self,
         _: &Context<Decision>,
         _: &ModelSettings,
+        _: Option<&Continuation<Decision>>,
     ) -> Result<Generation<Decision>, ModelError> {
         if self.mode == "review-timeout" {
             return Err(ModelError::new(ModelErrorKind::Timeout));
         }
         Ok(Generation::Complete {
             output: Decision::new(self.mode != "denied", Some(text("policy"))),
+            continuation: None,
         })
-    }
-}
-impl ModelClient<AssistantMessage> for Model {
-    fn route(&self) -> String {
-        "fixture".into()
-    }
-    fn invoke(
-        &self,
-        input: ModelInput<'_, AssistantMessage>,
-        recorder: &mut dyn BeforeModelSend,
-    ) -> Result<Observation<AssistantMessage>, SessionStoreError> {
-        let _permit = recorder.persist(prepared(&input, "fixture", true))?;
-        Ok(observed(
-            self.assistant_generation(input.context, input.settings),
-        ))
-    }
-}
-impl ModelClient<Decision> for Model {
-    fn route(&self) -> String {
-        "fixture".into()
-    }
-    fn invoke(
-        &self,
-        input: ModelInput<'_, Decision>,
-        recorder: &mut dyn BeforeModelSend,
-    ) -> Result<Observation<Decision>, SessionStoreError> {
-        let _permit = recorder.persist(prepared(&input, "fixture", false))?;
-        Ok(observed(
-            self.review_generation(input.context, input.settings),
-        ))
     }
 }
 struct Target(Counts);
@@ -147,77 +122,41 @@ impl Tool for Target {
 #[derive(Clone, Default)]
 struct Store {
     counts: Counts,
-    sessions: Rc<RefCell<BTreeMap<SessionId, SessionRecord>>>,
+    sessions: Rc<RefCell<BTreeMap<SessionId, Session>>>,
     fail_save: Option<usize>,
     fail_list: bool,
 }
-impl Store {
-    fn publish(&self, doc: &SessionRecord) -> Result<(), SessionStoreError> {
+impl SessionStore for Store {
+    fn save(&self, s: &Session) -> Result<(), SessionStoreError> {
         let n = self.counts.save.get() + 1;
         self.counts.save.set(n);
         if self.fail_save == Some(n) {
             return Err(SessionStoreError::new(
                 SessionStoreErrorKind::Storage,
-                io::Error::other("injected store error"),
+                io::Error::other("/private/secret storage detail"),
             ));
         }
-        self.sessions
-            .borrow_mut()
-            .insert(doc.session().id().clone(), doc.clone());
+        self.sessions.borrow_mut().insert(s.id().clone(), s.clone());
         Ok(())
     }
-}
-struct Writer {
-    store: Store,
-    doc: SessionRecord,
-    valid: bool,
-}
-impl SessionWriter for Writer {
-    fn committed(&self) -> &SessionRecord {
-        &self.doc
-    }
-    fn commit(&mut self, next: SessionRecord) -> Result<u64, SessionStoreError> {
-        assert!(self.valid);
-        self.valid = false;
-        assert!(self.doc.validates_successor(&next));
-        self.store.publish(&next)?;
-        self.doc = next;
-        self.valid = true;
-        Ok(self.doc.revision())
-    }
-}
-impl SessionStore for Store {
-    fn create(&self) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
-        let doc = SessionRecord::new(SessionId::new(uuid::Uuid::new_v4().to_string()).unwrap());
-        self.publish(&doc)?;
-        Ok(Box::new(Writer {
-            store: self.clone(),
-            doc,
-            valid: true,
-        }))
-    }
-    fn inspect(&self, id: &SessionId) -> Result<SessionRecord, SessionStoreError> {
-        self.counts.load.set(self.counts.load.get() + 1);
-        self.sessions.borrow().get(id).cloned().ok_or_else(|| {
-            SessionStoreError::new(SessionStoreErrorKind::NotFound, io::Error::other("missing"))
-        })
-    }
-    fn acquire(&self, id: &SessionId) -> Result<Box<dyn SessionWriter + '_>, SessionStoreError> {
-        Ok(Box::new(Writer {
-            store: self.clone(),
-            doc: self.inspect(id)?,
-            valid: true,
-        }))
-    }
-    fn list(&self) -> Result<Vec<SessionId>, SessionStoreError> {
+    fn list(&self) -> Result<Vec<Session>, SessionStoreError> {
         self.counts.list.set(self.counts.list.get() + 1);
         if self.fail_list {
             return Err(SessionStoreError::new(
                 SessionStoreErrorKind::Storage,
-                io::Error::other("injected list error"),
+                io::Error::other("/private/secret list detail"),
             ));
         }
-        Ok(self.sessions.borrow().keys().cloned().collect())
+        Ok(self.sessions.borrow().values().cloned().collect())
+    }
+    fn load(&self, id: &SessionId) -> Result<Session, SessionStoreError> {
+        self.counts.load.set(self.counts.load.get() + 1);
+        self.sessions.borrow().get(id).cloned().ok_or_else(|| {
+            SessionStoreError::new(
+                SessionStoreErrorKind::NotFound,
+                io::Error::other("/private/secret missing"),
+            )
+        })
     }
 }
 fn service<S: SessionStore>(
@@ -292,9 +231,9 @@ fn persistent_commands_preserve_selection_text_and_new_turn_only() {
     );
     assert_eq!(counts.model.get(), 2);
     assert_eq!(counts.list.get(), 1);
-    assert_eq!(counts.load.get(), 3);
+    assert_eq!(counts.load.get(), 0);
     let id = SessionId::new(replies[0]["session"]["id"].as_str().unwrap()).unwrap();
-    assert_eq!(store.inspect(&id).unwrap().session().turns().len(), 2);
+    assert_eq!(store.load(&id).unwrap().turns().len(), 2);
 }
 #[test]
 fn use_is_acknowledged_without_loading_and_accepts_opaque_ids() {
@@ -398,7 +337,7 @@ fn errors_retain_role_progress_and_blocked_resident_state() {
                 r[1]["error"]["progress"]["active"]["steps"][0]["executions"][0]["state"]["kind"],
                 "started"
             );
-            assert_eq!(r[2]["error"]["code"], "review_failure");
+            assert_eq!(r[2]["error"]["code"], "session_blocked");
         } else {
             assert!(r[1]["error"]["progress"]["active"].is_null());
         }
@@ -413,12 +352,12 @@ fn errors_retain_role_progress_and_blocked_resident_state() {
     );
     assert_eq!(exit, CliExit::CommandFailed);
     assert_eq!(r[1]["error"]["code"], "store_failure");
-    assert!(r[1]["error"]["progress"]["active"].is_object());
-    assert_eq!(r[2]["kind"], "chatted");
     assert_eq!(
-        r[3]["sessions"][0]["turns"][0]["outcome"]["reason"],
-        "process_lost"
+        r[1]["error"]["progress"]["turns"][0]["outcome"]["kind"],
+        "completed"
     );
+    assert_eq!(r[2]["error"]["code"], "session_blocked");
+    assert_eq!(r[3]["sessions"][0]["turns"].as_array().unwrap().len(), 1);
 }
 #[test]
 fn listing_failure_does_not_block_other_session_commands() {
@@ -439,6 +378,40 @@ fn listing_failure_does_not_block_other_session_commands() {
         !serde_json::to_string(&replies)
             .unwrap()
             .contains("/private/secret")
+    );
+}
+#[test]
+fn listing_preserves_unknown_effect_resolution_and_all_outcomes() {
+    let store = Store::default();
+    let mut s = Session::new(SessionId::new("resolved").unwrap());
+    let t = s.start_turn(UserMessage::new(text("work"))).unwrap();
+    s.record_assistant(
+        t,
+        AssistantMessage::tool_requests(None, ToolCalls::new(vec![call()]).unwrap()),
+    )
+    .unwrap();
+    s.start_tool(t, &call().id().clone()).unwrap();
+    s.interrupt(t, StopReason::ProcessLost).unwrap();
+    s.resolve_effect(
+        t,
+        call().id(),
+        EffectResolution::new(
+            EffectDisposition::NotPerformed,
+            ResolutionSource::ApplicationAttestation,
+            text("checked"),
+        ),
+    )
+    .unwrap();
+    store.save(&s).unwrap();
+    let (_, r) = run("answer", store, b"/sessions\n");
+    let turn = &r[0]["sessions"][0]["turns"][0];
+    assert_eq!(
+        turn["outcome"],
+        json!({"kind":"interrupted","reason":"process_lost"})
+    );
+    assert_eq!(
+        turn["steps"][0]["executions"][0],
+        json!({"call_id":"call-1","state":{"kind":"started"},"resolution":{"disposition":"not_performed","source":"application_attestation","evidence":"checked"}})
     );
 }
 #[test]
@@ -546,23 +519,4 @@ fn output_is_flushed_and_stream_failures_propagate() {
             .run(Broken, vec![])
             .is_err()
     );
-}
-
-#[test]
-fn review_acknowledgement_reports_id_and_retries_without_model_or_tool_calls() {
-    let store = Store::default();
-    let counts = store.counts.clone();
-    let (_, replies)=run("review-timeout",store,b"/new\nrequest\n/ack-review-failure 2 inspected\n/ack-review-failure 2 inspected\n/ack-review-failure 2 conflicting\n/sessions\ncontinue\n");
-    assert_eq!(replies[1]["error"]["invocation_id"], 2);
-    assert_eq!(replies[1]["error"]["code"], "model_timeout");
-    assert_eq!(replies[2]["kind"], "review_failure_acknowledged");
-    assert_eq!(replies[3], replies[2]);
-    assert_eq!(replies[4]["error"]["code"], "acknowledgement_conflict");
-    assert_eq!(
-        replies[5]["sessions"][0]["turns"][0]["outcome"]["kind"],
-        "failed"
-    );
-    assert_eq!(replies[6]["kind"], "chatted");
-    assert_eq!(counts.tool.get(), 0);
-    assert_eq!(counts.model.get(), 2);
 }

@@ -1,6 +1,6 @@
 use super::{
-    AssistantMessage, CallAddress, EffectResolution, ExecutionState, Message, NonEmptyText,
-    Session, ToolCall, ToolDefinition, ToolName, ToolResult, TurnId, TurnOutcome,
+    AssistantMessage, EffectResolution, ExecutionState, Message, NonEmptyText, Session, ToolCall,
+    ToolCallId, ToolDefinition, ToolName, ToolResult, TurnId, TurnOutcome,
 };
 use std::{collections::BTreeSet, error::Error, fmt, marker::PhantomData};
 
@@ -13,26 +13,38 @@ pub enum ExecutionNotice {
         outcome: TurnOutcome,
     },
     Undispatched {
-        address: CallAddress,
+        turn_id: TurnId,
         call: ToolCall,
     },
     UnknownEffect {
-        address: CallAddress,
+        turn_id: TurnId,
         call: ToolCall,
         resolution: Option<EffectResolution>,
     },
     ConfirmedResult {
-        address: CallAddress,
+        turn_id: TurnId,
         call: ToolCall,
         result: ToolResult,
     },
 }
+impl ExecutionNotice {
+    fn call(&self) -> Option<&ToolCall> {
+        match self {
+            Self::TurnClosed { .. } => None,
+            Self::Undispatched { call, .. }
+            | Self::UnknownEffect { call, .. }
+            | Self::ConfirmedResult { call, .. } => Some(call),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContextError {
     MissingUser,
     InvalidMessageOrder,
     UnresolvedToolBatch,
     MismatchedToolResult,
+    DuplicateCallId(ToolCallId),
     DuplicateToolName(ToolName),
     InvalidOutcome,
     InvalidTurnOrder,
@@ -51,6 +63,7 @@ impl fmt::Display for ContextError {
             Self::MismatchedToolResult => {
                 f.write_str("tool result does not match the next requested call")
             }
+            Self::DuplicateCallId(id) => write!(f, "duplicate tool call ID {id} in context"),
             Self::DuplicateToolName(name) => {
                 write!(f, "duplicate tool name {name} in context catalog")
             }
@@ -144,7 +157,7 @@ impl<O> Context<O> {
                 return Err(ContextError::DuplicateToolName(tool.name().clone()));
             }
         }
-
+        let mut ids = BTreeSet::new();
         let mut previous_turn = None;
         for (index, exchange) in exchanges.iter().enumerate() {
             if previous_turn.is_some_and(|previous| previous >= exchange.turn_id) {
@@ -153,6 +166,27 @@ impl<O> Context<O> {
             previous_turn = Some(exchange.turn_id);
             if exchange.outcome.is_none() && index + 1 != exchanges.len() {
                 return Err(ContextError::ActiveExchangeNotLast);
+            }
+            for id in exchange
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Assistant(assistant) => assistant.calls(),
+                    _ => None,
+                })
+                .flat_map(|calls| calls.as_slice())
+                .map(ToolCall::id)
+                .chain(
+                    exchange
+                        .notices
+                        .iter()
+                        .filter_map(ExecutionNotice::call)
+                        .map(ToolCall::id),
+                )
+            {
+                if !ids.insert(id) {
+                    return Err(ContextError::DuplicateCallId(id.clone()));
+                }
             }
         }
         Ok(Self {
@@ -218,7 +252,7 @@ fn validate_messages(
     }
     let mut remaining: &[ToolCall] = &[];
     let mut answered = false;
-
+    let mut ids = BTreeSet::new();
     for message in &messages[1..] {
         if answered {
             return Err(ContextError::InvalidMessageOrder);
@@ -234,6 +268,11 @@ fn validate_messages(
                 Message::Assistant(AssistantMessage::Answer(_)) => answered = true,
                 Message::Assistant(AssistantMessage::ToolRequests { calls, .. }) => {
                     remaining = calls.as_slice();
+                    for call in remaining {
+                        if !ids.insert(call.id()) {
+                            return Err(ContextError::DuplicateCallId(call.id().clone()));
+                        }
+                    }
                 }
                 _ => return Err(ContextError::InvalidMessageOrder),
             }
@@ -268,29 +307,24 @@ impl Session {
         for turn in self.turns() {
             let mut messages = vec![Message::User(turn.user().clone())];
             let mut partial_notices = vec![];
-            for (step_index, step) in turn.steps().iter().enumerate() {
+            for step in turn.steps() {
                 if step.all_returned() {
                     messages.extend(step.messages());
                 } else {
                     for execution in step.executions() {
                         let call = execution.call().clone();
-                        let address = CallAddress {
-                            session: self.id().clone(),
-                            turn: turn.id(),
-                            step: step_index as u64 + 1,
-                            native: call.id().clone(),
-                        };
                         partial_notices.push(match execution.state() {
-                            ExecutionState::NotStarted => {
-                                ExecutionNotice::Undispatched { address, call }
-                            }
+                            ExecutionState::NotStarted => ExecutionNotice::Undispatched {
+                                turn_id: turn.id(),
+                                call,
+                            },
                             ExecutionState::Started => ExecutionNotice::UnknownEffect {
-                                address,
+                                turn_id: turn.id(),
                                 call,
                                 resolution: execution.resolution().cloned(),
                             },
                             ExecutionState::Returned(outcome) => ExecutionNotice::ConfirmedResult {
-                                address,
+                                turn_id: turn.id(),
                                 result: ToolResult::new(call.id().clone(), outcome.clone()),
                                 call,
                             },

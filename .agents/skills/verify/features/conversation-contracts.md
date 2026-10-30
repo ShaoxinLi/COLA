@@ -15,8 +15,7 @@ interrupted work, and build typed context with their own assistant and reviewer.
 
 Import `cola::domain`. Construct `Session` and checked messages, then call
 `start_turn`, `record_assistant`, `start_tool`, and `record_tool_result`.
-Use `CallAddress` for `start_tool`, receipts, and `resolve_effect`.
-Call `interrupt`, `snapshot`, and `restore` for explicit state and raw restoration.
+Call `interrupt`, `resolve_effect`, `snapshot`, and `restore` for recovery.
 Build `Context` or implement `Assistant`, `ToolCallReviewer`, and `Tool`.
 
 ## Driving it with the Rust test runner
@@ -39,5 +38,5 @@ Cases live in `tests/domain/` and share public constructors in `tests/domain.rs`
 
 - Domain transitions are the library user's own operations. They perform no model, filesystem, or subprocess I/O.
 - Recording `Started` proves intent. It does not prove that a tool executed.
-- Raw restoration preserves active work. The application commits `ProcessLost` recovery. Resolution adds evidence without reopening the old turn.
+- Recovery closes active work as `ProcessLost`. Resolution adds evidence without reopening the old turn.
 - Passing domain tests does not prove adapter effects. Use the relevant adapter map for disk, process, or HTTP behavior.
